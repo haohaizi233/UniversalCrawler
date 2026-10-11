@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 from typing import Sequence
@@ -108,6 +109,86 @@ def _handle_association_helper(argv: Sequence[str]) -> bool:
         service.open_default_apps_settings()
     return True
 
+def _existing_qapplication():
+    """GUI 启动前先取进程内已有的 QApplication。没有则返回 None。"""
+    try:
+        from PyQt6.QtWidgets import QApplication
+    except Exception:
+        return None
+    return QApplication.instance()
+
+
+def _bind_existing_qapplication(existing):
+    """让桌面控制器复用已有实例，避免再构造第二个 QApplication。"""
+    from PyQt6.QtWidgets import QApplication
+    from app.controllers.application_controller import ApplicationController
+
+    original = ApplicationController._create_application
+
+    def _create_application():
+        current = QApplication.instance()
+        if current is not None:
+            return current
+        return existing
+
+    ApplicationController._create_application = staticmethod(_create_application)
+
+    def _restore() -> None:
+        ApplicationController._create_application = original
+
+    return _restore
+
+
+def _system_exit_code(exc: SystemExit) -> int:
+    code = exc.code
+    if code is None:
+        return 0
+    if isinstance(code, int):
+        return code
+    return 1
+
+
+def _hooked_gui_exit_code(controller) -> int | None:
+    """读取调用方留下的关闭退出码。环境变量优先于控制器上的同名钩子。"""
+    raw = os.environ.get("UCRAWL_GUI_EXIT_CODE", "").strip()
+    if raw:
+        try:
+            return int(raw)
+        except ValueError:
+            sys.stderr.write("UCRAWL_GUI_EXIT_CODE 无法解析为整数，已忽略\n")
+    hook = getattr(controller, "gui_exit_code", None)
+    if isinstance(hook, int):
+        return hook
+    if callable(hook):
+        try:
+            value = hook()
+        except Exception:
+            value = None
+        if isinstance(value, int):
+            return value
+    return None
+
+
+def _gui_close_exit_code(controller, exec_code: int) -> int:
+    """合并事件循环退出码和关闭失败。
+
+    关闭明细在控制器的 ``_application_shutdown_state`` 上。guardian 线程属于
+    ``app.controllers``，这里只读已经写好的状态，不 join、也不等待。
+    """
+    hooked = _hooked_gui_exit_code(controller)
+    if hooked is not None:
+        return hooked
+    state = getattr(controller, "_application_shutdown_state", None)
+    if state is not None:
+        if getattr(state, "failures", None):
+            return exec_code or 1
+        done = getattr(state, "done", None)
+        is_done = getattr(done, "is_set", None)
+        if callable(is_done) and not is_done():
+            return exec_code or 1
+    return exec_code
+
+
 def main(argv: list[str] | None = None) -> int:
     """GUI 入口：启动 PyQt6 桌面应用。
 
@@ -130,9 +211,19 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         from app.controllers.application_controller import ApplicationController
 
-        controller = ApplicationController(launch_args=normalized_argv)
-        controller.run()
-        return 0
+        qt_app = _existing_qapplication()
+        restore_factory = _bind_existing_qapplication(qt_app) if qt_app is not None else None
+        try:
+            controller = ApplicationController(launch_args=normalized_argv)
+        finally:
+            if restore_factory is not None:
+                restore_factory()
+        try:
+            outcome = controller.run()
+        except SystemExit as exc:
+            return _gui_close_exit_code(controller, _system_exit_code(exc))
+        code = outcome if isinstance(outcome, int) else 0
+        return _gui_close_exit_code(controller, code)
     except Exception as exc:
         debug_logger.log_exception("gui_entry", "startup", exc)
         sys.stderr.write("应用启动失败，请查看 logs/latest_error_summary.md 或 latest_debug.log\n")

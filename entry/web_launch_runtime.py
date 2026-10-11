@@ -21,6 +21,8 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 
 MIN_ACCESS_TOKEN_LENGTH = 20
+_QT_SERVER_JOIN_TIMEOUT = 5.0
+_QT_SERVER_FORCE_JOIN_TIMEOUT = 1.0
 
 
 def is_loopback_bind_host(host: str) -> bool:
@@ -256,17 +258,38 @@ def run_server_with_qt(
     serve_async: Callable[[], Coroutine[Any, Any, None]],
     create_tray_icon: Callable[[Any, str, threading.Event], Any],
     request_shutdown: Callable[[], None],
-) -> None:
+    escalate_shutdown: Callable[[], None] | None = None,
+) -> int:
     """Qt 模式下：后台线程跑 Web，主线程跑 Qt 事件循环。
 
     Qt 要占主线程，FastAPI/uvicorn 只能放到后台线程；QTimer 轮询
-    shutdown_event 是为了把信号处理安全切回 Qt 事件循环。
+    shutdown_event 是为了把信号处理安全切回 Qt 事件循环。服务线程不是
+    daemon：启动失败会结束 Qt 循环并返回非 0；join 超时或服务没有排空
+    完成时也不返回 0。
     """
+    outcome = {"code": 0, "clean": False}
 
     def _run_server() -> None:
-        asyncio.run(serve_async())
+        try:
+            asyncio.run(serve_async())
+        except SystemExit as exc:
+            code = exc.code
+            outcome["code"] = code if isinstance(code, int) and code != 0 else 1
+        except BaseException:
+            outcome["code"] = 1
+        else:
+            outcome["clean"] = True
+        finally:
+            shutdown_event.set()
+            quit_app = getattr(qt_app, "quit", None)
+            if callable(quit_app):
+                quit_app()
 
-    server_thread = threading.Thread(target=_run_server, daemon=True)
+    server_thread = threading.Thread(
+        target=_run_server,
+        name="ucrawl-web-server",
+        daemon=False,
+    )
     server_thread.start()
 
     tray = create_tray_icon(qt_app, url, shutdown_event)
@@ -285,7 +308,15 @@ def run_server_with_qt(
     timer.timeout.connect(_check_shutdown)
     timer.start(100)
     qt_app.exec()
-    server_thread.join(timeout=5)
+    server_thread.join(timeout=_QT_SERVER_JOIN_TIMEOUT)
+    if server_thread.is_alive():
+        request_shutdown()
+        if escalate_shutdown is not None:
+            escalate_shutdown()
+        server_thread.join(timeout=_QT_SERVER_FORCE_JOIN_TIMEOUT)
+    if server_thread.is_alive() or not outcome["clean"]:
+        return outcome["code"] or 1
+    return outcome["code"]
 
 def run_server_without_qt(*, serve_async: Callable[[], Coroutine[Any, Any, None]]) -> None:
     asyncio.run(serve_async())

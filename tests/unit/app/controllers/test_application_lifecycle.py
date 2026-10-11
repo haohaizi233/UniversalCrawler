@@ -3,7 +3,10 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from app.controllers.application_lifecycle_mixin import ApplicationLifecycleMixin
+from app.controllers.application_lifecycle_mixin import (
+    ApplicationLifecycleMixin,
+    _MAX_FRONTEND_DESTROY_ATTEMPTS,
+)
 
 class _DummyLifecycleController(ApplicationLifecycleMixin):
     def __init__(self):
@@ -138,7 +141,9 @@ class ApplicationLifecycleMixinTests(unittest.TestCase):
 
         self.assertIs(caught.exception, primary)
         self.assertIs(completed, True)
-        self.assertEqual(controller.dl_manager.request_stop.call_count, 1)
+        self.assertTrue(controller._shutdown_rejects_new_work)
+        self.assertEqual(controller.dl_manager.request_stop.call_count, 0)
+        self.assertNotIn("downloads.request_stop", controller._application_shutdown_state.completed_steps)
         self.assertEqual(controller.dl_manager.stop_all.call_count, 2)
         controller.frontend_state_service.destroy.assert_called_once_with()
         controller.app_state.shutdown.assert_called_once_with()
@@ -150,7 +155,6 @@ class ApplicationLifecycleMixinTests(unittest.TestCase):
     def test_shutdown_stops_downloads_before_dependent_services(self):
         controller = _DummyLifecycleController()
         order = []
-        controller.dl_manager.request_stop.side_effect = lambda: order.append("request_stop")
         controller.dl_manager.stop_all.side_effect = lambda: order.append("stop_all") or True
         controller.frontend_state_service = Mock()
         controller.frontend_state_service.destroy.side_effect = lambda: order.append("frontend") or True
@@ -167,7 +171,9 @@ class ApplicationLifecycleMixinTests(unittest.TestCase):
             drained = controller.shutdown()
 
         self.assertIs(drained, True)
-        self.assertEqual(order[:2], ["request_stop", "stop_all"])
+        self.assertEqual(order[0], "stop_all")
+        self.assertNotIn("request_stop", order)
+        self.assertTrue(controller._shutdown_rejects_new_work)
         for dependent in ("frontend", "app_state", "cache", "event_bus", "media", "spider"):
             self.assertGreater(order.index(dependent), order.index("stop_all"))
 
@@ -225,7 +231,6 @@ class ApplicationLifecycleMixinTests(unittest.TestCase):
 
             return callback
 
-        controller.dl_manager.request_stop.side_effect = record("request_stop")
         controller.dl_manager.stop_all.side_effect = lambda: release.wait(2.0) or True
         for signal_name in ("task_started", "task_progress", "task_finished", "task_error"):
             setattr(
@@ -267,7 +272,6 @@ class ApplicationLifecycleMixinTests(unittest.TestCase):
 
             self.assertIs(completed, False)
             qt_callbacks = {
-                "request_stop",
                 "timer.stop",
                 "timer.disconnect",
                 "scheduler.stop",
@@ -327,7 +331,8 @@ class ApplicationLifecycleMixinTests(unittest.TestCase):
             completed = controller.shutdown()
 
         self.assertIs(completed, True)
-        controller.dl_manager.request_stop.assert_called_once_with()
+        self.assertEqual(controller.dl_manager.request_stop.call_count, 0)
+        self.assertNotIn("downloads.request_stop", controller._application_shutdown_state.completed_steps)
         controller.dl_manager.stop_all.assert_called_once_with()
         self.assertEqual(controller.frontend_state_service.destroy.call_count, 2)
         controller.app_state.shutdown.assert_called_once_with()
@@ -359,7 +364,8 @@ class ApplicationLifecycleMixinTests(unittest.TestCase):
 
         self.assertIs(first, False)
         self.assertIs(second, True)
-        self.assertEqual(controller.dl_manager.request_stop.call_count, 1)
+        self.assertEqual(controller.dl_manager.request_stop.call_count, 0)
+        self.assertNotIn("downloads.request_stop", controller._application_shutdown_state.completed_steps)
         self.assertEqual(controller.dl_manager.stop_all.call_count, 2)
         controller.frontend_state_service.destroy.assert_called_once_with()
         controller.app_state.shutdown.assert_called_once_with()
@@ -385,12 +391,51 @@ class ApplicationLifecycleMixinTests(unittest.TestCase):
 
         self.assertIs(caught.exception, primary)
         self.assertIs(second, True)
-        controller.dl_manager.request_stop.assert_called_once_with()
+        self.assertEqual(controller.dl_manager.request_stop.call_count, 0)
+        self.assertNotIn("downloads.request_stop", controller._application_shutdown_state.completed_steps)
         controller.dl_manager.stop_all.assert_called_once_with()
         self.assertEqual(controller.frontend_state_service.destroy.call_count, 2)
         controller.app_state.shutdown.assert_called_once_with()
         controller.cache_service.close.assert_called_once_with()
         controller.event_bus.shutdown.assert_called_once_with()
+
+    def test_frontend_destroy_false_without_new_exception_stops_at_retry_limit(self):
+        controller = _DummyLifecycleController()
+        controller.frontend_state_service = Mock()
+        controller.frontend_state_service.destroy.return_value = False
+        controller.app_state = Mock()
+        controller.cache_service = Mock()
+        controller.event_bus = Mock()
+        controller._stop_active_spider = Mock()
+
+        with (
+            patch("app.controllers.application_lifecycle_mixin.debug_logger", Mock()),
+            patch(
+                "app.controllers.application_lifecycle_mixin._MAX_FRONTEND_DESTROY_ATTEMPTS",
+                3,
+            ),
+            self.assertRaises(RuntimeError) as caught,
+        ):
+            controller.shutdown()
+
+        state = controller._application_shutdown_state
+        state.thread.join(1.0)
+        self.assertEqual(_MAX_FRONTEND_DESTROY_ATTEMPTS, 24)
+        self.assertFalse(state.thread.daemon)
+        self.assertFalse(state.thread.is_alive())
+        self.assertTrue(state.done.is_set())
+        self.assertEqual(str(caught.exception), "frontend_state_service.destroy 在重试上限后仍未完成")
+        self.assertEqual(controller.frontend_state_service.destroy.call_count, 3)
+        self.assertEqual(
+            [(item[0], item[1], item[2]) for item in state.failures],
+            [(100, "frontend_state_service.destroy", caught.exception)],
+        )
+        self.assertNotIn("frontend_state_service.destroy", state.completed_steps)
+        controller.app_state.shutdown.assert_called_once_with()
+        controller.cache_service.close.assert_called_once_with()
+        controller.event_bus.shutdown.assert_called_once_with()
+        controller.host.cleanup_media.assert_called_once_with()
+        controller._stop_active_spider.assert_called_once_with()
 
     def test_shutdown_unsubscribes_deferred_domain_event_handlers(self):
         controller = _DummyLifecycleController()
@@ -411,6 +456,30 @@ class ApplicationLifecycleMixinTests(unittest.TestCase):
             "download.domain_event",
             controller._download_domain_event_handler,
         )
+
+    def test_shutdown_sets_reject_flag_and_skips_missing_request_stop(self):
+        controller = _DummyLifecycleController()
+
+        class Manager:
+            def __init__(self):
+                self.stopped = 0
+
+            def stop_all(self):
+                self.stopped += 1
+                return True
+
+        controller.dl_manager = Manager()
+        controller._stop_active_spider = Mock()
+
+        with patch("app.controllers.application_lifecycle_mixin.debug_logger", Mock()):
+            completed = controller.shutdown()
+
+        self.assertIs(completed, True)
+        self.assertTrue(controller._shutdown_rejects_new_work)
+        self.assertEqual(controller.dl_manager.stopped, 1)
+        self.assertNotIn("downloads.request_stop", controller._application_shutdown_state.completed_steps)
+        self.assertIn("downloads.stop_all", controller._application_shutdown_state.completed_steps)
+        self.assertFalse(hasattr(controller.dl_manager, "request_stop"))
 
     def test_run_exits_with_app_exec_code(self):
         controller = _DummyLifecycleController()

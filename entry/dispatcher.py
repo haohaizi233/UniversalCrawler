@@ -42,9 +42,6 @@ _CONSOLE_REQUIRED_MODES = frozenset(
         Mode.REPORT,
     }
 )
-_PERSISTENT_CONSOLE_MODES = frozenset({Mode.CLI, Mode.TEST})
-
-
 class _MenuUnavailable(Exception):
     """TUI 菜单无法显示（环境非交互）。
 
@@ -347,8 +344,9 @@ def prompt_mode_menu() -> Mode | None:
     3. **直接报错退出**：以上都不满足（无桌面环境）
 
     返回：
-        选中的 Mode；用户选退出则返回 None。
-        非交互环境（无 TTY 也无 Qt）时返回 None 并提示用户用 --mode 显式指定。
+        选中的 Mode；用户主动取消、关闭或 EOF 时返回 None。
+        没有 TTY 且 PyQt6 不可用，或 Qt 对话框无法构造时，抛出
+        ``_MenuUnavailable``，由 ``run()`` 转成退出码 2。
     """
     if not is_tty():
         # 非 TTY：先尝试 Qt 弹窗（IDE 场景下的最佳体验）
@@ -372,7 +370,7 @@ def prompt_mode_menu() -> Mode | None:
             "          python main.py --mode release  # 发布构建工具（仅源码开发态）\n"
             "      - 或设置环境变量: set UCRAWL_MODE=cli\n"
         )
-        return None
+        raise _MenuUnavailable()
 
     menu_items = _runtime_menu_items()
     # 选最长 label 宽度做对齐
@@ -537,7 +535,11 @@ def run(argv: Sequence[str] | None = None) -> int:
     return _dispatch(mode, passthrough)
 
 def _dispatch(mode: Mode, argv: Sequence[str]) -> int:
-    """按映射调用薄入口；目标入口退出码必须原样返回，不能由调度层改写。"""
+    """按映射调用薄入口。
+
+    直接运行的目标入口退出码必须原样返回。冻结窗口进程委托控制台
+    子进程时同样等待并传递该退出码。
+    """
     if _should_delegate_to_frozen_console(mode):
         return _spawn_frozen_console_mode(mode, argv)
     handler = _HANDLERS.get(mode)
@@ -564,23 +566,8 @@ def _spawn_frozen_console_mode(mode: Mode, argv: Sequence[str]) -> int:
             stream.write(f"error: missing frozen console launcher: {console_exe}\n")
         return 2
     command = [str(console_exe), "--mode", mode.value, *list(argv)]
-    if mode in _PERSISTENT_CONSOLE_MODES and not argv and os.name == "nt":
-        # CLI 帮助和安装包自检都可能在数秒内结束。由启动中心选择这些模式时
-        # 保留终端，既让 CLI 可继续输入，也让自检结果不会随进程退出而闪退。
-        # ``/D`` 禁用用户 AutoRun 钩子，固定可执行文件名则避免把安装路径
-        # 拼入 cmd 文本后再次经历一层转义。
-        comspec = os.environ.get("COMSPEC") or str(
-            Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "cmd.exe"
-        )
-        console_arguments = [FROZEN_CONSOLE_EXE_NAME, "--mode", mode.value]
-        if mode is Mode.CLI:
-            console_arguments.append("--help")
-        help_command = subprocess.list2cmdline(
-            console_arguments
-        )
-        command = [comspec, "/D", "/K", help_command]
     try:
-        subprocess.Popen(
+        process = subprocess.Popen(
             command,
             cwd=str(install_root),
             creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0),
@@ -591,7 +578,9 @@ def _spawn_frozen_console_mode(mode: Mode, argv: Sequence[str]) -> int:
         if stream is not None:
             stream.write(f"error: failed to start frozen console launcher: {exc}\n")
         return 2
-    return 0
+    # 新控制台只存活到子进程结束。父进程必须等待并传递退出码，
+    # 不能用 cmd /K 拉起后立刻返回 0。
+    return int(process.wait())
 
 if __name__ == "__main__":
     sys.exit(run())

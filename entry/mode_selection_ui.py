@@ -109,8 +109,23 @@ def _viewport_safe_dialog_minimum(
 def _load_app_icon() -> "QIcon | None":
     return load_qt_icon(["favicon.ico"], fallback_names=["Web.ico"])
 
+def _release_owned_qapplication(app: object) -> None:
+    """构造失败时丢掉本次新建的 QApplication，避免残留实例。"""
+
+    try:
+        from PyQt6 import sip
+
+        sip.delete(app)
+    except Exception:
+        return
+
+
 def _prompt_mode_with_qt() -> Mode | None:
-    """显示 Qt 模式对话框；取消、关闭或依赖导入失败时返回 None。"""
+    """显示 Qt 模式对话框。
+
+    取消、关闭或依赖导入失败时返回 None。``ChromedDialog`` 构造失败时
+    向 stderr 写出原因并抛出 ``_MenuUnavailable``，调用方据此返回退出码 2。
+    """
     try:
         from PyQt6.QtCore import QSize, Qt
         from PyQt6.QtGui import QKeySequence, QShortcut
@@ -131,6 +146,7 @@ def _prompt_mode_with_qt() -> Mode | None:
 
     btn_specs = _visible_qt_mode_specs()
     app = QApplication.instance()
+    owns_app = app is None
     if app is None:
         app = QApplication(sys.argv)
 
@@ -152,12 +168,22 @@ def _prompt_mode_with_qt() -> Mode | None:
             super().keyPressEvent(event)
 
     is_dark = resolve_is_dark_theme()
-    dialog = ChromedDialog(
-        title="UCrawl · 选择启动模式",
-        object_name="ModeSelectionDialog",
-        body_margins=(0, 0, 0, 0),
-        body_spacing=0,
-    )
+    try:
+        dialog = ChromedDialog(
+            title="UCrawl · 选择启动模式",
+            object_name="ModeSelectionDialog",
+            body_margins=(0, 0, 0, 0),
+            body_spacing=0,
+        )
+    except Exception as exc:
+        sys.stderr.write(
+            "❌ 无法构造模式选择对话框。\n"
+            f"   {exc}\n"
+        )
+        sys.stderr.flush()
+        if owns_app:
+            _release_owned_qapplication(app)
+        raise _MenuUnavailable() from exc
     dialog.apply_chrome_theme(is_dark)
     screen = QApplication.primaryScreen()
     if screen is not None:
@@ -505,9 +531,9 @@ def prompt_mode_menu() -> Mode | None:
     """返回用户选择的模式，或报告当前没有可用的交互通道。
 
     ``None`` 表示选择流程没有产生模式，例如取消、关闭、EOF、无效终端输入，
-    或 Qt 辅助函数未能创建对话框。仅当预检确认既无 TTY、也无 PyQt6 时才抛出
-    ``_MenuUnavailable``，且会先向 stderr 写出显式 ``--mode`` 的使用提示。
-    调用方应把该异常与普通的无选择结果分开处理。
+    或 Qt 依赖导入失败。没有 TTY 且 PyQt6 不可用，或 ``ChromedDialog`` 构造
+    失败时抛出 ``_MenuUnavailable``。前者会先向 stderr 写出显式 ``--mode``
+    的使用提示，后者会写出构造失败原因。调用方应把该异常与普通的无选择结果分开处理。
     """
     if not is_tty():
         if _has_pyqt6():

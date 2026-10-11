@@ -298,11 +298,32 @@ class CliSdkFacadeContractTests(unittest.TestCase):
 
         self.assertIs(runner_cls, runner_sentinel)
 
-    def test_sdk_package_exports_the_shared_runner(self):
-        from shared.cli_runner_runtime import CLIRunner as SharedCLIRunner
-        from ucrawl import CLIRunner
+    def test_sdk_package_exports_public_surface_only(self):
+        import ucrawl
 
-        self.assertIs(CLIRunner, SharedCLIRunner)
+        self.assertEqual(
+            set(ucrawl.__all__),
+            {
+                "UcrawlSDK",
+                "search",
+                "list_platforms",
+                "scan_directory",
+                "download_video",
+                "RuleSelection",
+                "PipeSelection",
+                "AutoSelection",
+                "SelectionStrategy",
+                "ToolsAPI",
+            },
+        )
+        for name in (
+            "CLIRunner",
+            "InteractiveTTYSelection",
+            "PipeOutput",
+            "is_selection_strategy",
+            "ToolRunnerUnavailableError",
+        ):
+            self.assertFalse(hasattr(ucrawl, name), name)
 
 class FastApiWorkflowRouteContractTests(unittest.TestCase):
     @classmethod

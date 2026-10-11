@@ -10,11 +10,13 @@ from entry.qt_entry_utils import ensure_windows_app_user_model_id, load_qt_icon
 def resolve_port_with_dialog(
     default_port: int,
     *,
+    host: str,
     is_port_in_use: Callable[[str, int], bool],
     port_probe_range: int,
 ) -> int:
     """在端口冲突时让用户选择另一个当前空闲的端口。
 
+    ``host`` 必须与 uvicorn 最终绑定的地址相同，不能另用通配地址探测。
     ``is_port_in_use`` 是只读探测回调：调用结束前必须关闭临时 socket，不得
     ``listen``、预留或持续占用端口。用户取消、关闭窗口或按 Esc 时抛出
     ``SystemExit(0)``；接受后会重新进入探测循环，最终只返回探测当时空闲的
@@ -57,7 +59,7 @@ def resolve_port_with_dialog(
     port = default_port
     while True:
         # 探测不能保留监听器；空闲结果只是服务器正式 bind 前的即时快照。
-        if not is_port_in_use("0.0.0.0", port):  # nosec B104
+        if not is_port_in_use(host, port):
             return port
 
         dialog = ChromedDialog(
@@ -310,7 +312,7 @@ def resolve_port_with_dialog(
                 break
             attempted += 1
             # 建议端口同样只做瞬时占用探测，不在对话框阶段预留。
-            if not is_port_in_use("0.0.0.0", candidate):  # nosec B104
+            if not is_port_in_use(host, candidate):
                 suggested = candidate
                 break
 

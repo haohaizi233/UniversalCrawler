@@ -215,9 +215,13 @@ class DispatcherTests(unittest.TestCase):
                     patch.object(dispatcher.subprocess, "Popen") as popen,
                     patch.object(dispatcher, "_HANDLERS", {mode: direct_handler}),
                 ):
+                    process = Mock()
+                    process.wait.return_value = 7
+                    popen.return_value = process
                     result = dispatcher._dispatch(mode, ["--help"])
 
-                self.assertEqual(result, 0)
+                self.assertEqual(result, 7)
+                process.wait.assert_called_once_with()
                 resolved_root = install_root.resolve()
                 popen.assert_called_once_with(
                     [
@@ -251,7 +255,7 @@ class DispatcherTests(unittest.TestCase):
         run_cli.assert_called_once_with(["--help"])
         popen.assert_not_called()
 
-    def test_frozen_windowed_launcher_opens_persistent_cli_shell_without_args(self):
+    def test_frozen_windowed_launcher_waits_for_cli_without_args(self):
         from entry import dispatcher
 
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -260,24 +264,23 @@ class DispatcherTests(unittest.TestCase):
             console_launcher = install_root / "UCrawlCLI.exe"
             windowed_launcher.touch()
             console_launcher.touch()
-            comspec = r"C:\Windows\System32\cmd.exe"
             direct_handler = Mock()
             with (
                 patch.object(dispatcher.sys, "frozen", True, create=True),
                 patch.object(dispatcher.sys, "executable", str(windowed_launcher)),
                 patch.object(dispatcher.subprocess, "Popen") as popen,
                 patch.object(dispatcher, "_HANDLERS", {dispatcher.Mode.CLI: direct_handler}),
-                patch.dict(dispatcher.os.environ, {"COMSPEC": comspec}),
             ):
+                process = Mock()
+                process.wait.return_value = 4
+                popen.return_value = process
                 result = dispatcher._dispatch(dispatcher.Mode.CLI, [])
 
         resolved_root = install_root.resolve()
-        console_command = subprocess.list2cmdline(
-            ["UCrawlCLI.exe", "--mode", "cli", "--help"]
-        )
-        self.assertEqual(result, 0)
+        self.assertEqual(result, 4)
+        process.wait.assert_called_once_with()
         popen.assert_called_once_with(
-            [comspec, "/D", "/K", console_command],
+            [str(resolved_root / "UCrawlCLI.exe"), "--mode", "cli"],
             cwd=str(resolved_root),
             creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0),
             shell=False,
@@ -304,10 +307,14 @@ class DispatcherTests(unittest.TestCase):
                     {dispatcher.Mode.INTERACTIVE: direct_handler},
                 ),
             ):
+                process = Mock()
+                process.wait.return_value = 5
+                popen.return_value = process
                 result = dispatcher._dispatch(dispatcher.Mode.INTERACTIVE, [])
 
         resolved_root = install_root.resolve()
-        self.assertEqual(result, 0)
+        self.assertEqual(result, 5)
+        process.wait.assert_called_once_with()
         popen.assert_called_once_with(
             [str(resolved_root / "UCrawlCLI.exe"), "--mode", "interactive"],
             cwd=str(resolved_root),
@@ -316,7 +323,7 @@ class DispatcherTests(unittest.TestCase):
         )
         direct_handler.assert_not_called()
 
-    def test_frozen_windowed_launcher_keeps_default_test_results_visible(self):
+    def test_frozen_windowed_launcher_waits_for_test_without_args(self):
         from entry import dispatcher
 
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -325,24 +332,23 @@ class DispatcherTests(unittest.TestCase):
             console_launcher = install_root / "UCrawlCLI.exe"
             windowed_launcher.touch()
             console_launcher.touch()
-            comspec = r"C:\Windows\System32\cmd.exe"
             direct_handler = Mock()
             with (
                 patch.object(dispatcher.sys, "frozen", True, create=True),
                 patch.object(dispatcher.sys, "executable", str(windowed_launcher)),
                 patch.object(dispatcher.subprocess, "Popen") as popen,
                 patch.object(dispatcher, "_HANDLERS", {dispatcher.Mode.TEST: direct_handler}),
-                patch.dict(dispatcher.os.environ, {"COMSPEC": comspec}),
             ):
+                process = Mock()
+                process.wait.return_value = 9
+                popen.return_value = process
                 result = dispatcher._dispatch(dispatcher.Mode.TEST, [])
 
         resolved_root = install_root.resolve()
-        console_command = subprocess.list2cmdline(
-            ["UCrawlCLI.exe", "--mode", "test"]
-        )
-        self.assertEqual(result, 0)
+        self.assertEqual(result, 9)
+        process.wait.assert_called_once_with()
         popen.assert_called_once_with(
-            [comspec, "/D", "/K", console_command],
+            [str(resolved_root / "UCrawlCLI.exe"), "--mode", "test"],
             cwd=str(resolved_root),
             creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0),
             shell=False,
@@ -622,12 +628,96 @@ class DispatcherTests(unittest.TestCase):
              patch("builtins.input", side_effect=EOFError):
             self.assertIsNone(dispatcher.prompt_mode_menu())
 
-    def test_prompt_mode_returns_none_when_neither_tty_nor_qt(self):
-        """非 TTY + 无 PyQt6 → 返回 None（让 run() 退出码 2）。"""
+    def test_run_returns_2_when_real_menu_has_no_interactive_channel(self):
+        """非 TTY + 无 PyQt6：真实菜单路径让 run() 返回 2，而不是当成取消。"""
         from entry import dispatcher
+        stderr = io.StringIO()
         with patch.object(dispatcher, "is_tty", return_value=False), \
-             patch.object(dispatcher, "_has_pyqt6", return_value=False):
-            self.assertIsNone(dispatcher.prompt_mode_menu())
+             patch.object(dispatcher, "_has_pyqt6", return_value=False), \
+             patch.object(dispatcher.sys, "stderr", stderr):
+            self.assertEqual(dispatcher.run([]), 2)
+        self.assertIn("--mode", stderr.getvalue())
+
+    def test_run_returns_2_when_real_menu_dialog_cannot_be_constructed(self):
+        """对话框构造失败写 stderr，真实菜单路径让 run() 返回 2。"""
+        from app.ui.dialogs.chromed_dialog import ChromedDialog
+        from entry import dispatcher
+
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PyQt6.QtWidgets import QApplication
+
+        created_app = QApplication.instance() is None
+        stderr = io.StringIO()
+
+        def _boom(self, *args, **kwargs):
+            raise RuntimeError("dialog backend failed")
+
+        with patch.object(dispatcher, "is_tty", return_value=False), \
+             patch.object(dispatcher, "_has_pyqt6", return_value=True), \
+             patch.object(ChromedDialog, "__init__", _boom), \
+             patch("entry.mode_selection_ui.sys.stderr", stderr):
+            self.assertEqual(dispatcher.run([]), 2)
+        self.assertIn("无法构造模式选择对话框", stderr.getvalue())
+        if created_app:
+            self.assertIsNone(QApplication.instance())
+
+    def test_gui_entry_returns_close_failure_without_waiting_for_guardian(self):
+        import threading
+        from types import SimpleNamespace
+
+        from entry import gui_entry
+
+        blocked = threading.Event()
+        guardian = threading.Thread(target=blocked.wait, args=(30,), daemon=True)
+        guardian.start()
+        state = SimpleNamespace(failures=[], done=threading.Event(), thread=guardian)
+        controller = Mock()
+        controller.run.side_effect = SystemExit(0)
+        controller._application_shutdown_state = state
+        with patch(
+            "app.controllers.application_controller.ApplicationController",
+            return_value=controller,
+        ), patch.object(gui_entry, "_existing_qapplication", return_value=None):
+            code = gui_entry.main([])
+        self.assertEqual(code, 1)
+        self.assertTrue(guardian.is_alive())
+        blocked.set()
+
+    def test_gui_entry_keeps_event_loop_code_when_shutdown_finished(self):
+        import threading
+        from types import SimpleNamespace
+
+        from entry import gui_entry
+
+        state = SimpleNamespace(failures=[], done=threading.Event(), thread=None)
+        state.done.set()
+        controller = Mock()
+        controller.run.side_effect = SystemExit(3)
+        controller._application_shutdown_state = state
+        with patch(
+            "app.controllers.application_controller.ApplicationController",
+            return_value=controller,
+        ), patch.object(gui_entry, "_existing_qapplication", return_value=None):
+            self.assertEqual(gui_entry.main([]), 3)
+
+    def test_gui_entry_reads_exit_code_hook(self):
+        import threading
+        from types import SimpleNamespace
+
+        from entry import gui_entry
+
+        state = SimpleNamespace(failures=[], done=threading.Event(), thread=None)
+        state.done.set()
+        controller = Mock()
+        controller.run.return_value = 0
+        controller._application_shutdown_state = state
+        with patch(
+            "app.controllers.application_controller.ApplicationController",
+            return_value=controller,
+        ), patch.object(gui_entry, "_existing_qapplication", return_value=None), patch.dict(
+            os.environ, {"UCRAWL_GUI_EXIT_CODE": "4"}
+        ):
+            self.assertEqual(gui_entry.main([]), 4)
 
 if __name__ == "__main__":
     unittest.main()

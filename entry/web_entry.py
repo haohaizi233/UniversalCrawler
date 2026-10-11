@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import inspect
 import ipaddress
 import os
 import signal
@@ -69,6 +70,46 @@ def _is_port_in_use(host: str, port: int) -> bool:
         except OSError:
             return True
 
+def _reserve_listener(host: str, port: int) -> socket.socket | None:
+    """绑定并监听最终端口，把套接字占住交给 uvicorn，避免探测后被抢走。"""
+    normalized_host = str(host or "").strip().strip("[]")
+    try:
+        family = socket.AF_INET6 if ipaddress.ip_address(normalized_host).version == 6 else socket.AF_INET
+    except ValueError:
+        family = socket.AF_INET
+    sock = socket.socket(family, socket.SOCK_STREAM)
+    try:
+        if family == socket.AF_INET6:
+            try:
+                sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+            except OSError:
+                pass
+        sock.bind((normalized_host, port))
+        sock.listen(socket.SOMAXCONN)
+    except OSError:
+        sock.close()
+        return None
+    return sock
+
+
+def _close_listener(listener: socket.socket | None) -> None:
+    if listener is None:
+        return
+    try:
+        listener.close()
+    except OSError:
+        pass
+
+
+def _server_accepts_sockets(server: object) -> bool:
+    serve = getattr(server, "serve", None)
+    try:
+        parameters = inspect.signature(serve).parameters
+    except (TypeError, ValueError):
+        return False
+    return "sockets" in parameters
+
+
 def _find_available_port(host: str, start_port: int, max_probe: int = _PORT_PROBE_RANGE) -> int | None:
     """从 start_port 开始顺延查找可用端口，最多尝试 max_probe 次。
 
@@ -100,12 +141,13 @@ def _ensure_app_user_model_id() -> None:
 
     ensure_windows_app_user_model_id(WEB_APP_USER_MODEL_ID)
 
-def _resolve_port_with_dialog(default_port: int) -> int:
-    """委托 Qt 对话框选择端口，并注入不保留监听 socket 的占用探测。"""
+def _resolve_port_with_dialog(default_port: int, host: str) -> int:
+    """委托 Qt 对话框选择端口；探测 host 与 uvicorn 绑定 host 相同。"""
     from entry.web_port_dialog import resolve_port_with_dialog
 
     return resolve_port_with_dialog(
         default_port,
+        host=host,
         is_port_in_use=_is_port_in_use,
         port_probe_range=_PORT_PROBE_RANGE,
     )
@@ -190,7 +232,6 @@ def main(argv: list[str] | None = None) -> int:
         parser.error(str(exc))
 
     qt_app = None
-    tray = None
     shutdown_event = threading.Event()
 
     from cli import __version__
@@ -199,6 +240,7 @@ def main(argv: list[str] | None = None) -> int:
         build_web_url,
         resolve_existing_web_url,
         resolve_web_access_token,
+        run_server_with_qt,
         try_reuse_existing_instance,
     )
     from app.utils.runtime_paths import user_data_root
@@ -260,7 +302,7 @@ def main(argv: list[str] | None = None) -> int:
             args.port = new_port
         else:
             # Qt 模式让用户确认建议端口或输入其他端口。
-            args.port = _resolve_port_with_dialog(args.port)
+            args.port = _resolve_port_with_dialog(args.port, args.host)
 
     from app.web.server import create_app
     from app.web.script_api import parse_kv_args, inject_script_async
@@ -276,13 +318,19 @@ def main(argv: list[str] | None = None) -> int:
                 web_controller,
                 strict=args.script_strict,
                 delay=args.script_delay,
+                app=app,
                 **script_kwargs,
             )
         yield
         registry = getattr(app.state, "web_session_registry", None)
         shutdown_all = getattr(registry, "shutdown_all", None)
         if callable(shutdown_all):
-            shutdown_all(wait=True, timeout=5.0)
+            drained = shutdown_all(wait=True, timeout=5.0)
+            if drained is False:
+                app.state.web_shutdown_drained = False
+                if exit_code[0] == 0:
+                    exit_code[0] = 1
+                sys.stderr.write("Web 会话关闭超时，仍有会话未排空。\n")
         else:
             # 兼容自定义 create_app 实现的后备清理路径。
             from app.web.server import controller
@@ -323,6 +371,11 @@ def main(argv: list[str] | None = None) -> int:
     signal.signal(signal.SIGINT, _signal_handler)
     signal.signal(signal.SIGTERM, _signal_handler)
 
+    listener = _reserve_listener(args.host, args.port)
+    if listener is None:
+        sys.stderr.write(f"错误: 无法绑定 {args.host}:{args.port}，启动已中止。\n")
+        return 1
+
     import uvicorn
     server = uvicorn.Server(
         uvicorn.Config(
@@ -335,11 +388,24 @@ def main(argv: list[str] | None = None) -> int:
         )
     )
 
-    def _request_web_shutdown() -> None:
+    exit_code = [0]
+
+    def request_web_shutdown(code: int = 0) -> None:
+        """排空后关闭 Web 服务，并保留脚本失败退出码。
+
+        ``app.state.web_shutdown_callback`` 是 ``--script-strict`` 的关闭入口。
+        注入脚本会收到本应用；回调存在时由这里记下退出码并结束服务。
+        """
+        if isinstance(code, int) and code != 0:
+            exit_code[0] = code
         shutdown_event.set()
         server.should_exit = True
 
-    app.state.web_shutdown_callback = _request_web_shutdown
+    def _escalate_web_shutdown() -> None:
+        server.should_exit = True
+        server.force_exit = True
+
+    app.state.web_shutdown_callback = request_web_shutdown
 
     # 抑制 asyncio ProactorEventLoop 在 Windows 上的连接重置噪音
     # 根因：远程服务器关闭连接后，asyncio 回调中调用 socket.shutdown()，
@@ -369,38 +435,41 @@ def main(argv: list[str] | None = None) -> int:
     async def _serve_with_patch():
         loop = asyncio.get_running_loop()
         _patch_proactor_exc_handler(loop)
-        await server.serve()
+        if _server_accepts_sockets(server):
+            await server.serve(sockets=[listener])
+        else:
+            _close_listener(listener)
+            await server.serve()
+        if getattr(app.state, "web_shutdown_drained", True) is False:
+            raise SystemExit(exit_code[0] or 1)
 
-    if qt_app:
-        # Qt 模式：uvicorn 在后台线程，主线程跑 QApplication.exec()
-        def _run_server():
-            asyncio.run(_serve_with_patch())
-
-        server_thread = threading.Thread(target=_run_server, daemon=True)
-        server_thread.start()
-
-        tray = _create_tray_icon(qt_app, url, shutdown_event)
-
-        from PyQt6.QtCore import QTimer
-
-        def _check_shutdown():
-            if shutdown_event.is_set():
-                timer.stop()
-                server.should_exit = True
-                if tray:
-                    tray.hide()
-                qt_app.quit()
-
-        timer = QTimer()
-        timer.timeout.connect(_check_shutdown)
-        timer.start(100)
-        qt_app.exec()
-        server_thread.join(timeout=5)
-    else:
-        # 无 Qt 模式：主线程直接跑 asyncio（同样应用连接重置异常抑制）
-        asyncio.run(_serve_with_patch())
-
-    return 0
+    try:
+        if qt_app:
+            status = run_server_with_qt(
+                qt_app,
+                url=url,
+                shutdown_event=shutdown_event,
+                serve_async=_serve_with_patch,
+                create_tray_icon=_create_tray_icon,
+                request_shutdown=request_web_shutdown,
+                escalate_shutdown=_escalate_web_shutdown,
+            )
+            if status != 0:
+                return status
+        else:
+            # 无 Qt 模式：主线程直接跑 asyncio（同样应用连接重置异常抑制）
+            try:
+                asyncio.run(_serve_with_patch())
+            except SystemExit as exc:
+                code = exc.code
+                if code is None:
+                    code = 0
+                elif not isinstance(code, int):
+                    code = 1
+                return exit_code[0] or code
+        return exit_code[0]
+    finally:
+        _close_listener(listener)
 
 if __name__ == "__main__":
     sys.exit(main())

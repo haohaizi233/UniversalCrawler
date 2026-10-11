@@ -9,10 +9,13 @@ from typing import Any
 from app.debug_logger import debug_logger
 
 DOWNLOAD_STOP_WAIT_SECONDS = 2.0
+# 与下层 frontend shutdown guardian 的 24 次同量级。False 且无新异常时不能无限重试，
+# 否则非 daemon 关闭线程不会结束，并会在下层 guardian 退出后再次拉起。
+_MAX_FRONTEND_DESTROY_ATTEMPTS = 24
 _SHUTDOWN_STATE_LOCK = threading.RLock()
+_SHUTDOWN_STEP_MISSING = object()
 _REQUIRED_SHUTDOWN_STEPS = frozenset(
     {
-        "downloads.request_stop",
         "downloads.stop_all",
         "release_timer.stop",
         "release_timer.disconnect",
@@ -70,11 +73,39 @@ def _attempt_shutdown_step(
             state.failures.append((order, action, failure))
         _log_shutdown_failure(action, failure)
         return False
-    if result is False:
+    if result is False or result is _SHUTDOWN_STEP_MISSING:
         return False
     with state.lock:
         state.completed_steps.add(action)
     return True
+
+
+def _declared_callable(owner: Any, method: str):
+    """只调用类型上真实声明的方法，避免把不存在的入口记成已完成。"""
+    if owner is None:
+        return None
+    candidate = getattr(type(owner), method, None)
+    if not callable(candidate):
+        return None
+    module = str(getattr(candidate, "__module__", "") or "")
+    if module.startswith("unittest.mock"):
+        return None
+    return getattr(owner, method)
+
+
+def _mark_shutdown_rejects_new_work(controller: Any) -> None:
+    try:
+        setattr(controller, "_shutdown_rejects_new_work", True)
+    except Exception:
+        pass
+
+
+def _request_existing_download_stop(controller: Any) -> Any:
+    """DownloadManager 没有 request_stop。缺失时不能记入 completed_steps；真实停止入口是 stop_all。"""
+    callback = _declared_callable(getattr(controller, "dl_manager", None), "request_stop")
+    if callback is None:
+        return _SHUTDOWN_STEP_MISSING
+    return callback()
 
 
 def _call_optional(owner: Any, attribute: str, method: str, *args: Any, **kwargs: Any) -> Any:
@@ -178,13 +209,24 @@ def _run_application_shutdown(controller: Any, state: _ApplicationShutdownState)
             if len(state.failures) != failures_before:
                 continue
             delay = 0.01
-            while result is False:
+            attempts = 1
+            while result is False and attempts < _MAX_FRONTEND_DESTROY_ATTEMPTS:
                 threading.Event().wait(delay)
                 failures_before = len(state.failures)
                 result = _attempt_shutdown_step(state, order, action, callback)
+                attempts += 1
                 if len(state.failures) != failures_before:
                     break
                 delay = min(0.25, delay * 2.0)
+            if result is False and attempts >= _MAX_FRONTEND_DESTROY_ATTEMPTS:
+                failure = RuntimeError("frontend_state_service.destroy 在重试上限后仍未完成")
+                should_log = False
+                with state.lock:
+                    if len(state.failures) == failures_before:
+                        state.failures.append((order, action, failure))
+                        should_log = True
+                if should_log:
+                    _log_shutdown_failure(action, failure)
     finally:
         state.downloads_done.set()
         state.done.set()
@@ -259,6 +301,7 @@ def _run_gui_cleanup(controller: Any, state: _ApplicationShutdownState) -> None:
 
 
 def _get_or_start_shutdown_state(controller: Any) -> _ApplicationShutdownState:
+    _mark_shutdown_rejects_new_work(controller)
     with _SHUTDOWN_STATE_LOCK:
         state = getattr(controller, "_application_shutdown_state", None)
         if isinstance(state, _ApplicationShutdownState):
@@ -290,7 +333,7 @@ def _get_or_start_shutdown_state(controller: Any) -> _ApplicationShutdownState:
             state,
             0,
             "downloads.request_stop",
-            lambda: _call_optional(controller, "dl_manager", "request_stop"),
+            lambda: _request_existing_download_stop(controller),
         )
         try:
             state.thread = threading.Thread(

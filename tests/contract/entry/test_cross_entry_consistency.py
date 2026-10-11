@@ -660,7 +660,14 @@ class EntryResultStructureConsistencyTests(unittest.TestCase):
                 headers=_auth_headers(client),
             ).json()
 
-        self.assertEqual(cli_result, expected)
+        self.assertEqual(
+            cli_result,
+            {
+                "status": "error",
+                "local_path": "",
+                "error": "下载失败: boom",
+            },
+        )
         self.assertEqual(sdk_result, expected)
         for field in ("status", "url", "source", "title", "error", "save_dir", "local_path", "content_type", "meta"):
             self.assertEqual(api_result[field], expected[field])

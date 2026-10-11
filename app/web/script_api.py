@@ -82,11 +82,40 @@ def _auto_convert(v: str):
     except ValueError:
         return v
 
+def _resolve_web_shutdown_callback(app: Any | None):
+    candidate = app
+    if candidate is None:
+        from app.web.server import active_web_app
+
+        candidate = active_web_app
+    state = getattr(candidate, "state", None)
+    callback = getattr(state, "web_shutdown_callback", None)
+    return callback if callable(callback) else None
+
+
+def _deliver_strict_exit(exit_code: int, loop: Any | None) -> None:
+    """把脚本退出码交到正在跑服务的线程，不在工作线程里吞掉。"""
+
+    if loop is not None and getattr(loop, "is_running", lambda: False)():
+        loop.call_soon_threadsafe(_raise_system_exit, exit_code)
+        return
+    # 宿主事件循环已停且没有关闭回调：SystemExit 在线程里会被
+    # threading.excepthook 静默忽略，严格失败必须保证进程按退出码结束。
+    sys.stderr.write(f"❌ 宿主事件循环已停止且无关闭回调，按退出码 {exit_code} 结束进程\n")
+    sys.stderr.flush()
+    os._exit(exit_code)
+
+
+def _raise_system_exit(exit_code: int) -> None:
+    raise SystemExit(exit_code)
+
+
 def inject_script_async(
     script_path: str,
     controller: Any,
     strict: bool = False,
     delay: float = 0.0,
+    app: Any | None = None,
     **kwargs,
 ) -> threading.Thread:
     """异步执行注入脚本（不阻塞 Web 服务）。
@@ -96,11 +125,19 @@ def inject_script_async(
         controller: WebController 实例
         strict: 脚本失败时是否退出 Web 服务
         delay: 执行前延迟秒数
+        app: 持有 web_shutdown_callback 的应用；回调存在时走回调
         **kwargs: 传递给脚本的参数
 
     返回:
         脚本执行线程
     """
+    try:
+        import asyncio
+
+        host_loop = asyncio.get_running_loop()
+    except RuntimeError:
+        host_loop = None
+
     def _run():
         import time
         if delay > 0:
@@ -112,12 +149,19 @@ def inject_script_async(
             rc = 1
         if rc != 0 and strict:
             print(f"❌ 注入脚本退出码 {rc}，按 --script-strict 退出")
-            import os
-            os._exit(rc)
+            callback = _resolve_web_shutdown_callback(app)
+            if callback is not None:
+                callback(rc)
+                return
+            _deliver_strict_exit(rc, host_loop)
         else:
             print(f"✅ 注入脚本完成 (rc={rc})")
 
-    thread = threading.Thread(target=_run, daemon=True, name="injected-script")
+    thread = threading.Thread(
+        target=_run,
+        daemon=not strict,
+        name="injected-script",
+    )
     thread.start()
     print(f"[注入] 启动脚本线程: {script_path}")
     return thread

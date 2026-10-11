@@ -4,7 +4,7 @@ from asyncio import to_thread
 from json import loads
 from re import compile
 from typing import TYPE_CHECKING
-from urllib.parse import unquote, urlsplit
+from urllib.parse import unquote, urljoin, urlsplit
 
 from shared.network.pinned_transport import (
     PinnedTransport,
@@ -12,7 +12,7 @@ from shared.network.pinned_transport import (
     canonicalize_host,
     canonicalize_request_target,
 )
-from shared.runtime_options import DomainPolicyViolation
+from shared.runtime_options import DomainPolicyEngine, DomainPolicyViolation
 
 try:
     from ..tools import (
@@ -22,6 +22,7 @@ try:
         capture_error_request,
         wait,
     )
+    from ..tools.retry import abort_if_stopped
 except ImportError:
     # 独立加载该文件时保留最小兼容层，避免工具包导入失败阻断链接解析。
     TIMEOUT = 10
@@ -43,6 +44,9 @@ except ImportError:
 
     async def wait():
         pass
+
+    async def abort_if_stopped(_owner):
+        return False
 
 if TYPE_CHECKING:
     from httpx import AsyncClient, get, head
@@ -83,13 +87,65 @@ def is_douyin_public_host(host: str) -> bool:
 
 
 def is_douyin_public_url(url: str) -> bool:
-    """Validate one HTTP(S) URL before the public pinned transport sees it."""
+    """Validate one HTTPS platform URL before the public pinned transport sees it."""
 
     try:
         target = canonicalize_request_target(url)
     except (DomainPolicyViolation, UnicodeError, ValueError):
         return False
-    return is_douyin_public_host(target.host)
+    return target.scheme == "https" and is_douyin_public_host(target.host)
+
+
+def is_platform_redirect_hop(url: str, *, first_hop: bool, live_text: bool = False) -> bool:
+    """允许平台后缀上的 https；http 只可能出现在短链首跳。"""
+
+    if live_text and is_douyin_live_reflow_url(url):
+        return True
+    try:
+        target = canonicalize_request_target(url)
+    except (DomainPolicyViolation, UnicodeError, ValueError):
+        return False
+    if not is_douyin_public_host(target.host):
+        return False
+    if target.scheme == "https":
+        return True
+    return bool(first_hop and target.scheme == "http")
+
+
+def headers_for_platform_hop(
+    headers: dict[str, str] | None,
+    url: str,
+    *,
+    live: bool = False,
+) -> dict[str, str]:
+    """http 首跳去掉 Cookie 和 Authorization；直播回流额外去掉敏感头。"""
+
+    blocked: set[str] = set()
+    if live:
+        blocked.update(_SENSITIVE_LIVE_HEADERS)
+    try:
+        scheme = urlsplit(url).scheme.lower()
+    except ValueError:
+        scheme = ""
+    if scheme != "https":
+        blocked.update({"authorization", "cookie", "proxy-authorization"})
+    source = headers or {}
+    if not blocked:
+        return dict(source)
+    return {
+        str(key): value
+        for key, value in source.items()
+        if str(key).lower() not in blocked
+    }
+
+
+def _redirect_location(headers: dict | None) -> str:
+    if not isinstance(headers, dict):
+        return ""
+    for key, value in headers.items():
+        if str(key).lower() == "location" and value:
+            return str(value)
+    return ""
 
 
 def is_douyin_live_reflow_url(url: str) -> bool:
@@ -157,6 +213,7 @@ class Requester:
         self.log = params.logger
         self.max_retry = params.max_retry
         self.timeout = params.timeout
+        self._stop_check = getattr(params, "stop_requested", None)
         self.transport = transport or PinnedTransport(timeout=float(self.timeout))
 
     async def aclose(self) -> None:
@@ -170,6 +227,8 @@ class Requester:
             proxy: str = None,
     ) -> str:
         """逐个展开文本 URL，并以空格连接有效结果。"""
+        if not isinstance(text, str) or not text.strip():
+            return ""
         urls = self.URL.finditer(text)
         if not urls:
             return ""
@@ -194,37 +253,54 @@ class Requester:
             proxy: str = None,
     ):
         del proxy
-        is_live_reflow = content == "text" and is_douyin_live_reflow_url(url)
-        if not is_douyin_public_url(url) and not is_live_reflow:
+        original = url
+        live_text = content == "text" and is_douyin_live_reflow_url(url)
+        if not is_platform_redirect_hop(url, first_hop=True, live_text=live_text):
             return url
-
-        request_headers = self.headers
-        if is_live_reflow:
-            request_headers = {
-                key: value
-                for key, value in self.headers.items()
-                if key.lower() not in _SENSITIVE_LIVE_HEADERS
-            }
 
         self.log.info("Resolving a public Douyin/TikTok URL", False)
-        try:
-            response = await to_thread(
-                self.transport.request,
-                "GET",
-                url,
-                headers=request_headers,
-                max_redirects=5,
-            )
-        except DomainPolicyViolation:
-            self.log.warning("Blocked an unsafe Douyin/TikTok redirect", False)
-            return url
-        except Exception as error:
-            if not _is_retryable_transport_error(error):
-                raise
-            self.log.warning("Transport request failed; retrying", False)
-            return None
+        current = url
+        response = None
+        for hop_index in range(6):
+            if await abort_if_stopped(self):
+                self.finished = True
+                return None
+            try:
+                response = await to_thread(
+                    self.transport.request,
+                    "GET",
+                    current,
+                    headers=headers_for_platform_hop(
+                        self.headers,
+                        current,
+                        live=live_text,
+                    ),
+                    max_redirects=0,
+                )
+            except DomainPolicyViolation:
+                self.log.warning("Blocked an unsafe Douyin/TikTok redirect", False)
+                return original
+            except Exception as error:
+                if not _is_retryable_transport_error(error):
+                    raise
+                self.log.warning("Transport request failed; retrying", False)
+                return None
 
-        self.log.info(f"Response Code: {response.status_code}", False)
+            self.log.info(f"Response Code: {response.status_code}", False)
+            location = _redirect_location(getattr(response, "headers", None))
+            if response.status_code not in DomainPolicyEngine.REDIRECT_STATUS_CODES or not location:
+                break
+            if hop_index >= 5:
+                self.log.warning("Blocked an unsafe Douyin/TikTok redirect", False)
+                return original
+            next_url = urljoin(str(getattr(response, "url", None) or current), location)
+            if not is_platform_redirect_hop(next_url, first_hop=False, live_text=live_text):
+                self.log.warning("Blocked an unsafe Douyin/TikTok redirect", False)
+                return original
+            current = next_url
+
+        if response is None:
+            return original
 
         match content:
             case "text":

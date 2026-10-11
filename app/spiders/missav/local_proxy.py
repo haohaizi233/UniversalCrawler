@@ -53,6 +53,19 @@ def chromium_proxy_bypass_switch() -> str:
     return "--proxy-bypass-list=localhost;127.0.0.1;::1;<local>"
 
 
+def chromium_proxy_launch_args(proxy_server: str | None) -> list[str]:
+    """可见模式和无头模式共用的出口参数。直连时显式禁用继承来的系统代理。"""
+    text = str(proxy_server or "").strip()
+    if not text:
+        return ["--no-proxy-server"]
+    return [chromium_proxy_switch(text), chromium_proxy_bypass_switch()]
+
+
+def browser_egress_proxy(proxy_server: str | None) -> str | None:
+    """下载元数据使用的代理，与浏览器启动参数指向的出口一致。"""
+    return str(proxy_server or "").strip() or None
+
+
 def is_unreachable_loopback_proxy(proxy_url: str, *, timeout: float = _CONNECT_TIMEOUT_SECONDS) -> bool:
     """仅当代理明确指向本机且端口拒绝连接时返回 True。"""
     parsed = urllib.parse.urlparse(str(proxy_url or "").strip())

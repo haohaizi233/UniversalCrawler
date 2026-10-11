@@ -4,6 +4,8 @@ from json.decoder import JSONDecodeError
 from ssl import SSLError
 from typing import TYPE_CHECKING, Union
 from httpx import HTTPStatusError, NetworkError, RequestError, TimeoutException
+
+from .log_redact import redact_logged_text
 try:
     from ..translation import _
 except ImportError:
@@ -31,7 +33,7 @@ def capture_error_params(function):
         ):
             logger.error(_("响应内容不是有效的 JSON 数据"))
         except HTTPStatusError as e:
-            logger.error(_("响应码异常：{error}").format(error=e))
+            logger.error(_("响应码异常：{error}").format(error=redact_logged_text(e)))
         except NetworkError as e:
             logger.error(_("网络异常：{error}").format(error=e))
         except TimeoutException as e:
@@ -52,7 +54,7 @@ def capture_error_request(function):
         except (JSONDecodeError, UnicodeDecodeError):
             self.log.error(_("响应内容不是有效的 JSON 数据，请尝试更新 Cookie！"))
         except HTTPStatusError as e:
-            self.log.error(_("响应码异常：{error}").format(error=e))
+            self.log.error(_("响应码异常：{error}").format(error=redact_logged_text(e)))
         except NetworkError as e:
             self.log.error(_("网络异常：{error}").format(error=e))
         except TimeoutException as e:

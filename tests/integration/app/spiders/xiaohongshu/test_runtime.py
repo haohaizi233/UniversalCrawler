@@ -10,6 +10,7 @@ from types import MethodType
 from unittest.mock import Mock, patch
 
 from app.core.downloaders.xiaohongshu import XiaohongshuDownloader
+from app.exceptions import SpiderParseError
 from app.services.auth_service import AuthService
 from app.spiders.xiaohongshu.client import XiaohongshuClient
 from app.spiders.xiaohongshu.helpers import (
@@ -17,6 +18,8 @@ from app.spiders.xiaohongshu.helpers import (
     CreatorLookupInfo,
     CreatorUrlInfo,
     extract_first_url,
+    extract_image_entries,
+    extract_note_detail_from_html,
     extract_video_candidates,
     parse_creator_lookup_input,
     parse_creator_info_from_url,
@@ -232,6 +235,49 @@ class XiaohongshuHelperTests(unittest.TestCase):
         self.assertEqual(candidates[0], "http://sns-bak-v1.xhscdn.com/stream/1/110/114/demo_114.mp4")
         self.assertEqual(candidates[-1], "http://sns-video-bd.xhscdn.com/stream/origin/demo.mp4")
 
+    def test_extract_video_candidates_does_not_fall_back_to_cover(self):
+        candidates = extract_video_candidates(
+            {
+                "type": "video",
+                "video": {"image": {"url": "https://cdn.example.com/cover.jpg"}},
+                "image_list": [{"url_default": "https://cdn.example.com/cover.jpg"}],
+            }
+        )
+        self.assertEqual(candidates, [])
+
+    def test_extract_image_entries_prefers_wb_dft_and_camel_case(self):
+        images = extract_image_entries(
+            {
+                "imageList": [
+                    {
+                        "urlDefault": "https://cdn.example.com/default.jpg",
+                        "infoList": [
+                            {"imageScene": "WB_PRV", "url": "https://cdn.example.com/preview.jpg"},
+                            {"imageScene": "WB_DFT", "url": "https://cdn.example.com/origin.jpg"},
+                        ],
+                    }
+                ]
+            }
+        )
+        self.assertEqual(images, [{"image_url": "https://cdn.example.com/origin.jpg"}])
+
+    def test_extract_note_detail_from_html_truncates_at_first_script_and_keeps_string_undefined(self):
+        html = (
+            "<html><script>window.__INITIAL_STATE__="
+            '{"note":{"noteDetailMap":{"note-1":{"note":{"note_id":"note-1","title":"say undefined","flag":undefined}}}}}'
+            "</script><script>window.__INITIAL_STATE__="
+            '{"note":{"noteDetailMap":{"note-1":{"note":{"title":"second"}}}}}'
+            "</script></html>"
+        )
+        detail = extract_note_detail_from_html("note-1", html)
+        self.assertEqual(detail["title"], "say undefined")
+        self.assertIsNone(detail["flag"])
+
+    def test_extract_note_detail_from_html_raises_when_json_is_invalid(self):
+        html = '<script>window.__INITIAL_STATE__={"note":{"noteDetailMap": bad}}</script>'
+        with self.assertRaises(SpiderParseError):
+            extract_note_detail_from_html("note-1", html)
+
     def test_build_items_falls_back_to_note_id_when_title_sanitizes_to_untitled(self):
         builder = XiaohongshuTaskBuilder()
         items = builder.build_items(
@@ -304,6 +350,22 @@ class XiaohongshuTaskBuilderTests(unittest.TestCase):
         self.assertEqual(items[0].url, "https://cdn.example.com/1.jpg")
         self.assertEqual(items[1].url, "https://cdn.example.com/2.webp")
 
+    def test_build_items_does_not_use_cover_when_video_has_no_playable_url(self):
+        items = self.builder.build_items(
+            {
+                "note_id": "note-cover",
+                "type": "video",
+                "title": "只有封面",
+                "user": {"nickname": "作者"},
+                "images_data": [{"image_url": "https://cdn.example.com/cover.jpg"}],
+            },
+            trace_id_factory=lambda suffix: f"{suffix}-trace",
+            referer="https://www.xiaohongshu.com/explore/note-cover",
+            user_agent="ua-demo",
+            cookie_str="a1=demo",
+        )
+        self.assertEqual(items, [])
+
 class XiaohongshuAuthTests(unittest.TestCase):
     def test_self_info_payload_detects_logged_in_state(self):
         self.assertTrue(
@@ -326,6 +388,32 @@ class XiaohongshuAuthTests(unittest.TestCase):
                 cookie_str = spider._load_saved_cookie_string()
         self.assertEqual(cookie_str, "")
         self.assertFalse(os.path.exists(spider.auth_file))
+
+    def test_saved_cookie_is_kept_when_probe_is_inconclusive(self):
+        spider = XiaohongshuSpider("test", {})
+        spider.auth_service = AuthService()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            spider.auth_file = os.path.join(temp_dir, "xhs_auth.json")
+            spider.auth_service.save_json_file(
+                spider.auth_file,
+                [{"name": "a1", "value": "kept-cookie"}],
+            )
+            with patch.object(spider, "_probe_cookie_login_status", return_value=None):
+                cookie_str = spider._load_saved_cookie_string()
+            self.assertIn("a1=kept-cookie", cookie_str)
+            self.assertTrue(os.path.exists(spider.auth_file))
+            self.assertTrue(spider._login_probe_cached)
+            self.assertIsNone(spider._login_probe_status)
+
+    def test_probe_client_is_closed_when_probe_fails(self):
+        spider = XiaohongshuSpider("test", {})
+        client = Mock()
+        client.check_cookie_ready.return_value = True
+        client.probe_login_status.side_effect = RuntimeError("probe failed")
+        with patch.object(spider, "_build_client", return_value=client):
+            with self.assertRaises(RuntimeError):
+                spider._probe_cookie_login_status("a1=demo")
+        client.close.assert_called_once()
 
     def test_logged_in_page_requires_profile_entry_or_session_change(self):
         spider = XiaohongshuSpider("test", {})
@@ -651,13 +739,29 @@ class XiaohongshuAuthTests(unittest.TestCase):
         mocked_client.get_note_detail.return_value = {}
         mocked_client.get_note_detail_from_html.return_value = {"note_id": "note-1", "type": "video"}
 
-        with patch.object(spider.parser, "normalize_note", return_value={"note_id": "note-1", "type": "video"}) as mocked_normalize:
+        with patch.object(
+            spider.parser,
+            "normalize_note",
+            return_value={
+                "note_id": "note-1",
+                "type": "video",
+                "video_candidates": ["https://cdn.example.com/video.mp4"],
+            },
+        ) as mocked_normalize, patch.object(spider, "_pause_between_detail_requests") as mocked_pause:
             detail = spider._fetch_note_detail(
                 mocked_client,
                 {"note_id": "note-1", "xsec_source": "pc_search", "xsec_token": "token-1"},
             )
 
-        self.assertEqual(detail, {"note_id": "note-1", "type": "video"})
+        self.assertEqual(
+            detail,
+            {
+                "note_id": "note-1",
+                "type": "video",
+                "video_candidates": ["https://cdn.example.com/video.mp4"],
+            },
+        )
+        mocked_pause.assert_called_once()
         mocked_client.get_note_detail_from_html.assert_called_once_with(
             note_id="note-1",
             xsec_source="pc_search",
@@ -665,23 +769,37 @@ class XiaohongshuAuthTests(unittest.TestCase):
         )
         mocked_normalize.assert_called_once()
 
-    def test_fetch_note_detail_triggers_cooldown_on_461(self):
+    def test_fetch_note_detail_opens_circuit_on_461_and_skips_html(self):
         spider = XiaohongshuSpider("主页", {})
         mocked_client = Mock()
-        response = Mock(status_code=461)
+        response = Mock(status_code=461, text="")
+        response.json.side_effect = ValueError("not json")
         http_error = requests.HTTPError("status code 461")
         http_error.response = response
         mocked_client.get_note_detail.side_effect = http_error
 
-        with patch.object(spider, "_pause_between_requests") as mocked_pause, patch.object(spider, "log") as mocked_log:
+        with patch.object(spider, "_pause_between_detail_requests") as mocked_pause, patch.object(
+            spider, "_pause_between_requests"
+        ) as mocked_list_pause:
+            with self.assertRaises(SpiderParseError):
+                spider._fetch_note_detail(
+                    mocked_client,
+                    {"note_id": "note-1", "xsec_source": "pc_search", "xsec_token": "token-1"},
+                )
+            self.assertTrue(spider._detail_circuit_is_open())
+            mocked_client.get_note_detail_from_html.assert_not_called()
+            mocked_pause.assert_called_once()
+            mocked_list_pause.assert_not_called()
+            mocked_client.get_note_detail.reset_mock()
             detail = spider._fetch_note_detail(
                 mocked_client,
-                {"note_id": "note-1", "xsec_source": "pc_search", "xsec_token": "token-1"},
+                {"note_id": "note-2", "xsec_source": "pc_search", "xsec_token": "token-2"},
             )
 
         self.assertIsNone(detail)
-        mocked_pause.assert_called_once_with(multiplier=4.0)
-        mocked_log.assert_any_call("⏳ 小红书返回 461，触发限流冷却后继续")
+        mocked_client.get_note_detail.assert_not_called()
+        mocked_client.get_note_detail_from_html.assert_not_called()
+        self.assertEqual(mocked_pause.call_count, 1)
 
     @patch.object(XiaohongshuSpider, "_collect_search_refs")
     @patch.object(XiaohongshuSpider, "_handle_multi_refs")
@@ -858,6 +976,162 @@ class XiaohongshuAuthTests(unittest.TestCase):
         self.assertIn("_configured_timeout_ms", lookup_code.co_names)
         self.assertIn(60, bootstrap_code.co_consts)
         self.assertIn(60, lookup_code.co_consts)
+
+    def test_collect_search_refs_reuses_one_search_id(self):
+        spider = XiaohongshuSpider("美女", {"max_items": 50, "search_max_pages": 3})
+        mocked_client = Mock()
+        mocked_client.search_notes.side_effect = [
+            {"items": [{"id": "note-1", "xsec_token": "token-1"}], "has_more": True},
+            {"items": [{"id": "note-2", "xsec_token": "token-2"}], "has_more": False},
+        ]
+        with patch("app.spiders.xiaohongshu.spider.build_search_id", return_value="stable-search") as mocked_build:
+            refs = spider._collect_search_refs(mocked_client, "美女")
+
+        self.assertEqual([item["note_id"] for item in refs], ["note-1", "note-2"])
+        mocked_build.assert_called_once()
+        self.assertEqual(
+            [call.kwargs["search_id"] for call in mocked_client.search_notes.call_args_list],
+            ["stable-search", "stable-search"],
+        )
+
+    def test_collect_creator_refs_stops_when_cursor_or_page_is_unchanged(self):
+        spider = XiaohongshuSpider("主页", {"max_items": 20, "search_max_pages": 5})
+        mocked_client = Mock()
+        mocked_client.get_creator_notes.side_effect = [
+            {"notes": [{"note_id": "note-1"}], "cursor": "cursor-1", "has_more": True},
+            {"notes": [{"note_id": "note-1"}], "cursor": "cursor-2", "has_more": True},
+            {"notes": [{"note_id": "note-3"}], "cursor": "cursor-3", "has_more": True},
+        ]
+
+        refs = spider._collect_creator_refs(
+            mocked_client,
+            CreatorUrlInfo(user_id="user-1", xsec_token="token", xsec_source="pc_feed"),
+        )
+
+        self.assertEqual([item["note_id"] for item in refs], ["note-1"])
+        self.assertEqual(mocked_client.get_creator_notes.call_count, 2)
+
+    def test_collect_creator_refs_stops_at_search_page_cap(self):
+        spider = XiaohongshuSpider("主页", {"max_items": 20, "search_max_pages": 2})
+        mocked_client = Mock()
+        mocked_client.get_creator_notes.side_effect = [
+            {"notes": [{"noteId": "note-1", "displayTitle": "一", "userInfo": {"nickName": "作者"}}], "cursor": "c1", "has_more": True},
+            {"notes": [{"note_id": "note-2"}], "cursor": "c2", "has_more": True},
+            {"notes": [{"note_id": "note-3"}], "cursor": "c3", "has_more": True},
+        ]
+
+        refs = spider._collect_creator_refs(
+            mocked_client,
+            CreatorUrlInfo(user_id="user-1", xsec_token="token", xsec_source="pc_feed", nickname="主页"),
+        )
+
+        self.assertEqual([item["note_id"] for item in refs], ["note-1", "note-2"])
+        self.assertEqual(refs[0]["title"], "一")
+        self.assertEqual(refs[0]["author"], "作者")
+        self.assertEqual(refs[0]["xsec_source"], "pc_feed")
+        self.assertEqual(mocked_client.get_creator_notes.call_count, 2)
+
+    def test_fetch_note_detail_skips_html_after_stop(self):
+        spider = XiaohongshuSpider("主页", {})
+        mocked_client = Mock()
+
+        def stop_after_feed(**_kwargs):
+            spider.is_running = False
+            return {}
+
+        mocked_client.get_note_detail.side_effect = stop_after_feed
+        with patch.object(spider, "_pause_between_detail_requests"):
+            detail = spider._fetch_note_detail(
+                mocked_client,
+                {"note_id": "note-1", "xsec_source": "pc_search", "xsec_token": "token-1"},
+            )
+
+        self.assertIsNone(detail)
+        mocked_client.get_note_detail_from_html.assert_not_called()
+
+    def test_fetch_note_detail_rejects_cover_only_video(self):
+        spider = XiaohongshuSpider("主页", {})
+        mocked_client = Mock()
+        mocked_client.get_note_detail.return_value = {
+            "note_id": "note-1",
+            "type": "video",
+            "image_list": [{"url": "https://cdn.example.com/cover.jpg"}],
+        }
+        with patch.object(spider, "_pause_between_detail_requests"):
+            with self.assertRaises(SpiderParseError):
+                spider._fetch_note_detail(
+                    mocked_client,
+                    {"note_id": "note-1", "xsec_source": "pc_search", "xsec_token": "token-1"},
+                )
+        mocked_client.get_note_detail_from_html.assert_not_called()
+
+    def test_stopped_task_does_not_revive_after_downloads_are_queued(self):
+        spider = XiaohongshuSpider("主页", {"stream_downloads": True})
+        refs = [{"note_id": "note-1", "xsec_source": "pc_feed", "xsec_token": "token-1"}]
+
+        def fetch_detail(_client, ref):
+            spider.is_running = False
+            return {"note_id": ref["note_id"]}
+
+        with patch.object(spider, "_fetch_note_detail", side_effect=fetch_detail), patch.object(
+            spider, "_emit_note_items", return_value=1
+        ), patch.object(spider, "revive_for_partial_selection") as mocked_revive:
+            spider._handle_multi_refs_streaming(Mock(), refs, "a1=demo")
+
+        mocked_revive.assert_not_called()
+        self.assertFalse(spider.is_running)
+
+    def test_executor_shutdown_cancels_futures_when_stopped(self):
+        from concurrent.futures import Future
+
+        spider = XiaohongshuSpider("主页", {"stream_downloads": True})
+        spider.is_running = False
+        refs = [{"note_id": "note-1", "xsec_source": "pc_feed", "xsec_token": "token-1"}]
+        created = []
+
+        class _Executor:
+            def __init__(self, *args, **kwargs):
+                created.append(self)
+                self.shutdown_calls = []
+
+            def submit(self, fn, arg):
+                future = Future()
+                try:
+                    future.set_result(fn(arg))
+                except Exception as exc:
+                    future.set_exception(exc)
+                return future
+
+            def shutdown(self, wait=True, cancel_futures=False):
+                self.shutdown_calls.append((wait, cancel_futures))
+
+        with patch("app.spiders.xiaohongshu.spider.ThreadPoolExecutor", _Executor):
+            spider._handle_multi_refs_streaming(Mock(), refs, "a1=demo")
+
+        self.assertEqual(created[0].shutdown_calls, [(True, True)])
+
+    @patch.object(XiaohongshuSpider, "_handle_note_url")
+    @patch.object(XiaohongshuSpider, "_ensure_cookie_string", return_value="a1=demo")
+    @patch.object(XiaohongshuSpider, "_build_client")
+    def test_run_reuses_probe_from_the_same_saved_cookie(
+        self,
+        mocked_build_client,
+        _mocked_ensure_cookie,
+        _mocked_handle_note_url,
+    ):
+        spider = XiaohongshuSpider(
+            "https://www.xiaohongshu.com/explore/66fad51c000000001b0224b8?xsec_token=demo-token&xsec_source=pc_search",
+            {},
+        )
+        spider._login_probe_cached = True
+        spider._login_probe_cookie = "a1=demo"
+        spider._login_probe_status = True
+        mocked_build_client.return_value.check_cookie_ready.return_value = True
+        mocked_build_client.return_value.probe_login_status.side_effect = AssertionError("duplicate probe")
+
+        spider.run()
+
+        mocked_build_client.return_value.probe_login_status.assert_not_called()
 
 class XiaohongshuDownloaderTests(unittest.TestCase):
     @patch("app.core.downloaders.xiaohongshu.XiaohongshuDownloader._download_with_strategy_fallback")

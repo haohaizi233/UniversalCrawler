@@ -4,12 +4,12 @@ from __future__ import annotations
 
 import os
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, CancelledError, ThreadPoolExecutor, wait
 from typing import Any
 from urllib.parse import quote
 
 import requests
-from playwright.sync_api import Error as PlaywrightError, sync_playwright
+from playwright.sync_api import Error as PlaywrightError, TimeoutError as PlaywrightTimeoutError, sync_playwright
 
 from app.config import DEFAULT_USER_AGENT, cfg, get_setting_default
 from app.debug_logger import debug_logger
@@ -22,12 +22,22 @@ from shared.runtime_options import DomainPolicyViolation
 
 from .client import XiaohongshuClient
 from .helpers import (
+    AUTHOR_NAME_KEYS,
+    RED_ID_KEYS,
+    USER_ID_KEYS,
+    XSEC_SOURCE_KEYS,
+    XSEC_TOKEN_KEYS,
     CreatorLookupInfo,
     CreatorUrlInfo,
     NoteUrlInfo,
+    build_search_id,
+    embedded_note_user,
     extract_first_url,
+    extract_note_ref,
+    note_display_title,
     is_creator_url,
     is_note_url,
+    note_has_downloadable_media,
     parse_creator_lookup_input,
     parse_creator_info_from_url,
     parse_note_info_from_note_url,
@@ -55,6 +65,11 @@ class XiaohongshuSpider(BaseSpider):
         )
         self._detail_request_count = 0
         self._detail_request_lock = threading.RLock()
+        self._detail_circuit_open = False
+        self._detail_circuit_lock = threading.Lock()
+        self._login_probe_cookie = ""
+        self._login_probe_status: bool | None = None
+        self._login_probe_cached = False
         self._client: XiaohongshuClient | None = None
         self.user_agent = resolve_user_agent(
             "xiaohongshu",
@@ -140,13 +155,6 @@ class XiaohongshuSpider(BaseSpider):
                 return text
         return ""
 
-    @staticmethod
-    def _nested_dict(*values: object) -> dict[str, Any]:
-        for value in values:
-            if isinstance(value, dict):
-                return value
-        return {}
-
     @classmethod
     def _detail_worker_count(cls, total: int) -> int:
         return max(1, min(int(total or 1), cls.DETAIL_WORKER_CAP))
@@ -160,79 +168,114 @@ class XiaohongshuSpider(BaseSpider):
 
     @staticmethod
     def _extract_search_ref(entry: dict[str, Any]) -> dict[str, str] | None:
-        if not isinstance(entry, dict):
+        return extract_note_ref(entry, fallback_source="pc_search")
+
+    def _detail_circuit_is_open(self) -> bool:
+        with self._detail_circuit_lock:
+            return self._detail_circuit_open
+
+    def _open_detail_circuit(self, kind: str) -> None:
+        labels = {"461": "461", "login": "登录失效", "captcha": "验证码"}
+        with self._detail_circuit_lock:
+            already_open = self._detail_circuit_open
+            self._detail_circuit_open = True
+        if not already_open:
+            self.log(f"⛔ 小红书详情熔断（{labels.get(kind, kind)}），已停止后续详情和 HTML 兜底")
+
+    @staticmethod
+    def _exception_status_code(exc: BaseException) -> int | None:
+        status_code = getattr(getattr(exc, "response", None), "status_code", None)
+        if isinstance(status_code, int):
+            return status_code
+        return None
+
+    @classmethod
+    def _exception_business_code(cls, exc: BaseException) -> int | None:
+        response = getattr(exc, "response", None)
+        payload = None
+        if response is not None:
+            try:
+                payload = response.json()
+            except (TypeError, ValueError, AttributeError):
+                payload = None
+        if isinstance(payload, dict):
+            code = payload.get("code")
+            if isinstance(code, int):
+                return code
+            if isinstance(code, str) and code.lstrip("-").isdigit():
+                return int(code)
+        text = str(exc)
+        marker = "code="
+        index = text.find(marker)
+        if index < 0:
             return None
-        if entry.get("model_type") in {"rec_query", "hot_query"}:
+        rest = text[index + len(marker):]
+        digits = []
+        if rest.startswith("-"):
+            digits.append("-")
+            rest = rest[1:]
+        for char in rest:
+            if char.isdigit():
+                digits.append(char)
+                continue
+            break
+        if digits in {[], ["-"]}:
             return None
-        note_card = entry.get("note_card") if isinstance(entry.get("note_card"), dict) else {}
-        note_info = entry.get("note_info") if isinstance(entry.get("note_info"), dict) else {}
-        note = entry.get("note") if isinstance(entry.get("note"), dict) else {}
-        note_id = str(
-            entry.get("id")
-            or entry.get("note_id")
-            or note_card.get("note_id")
-            or note_card.get("id")
-            or note_info.get("note_id")
-            or note_info.get("id")
-            or note.get("note_id")
-            or note.get("id")
-            or ""
-        ).strip()
-        if not note_id:
-            return None
-        user = XiaohongshuSpider._nested_dict(
-            note_card.get("user"),
-            note_card.get("user_info"),
-            note_info.get("user"),
-            note_info.get("user_info"),
-            note.get("user"),
-            entry.get("user"),
-            entry.get("author"),
-        )
-        title = XiaohongshuSpider._first_text(
-            entry.get("display_title"),
-            entry.get("title"),
-            note_card.get("display_title"),
-            note_card.get("title"),
-            note_info.get("display_title"),
-            note_info.get("title"),
-            note.get("display_title"),
-            note.get("title"),
-            note.get("desc"),
-        )
-        author = XiaohongshuSpider._first_text(
-            user.get("nickname"),
-            user.get("nick_name"),
-            user.get("name"),
-        )
-        note_type = XiaohongshuSpider._first_text(
-            entry.get("type"),
-            entry.get("note_type"),
-            note_card.get("type"),
-            note_card.get("note_type"),
-            note_info.get("type"),
-            note.get("type"),
-        )
-        return {
-            "note_id": note_id,
-            "xsec_source": str(
-                entry.get("xsec_source")
-                or note_card.get("xsec_source")
-                or note_info.get("xsec_source")
-                or note.get("xsec_source")
-                or "pc_search"
-            ),
-            "xsec_token": str(
-                entry.get("xsec_token")
-                or note_card.get("xsec_token")
-                or note_info.get("xsec_token")
-                or note.get("xsec_token")
-                or ""
-            ),
-            "title": title,
-            "author": author,
-            "note_type": note_type,
-        }
+        return int("".join(digits))
+
+    @classmethod
+    def _detail_failure_kind(cls, exc: BaseException) -> str | None:
+        if cls._exception_status_code(exc) == 461:
+            return "461"
+        code = cls._exception_business_code(exc)
+        if code in {-100, -101, 300012}:
+            return "login"
+        if code == 300011:
+            return "captcha"
+        response = getattr(exc, "response", None)
+        body = str(getattr(response, "text", "") or "")
+        blob = f"{exc}\n{body}".lower()
+        if "验证码" in blob or "captcha" in blob or "verifytype" in blob or "verify_type" in blob:
+            return "captcha"
+        if "登录已过期" in blob or "登录失效" in blob or "login expired" in blob or "请先登录" in blob:
+            return "login"
+        return None
+
+    def _raise_if_detail_blocked(self, exc: BaseException, note_id: str) -> None:
+        kind = self._detail_failure_kind(exc)
+        if kind:
+            self._open_detail_circuit(kind)
+            raise SpiderParseError(f"小红书详情触发熔断: {note_id}") from exc
+        if isinstance(exc, SpiderParseError):
+            raise
+        raise SpiderParseError(f"获取小红书笔记失败: {note_id}") from exc
+
+    def _open_page(self, page, url: str, *, timeout_ms: int, settle_ms: int = 3000) -> bool:
+        """先提交导航，再分段等待加载，以便停止请求不必耗完整超时。"""
+        if not self.interruptible_playwright_goto(
+            page,
+            url,
+            wait_until="commit",
+            timeout=timeout_ms,
+        ):
+            return False
+        if not self.is_running or self.interrupt_requested:
+            return False
+        try:
+            loaded = self.interruptible_wait_for_load_state(
+                page,
+                "domcontentloaded",
+                timeout=timeout_ms,
+            )
+        except PlaywrightTimeoutError:
+            if not self.is_running or self.interrupt_requested:
+                return False
+            loaded = True
+        if not loaded or not self.is_running or self.interrupt_requested:
+            return False
+        if settle_ms > 0 and not self.interruptible_page_wait(page, settle_ms):
+            return False
+        return bool(self.is_running and not self.interrupt_requested)
 
     def _resolve_short_share_url(self, url: str) -> str:
         candidate = str(url or "").strip()
@@ -294,9 +337,12 @@ class XiaohongshuSpider(BaseSpider):
         if not cookie_str:
             return False
         client = self._build_client(cookie_str)
-        if not client.check_cookie_ready():
-            return False
-        return client.probe_login_status()
+        try:
+            if not client.check_cookie_ready():
+                return False
+            return client.probe_login_status()
+        finally:
+            client.close()
 
     def _page_shows_logged_in_state(self, page, *, context, baseline_web_session: str = "") -> bool:
         try:
@@ -319,14 +365,18 @@ class XiaohongshuSpider(BaseSpider):
         if not cookie_str:
             return ""
         login_status = self._probe_cookie_login_status(cookie_str)
-        if login_status is True:
-            return cookie_str
+        self._login_probe_cookie = cookie_str
+        self._login_probe_status = login_status
+        self._login_probe_cached = True
         if login_status is False:
+            self._login_probe_cached = False
+            self._login_probe_cookie = ""
             self.log("⚠️ 本地小红书 Cookie 已失效，已丢弃并准备重新登录")
             self._discard_saved_cookie_file()
-        else:
-            self.log("⚠️ 无法确认本地小红书 Cookie 登录态，本次将重新获取会话")
-        return ""
+            return ""
+        if login_status is None:
+            self.log("⚠️ 无法确认本地小红书 Cookie 登录态，继续使用已保存 Cookie")
+        return cookie_str
 
     def _save_context_cookies(self, context) -> str:
         cookies = context.cookies()
@@ -363,14 +413,8 @@ class XiaohongshuSpider(BaseSpider):
                 page = context.new_page()
                 target = entry_url or self.HOME_URL
                 baseline_web_session = self._current_web_session(context.cookies())
-                if not self.interruptible_playwright_goto(
-                    page,
-                    target,
-                    wait_until="domcontentloaded",
-                    timeout=self._configured_timeout_ms(default=60),
-                ):
-                    return ""
-                if not self.interruptible_page_wait(page, 3000):
+                timeout_ms = self._configured_timeout_ms(default=60)
+                if not self._open_page(page, target, timeout_ms=timeout_ms, settle_ms=3000):
                     return ""
                 if self._page_shows_logged_in_state(page, context=context, baseline_web_session=baseline_web_session):
                     cookie_str = self._save_context_cookies(context)
@@ -417,30 +461,37 @@ class XiaohongshuSpider(BaseSpider):
         note_id = ref.get("note_id", "")
         xsec_source = ref.get("xsec_source", "")
         xsec_token = ref.get("xsec_token", "")
+        if not self.is_running or self._detail_circuit_is_open():
+            return None
         with self._detail_request_lock:
             self._detail_request_count += 1
+            multiplier = self._detail_pause_multiplier()
+        self._pause_between_detail_requests(multiplier=multiplier)
+        if not self.is_running or self._detail_circuit_is_open():
+            return None
         try:
             detail = client.get_note_detail(note_id=note_id, xsec_source=xsec_source, xsec_token=xsec_token)
-            if not detail:
+        except (requests.HTTPError, SpiderParseError) as exc:
+            self._raise_if_detail_blocked(exc, note_id)
+            return None
+        if not detail:
+            if not self.is_running or self._detail_circuit_is_open():
+                return None
+            try:
                 detail = client.get_note_detail_from_html(
                     note_id=note_id,
                     xsec_source=xsec_source,
                     xsec_token=xsec_token,
                 )
-            if not detail:
-                self.log(f"⚠️ 无法解析小红书笔记详情: {note_id}")
+            except (requests.HTTPError, SpiderParseError) as exc:
+                self._raise_if_detail_blocked(exc, note_id)
                 return None
-            return self.parser.normalize_note(detail)
-        except requests.HTTPError as exc:
-            status_code = getattr(getattr(exc, "response", None), "status_code", None)
-            self.log(f"⚠️ 获取小红书笔记失败: {note_id} | {exc}")
-            if status_code == 461:
-                self.log("⏳ 小红书返回 461，触发限流冷却后继续")
-                self._pause_between_requests(multiplier=4.0)
-            return None
-        except Exception as exc:
-            self.log(f"⚠️ 获取小红书笔记失败: {note_id} | {exc}")
-            return None
+        if not detail:
+            raise SpiderParseError(f"无法解析小红书笔记详情: {note_id}")
+        normalized = self.parser.normalize_note(detail)
+        if not note_has_downloadable_media(normalized):
+            raise SpiderParseError(f"小红书笔记没有可下载媒体: {note_id}")
+        return normalized
 
     def _emit_note_items(self, note: dict[str, Any], cookie_str: str, referer: str) -> int:
         items = self.task_builder.build_items(
@@ -470,8 +521,9 @@ class XiaohongshuSpider(BaseSpider):
             },
         )
         if not note:
-            self.log("❌ 未能获取指定小红书笔记详情")
-            return
+            if not self.is_running:
+                return
+            raise SpiderParseError("未能获取指定小红书笔记详情")
         count = self._emit_note_items(note, cookie_str, referer=referer)
         self.log(f"✅ 已生成 {count} 个小红书下载任务")
 
@@ -481,6 +533,7 @@ class XiaohongshuSpider(BaseSpider):
         limit = self._max_items_limit()
         page_size = 20
         max_pages = self._search_max_pages()
+        search_id = build_search_id()
         for page in range(1, max_pages + 1):
             if not self.is_running or len(refs) >= limit:
                 break
@@ -489,6 +542,7 @@ class XiaohongshuSpider(BaseSpider):
                 keyword=keyword,
                 page=page,
                 page_size=page_size,
+                search_id=search_id,
                 sort=str(
                     self.config.get("sort")
                     or cfg.get("xiaohongshu", "sort", get_setting_default("xiaohongshu", "sort"))
@@ -527,7 +581,10 @@ class XiaohongshuSpider(BaseSpider):
         seen: set[str] = set()
         cursor = ""
         limit = self._max_items_limit()
-        while self.is_running and len(refs) < limit:
+        max_pages = self._search_max_pages()
+        for _page in range(1, max_pages + 1):
+            if not self.is_running or len(refs) >= limit:
+                break
             self.log(f"👤 正在读取小红书作者笔记列表... 已抓到 {len(refs)}/{limit}")
             data = client.get_creator_notes(
                 user_id=creator.user_id,
@@ -536,42 +593,37 @@ class XiaohongshuSpider(BaseSpider):
                 xsec_source=creator.xsec_source or "pc_feed",
             )
             notes = data.get("notes") or []
+            page_added = 0
             for entry in notes:
-                if not isinstance(entry, dict):
+                ref = extract_note_ref(
+                    entry,
+                    default_source=creator.xsec_source or "pc_feed",
+                    default_token=creator.xsec_token,
+                    default_author=creator.nickname,
+                    fallback_source="pc_feed",
+                )
+                if not ref:
                     continue
-                note_id = str(entry.get("note_id") or entry.get("id") or "")
-                if not note_id or note_id in seen:
+                note_id = ref["note_id"]
+                if note_id in seen:
                     continue
                 seen.add(note_id)
-                user = self._nested_dict(entry.get("user"), entry.get("user_info"), entry.get("author"))
-                refs.append(
-                    {
-                        "note_id": note_id,
-                        "xsec_source": str(entry.get("xsec_source") or creator.xsec_source or "pc_feed"),
-                        "xsec_token": str(entry.get("xsec_token") or creator.xsec_token or ""),
-                        "title": self._first_text(
-                            entry.get("display_title"),
-                            entry.get("title"),
-                            entry.get("desc"),
-                        ),
-                        "author": self._first_text(
-                            user.get("nickname"),
-                            user.get("nick_name"),
-                            user.get("name"),
-                            creator.nickname,
-                        ),
-                        "note_type": self._first_text(entry.get("type"), entry.get("note_type")),
-                    }
-                )
+                refs.append(ref)
+                page_added += 1
                 if self._should_log_progress(len(refs), limit):
                     self.log(f"📚 主页候选累计 {len(refs)}/{limit}")
                 if len(refs) >= limit:
                     break
-            if len(refs) >= limit or not data.get("has_more", False):
+            next_cursor = str(data.get("cursor") or "")
+            if (
+                len(refs) >= limit
+                or page_added == 0
+                or not data.get("has_more", False)
+                or not next_cursor
+                or next_cursor == cursor
+            ):
                 break
-            cursor = str(data.get("cursor") or "")
-            if not cursor:
-                break
+            cursor = next_cursor
             self._pause_between_requests(multiplier=1.5)
         return refs
 
@@ -593,24 +645,27 @@ class XiaohongshuSpider(BaseSpider):
                 if isinstance(entry.get("user_card"), dict)
                 else entry
             )
-            user_id = str(user.get("user_id") or user.get("id") or user.get("userid") or "").strip()
+            user_id = self._first_text(*(user.get(key) for key in USER_ID_KEYS))
             if not user_id or user_id in seen:
                 continue
             seen.add(user_id)
             candidates.append(
                 CreatorUrlInfo(
                     user_id=user_id,
-                    xsec_token=str(user.get("xsec_token") or entry.get("xsec_token") or ""),
-                    xsec_source=str(user.get("xsec_source") or entry.get("xsec_source") or "pc_search"),
-                    nickname=str(user.get("nickname") or user.get("nick_name") or entry.get("title") or "").strip(),
-                    red_id=str(
-                        user.get("red_id")
-                        or user.get("redId")
-                        or user.get("xhs_id")
-                        or user.get("display_id")
-                        or user.get("redid")
-                        or ""
-                    ).strip(),
+                    xsec_token=self._first_text(
+                        *(user.get(key) for key in XSEC_TOKEN_KEYS),
+                        *(entry.get(key) for key in XSEC_TOKEN_KEYS),
+                    ),
+                    xsec_source=self._first_text(
+                        *(user.get(key) for key in XSEC_SOURCE_KEYS),
+                        *(entry.get(key) for key in XSEC_SOURCE_KEYS),
+                        "pc_search",
+                    ),
+                    nickname=self._first_text(
+                        *(user.get(key) for key in AUTHOR_NAME_KEYS),
+                        entry.get("title"),
+                    ),
+                    red_id=self._first_text(*(user.get(key) for key in RED_ID_KEYS)),
                 )
             )
         return candidates
@@ -624,33 +679,22 @@ class XiaohongshuSpider(BaseSpider):
         for entry in items:
             if not isinstance(entry, dict):
                 continue
-            note_card = entry.get("note_card") if isinstance(entry.get("note_card"), dict) else {}
-            user = note_card.get("user") if isinstance(note_card.get("user"), dict) else {}
-            user_id = str(user.get("user_id") or user.get("id") or "").strip()
+            user = embedded_note_user(entry)
+            user_id = self._first_text(*(user.get(key) for key in USER_ID_KEYS))
             if not user_id:
                 continue
-            note_hint = str(
-                note_card.get("display_title")
-                or note_card.get("title")
-                or entry.get("display_title")
-                or entry.get("title")
-                or ""
-            ).strip()
+            note_hint = note_display_title(entry)
             candidate = candidates_by_user.get(user_id)
             if candidate is None:
                 candidates_by_user[user_id] = CreatorUrlInfo(
                     user_id=user_id,
-                    xsec_token=str(user.get("xsec_token") or ""),
-                    xsec_source=str(entry.get("xsec_source") or "pc_search"),
-                    nickname=str(user.get("nickname") or user.get("nick_name") or "").strip(),
-                    red_id=str(
-                        user.get("red_id")
-                        or user.get("redId")
-                        or user.get("xhs_id")
-                        or user.get("display_id")
-                        or user.get("redid")
-                        or ""
-                    ).strip(),
+                    xsec_token=self._first_text(*(user.get(key) for key in XSEC_TOKEN_KEYS)),
+                    xsec_source=self._first_text(
+                        *(entry.get(key) for key in XSEC_SOURCE_KEYS),
+                        "pc_search",
+                    ),
+                    nickname=self._first_text(*(user.get(key) for key in AUTHOR_NAME_KEYS)),
+                    red_id=self._first_text(*(user.get(key) for key in RED_ID_KEYS)),
                     note_hint=note_hint,
                 )
             elif note_hint and not candidate.note_hint:
@@ -733,14 +777,8 @@ class XiaohongshuSpider(BaseSpider):
                         debug_logger.log_exception("XiaohongshuSpider", "restore_playwright_cookies", exc)
                 page = context.new_page()
                 search_url = f"{self.HOME_URL}search_result?keyword={quote(lookup.keyword)}&type=51"
-                if not self.interruptible_playwright_goto(
-                    page,
-                    search_url,
-                    wait_until="domcontentloaded",
-                    timeout=self._configured_timeout_ms(default=60),
-                ):
-                    return None
-                if not self.interruptible_page_wait(page, 3000):
+                timeout_ms = self._configured_timeout_ms(default=60)
+                if not self._open_page(page, search_url, timeout_ms=timeout_ms, settle_ms=3000):
                     return None
                 current_url = page.url
                 if "/login" in current_url:
@@ -850,13 +888,14 @@ class XiaohongshuSpider(BaseSpider):
         worker_count = self._detail_worker_count(total_refs)
         parsed = 0
         emitted = 0
+        detail_failures = 0
         if require_user_confirmed:
             self.log(f"XiaoHongShu confirmed pipeline is active: {total_refs} selected candidates.")
         self.log(f"🚀 小红书流水线模式：详情解析成功后立即投递下载队列 | 候选 {total_refs}")
 
         def fetch_one(index_ref: tuple[int, dict[str, str]]) -> tuple[int, dict[str, Any] | None]:
             idx, ref = index_ref
-            if not self.is_running:
+            if not self.is_running or self._detail_circuit_is_open():
                 return idx, None
             worker_client = self._build_client(cookie_str) if worker_count > 1 else client
             try:
@@ -866,27 +905,62 @@ class XiaohongshuSpider(BaseSpider):
                     worker_client.close()
 
         indexed_refs = list(enumerate(refs, 1))
-        # 并发任务各自持有 HTTP 会话；停止后不再提交结果，已开始请求则受客户端超时约束后退出。
-        with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="xhs-detail") as executor:
-            future_map = {executor.submit(fetch_one, index_ref): index_ref[0] for index_ref in indexed_refs}
-            completed_refs = 0
-            for future in as_completed(future_map):
-                idx = future_map[future]
-                completed_refs += 1
-                if not self.is_running:
-                    break
-                try:
-                    _idx, detail = future.result()
-                except Exception as exc:
-                    self.log(f"⚠️ 小红书笔记详情线程失败 {idx} | {exc}")
-                    detail = None
-                if detail:
-                    parsed += 1
-                    referer = f"{self.HOME_URL}explore/{detail.get('note_id', '')}"
-                    emitted += self._emit_note_items(detail, cookie_str, referer=referer)
-                if self._should_log_progress(completed_refs, total_refs):
-                    self.log(f"📥 已解析详情 {completed_refs}/{total_refs} | 成功 {parsed} | 已投递 {emitted}")
+        # 并发任务各自持有 HTTP 会话；停止后取消尚未启动的任务，并等待已运行任务退出。
+        executor = ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="xhs-detail")
+        future_map: dict[Any, int] = {}
+        consumed: set[Any] = set()
 
+        def consume(future) -> None:
+            nonlocal parsed, emitted, detail_failures
+            if future in consumed:
+                return
+            consumed.add(future)
+            idx = future_map[future]
+            try:
+                _idx, detail = future.result()
+            except CancelledError:
+                return
+            except Exception as exc:
+                self.log(f"⚠️ 小红书笔记详情线程失败 {idx} | {exc}")
+                detail = None
+                detail_failures += 1
+            if detail:
+                parsed += 1
+                referer = f"{self.HOME_URL}explore/{detail.get('note_id', '')}"
+                emitted += self._emit_note_items(detail, cookie_str, referer=referer)
+            if self._should_log_progress(len(consumed), total_refs):
+                self.log(f"📥 已解析详情 {len(consumed)}/{total_refs} | 成功 {parsed} | 已投递 {emitted}")
+
+        try:
+            future_map = {executor.submit(fetch_one, index_ref): index_ref[0] for index_ref in indexed_refs}
+            pending = set(future_map)
+            while pending and self.is_running and not self._detail_circuit_is_open():
+                done, pending = wait(pending, timeout=0.5, return_when=FIRST_COMPLETED)
+                for future in done:
+                    consume(future)
+                if not self.is_running or self._detail_circuit_is_open():
+                    break
+            for future in list(pending):
+                if future.done():
+                    pending.discard(future)
+                    consume(future)
+        finally:
+            stop_pool = not self.is_running or self.interrupt_requested or self._detail_circuit_is_open()
+            executor.shutdown(wait=True, cancel_futures=stop_pool)
+            for future in list(future_map):
+                if future.done():
+                    consume(future)
+
+        if not self.is_running and emitted > 0:
+            self.log("🛑 小红书任务已停止，下载已入队，保持停止状态")
+            return
+        if not self.is_running and parsed > 0:
+            self.log("🛑 小红书任务已停止，未投递的解析结果不会恢复运行")
+            return
+        if self._detail_circuit_is_open():
+            raise SpiderParseError("小红书详情触发熔断，任务终止")
+        if parsed <= 0 and detail_failures:
+            raise SpiderParseError("小红书笔记详情解析失败")
         if not self.revive_for_partial_selection(parsed, "条候选笔记"):
             return
         if parsed <= 0:
@@ -895,6 +969,7 @@ class XiaohongshuSpider(BaseSpider):
         self.log(f"✅ 小红书流水线投递完成，共投递 {emitted} 个下载项")
 
     def run(self) -> None:
+        self.run_succeeded = False
         self.log(f"🚀 启动小红书任务 | 目标: {self.keyword}")
         self.debug_state(
             action="run_start",
@@ -921,7 +996,13 @@ class XiaohongshuSpider(BaseSpider):
             self._client = client
             if not client.check_cookie_ready():
                 raise SpiderAuthError("小红书 Cookie 缺少 a1，无法进行签名请求")
-            login_status = client.probe_login_status()
+            if self._login_probe_cached and self._login_probe_cookie == cookie_str:
+                login_status = self._login_probe_status
+            else:
+                login_status = client.probe_login_status()
+                self._login_probe_cookie = cookie_str
+                self._login_probe_status = login_status
+                self._login_probe_cached = True
             if login_status is False:
                 raise SpiderAuthError("小红书 Cookie 无有效登录态，请重新登录后再试")
             if login_status is None:
@@ -949,6 +1030,8 @@ class XiaohongshuSpider(BaseSpider):
             else:
                 refs = self._collect_search_refs(client, route_value)
                 self._handle_multi_refs(client, refs, cookie_str)
+            if self.is_running and not self.interrupt_requested:
+                self.run_succeeded = True
         except (SpiderAuthError, SpiderParseError, ValueError, PlaywrightError) as exc:
             self.log(f"❌ 小红书任务失败: {exc}")
             self.debug_state(

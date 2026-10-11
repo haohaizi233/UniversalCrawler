@@ -10,10 +10,14 @@ from app.config import DEFAULT_USER_AGENT, cfg, get_setting_default
 from app.spiders.base import BaseSpider
 from app.spiders.kuaishou.auth_runtime import KuaishouAuthRuntimeMixin
 from app.spiders.kuaishou.parser import KuaishouParser
-from app.spiders.kuaishou.share_runtime import KuaishouShareRuntimeMixin
+from app.spiders.kuaishou.share_runtime import (
+    KuaishouShareRuntimeMixin,
+    _response_content_length,
+)
 from app.spiders.kuaishou.task_builder import KuaishouTaskBuilder
 from app.services.auth_service import AuthService
 from app.utils.user_agents import resolve_user_agent
+from shared.runtime_options import DomainPolicyViolation
 
 
 class KuaishouSpider(
@@ -35,6 +39,7 @@ class KuaishouSpider(
     SHORT_LINK_TOTAL_TIMEOUT_SECONDS = 15.0
     SHORT_LINK_MAX_REDIRECTS = 5
     SHARE_DETAIL_HTML_MAX_BYTES = 2 * 1024 * 1024
+    LIST_SCAN_STALL_LIMIT = 5
     DETAIL_STREAM_WAIT_MS = 8000
     DETAIL_STREAM_POLL_MS = 100
     SEARCH_POPUP_NAVIGATION_TIMEOUT_MS = 3000
@@ -132,6 +137,13 @@ class KuaishouSpider(
     ) -> bool:
         """重试导航，并把已渲染的站点网络错误页也视为失败。"""
         target_url = url.strip().strip("`")
+        if not self._url_matches_hosts(
+            target_url,
+            ("kuaishou.com", "chenzhongtech.com"),
+        ):
+            self.log(f"❌ {description}的目标主机不属于快手白名单，已中止导航")
+            return False
+        self._kuaishou_navigation_blocked = False
         try:
             target_path = urllib.parse.urlsplit(target_url).path.rstrip("/")
         except ValueError:
@@ -148,12 +160,18 @@ class KuaishouSpider(
         last_error = None
         for attempt in range(1, attempts + 1):
             try:
+                if getattr(self, "_kuaishou_navigation_blocked", False):
+                    self.log(f"❌ {description}的跳转离开快手白名单，已中止导航")
+                    return False
                 if not self.interruptible_playwright_goto(
                     page,
                     target_url,
                     timeout=navigation_timeout,
                     wait_until="commit" if is_keyword_results else "domcontentloaded",
                 ):
+                    return False
+                if getattr(self, "_kuaishou_navigation_blocked", False):
+                    self.log(f"❌ {description}的跳转离开快手白名单，已中止导航")
                     return False
                 if not self.interruptible_page_wait(page, 1500):
                     return False
@@ -168,12 +186,102 @@ class KuaishouSpider(
                     return True
             except PlaywrightError as exc:
                 last_error = exc
+                if getattr(self, "_kuaishou_navigation_blocked", False):
+                    self.log(f"❌ {description}的跳转离开快手白名单，已中止导航")
+                    return False
                 self.log(f"⚠️ {description}失败，第 {attempt}/{attempts} 次重试: {exc}")
             if attempt < attempts and not self.interruptible_page_wait(page, min(1000 * attempt, 2500)):
                 return False
         if last_error:
             self.log(f"❌ {description}失败: {last_error}")
         return False
+
+    def _ensure_playwright_public_route(self, page) -> None:
+        super()._ensure_playwright_public_route(page)
+        self._install_kuaishou_navigation_whitelist(page)
+
+    def _install_kuaishou_navigation_whitelist(self, page) -> None:
+        """浏览器文档跳转逐跳限制在快手白名单，子资源仍交给公共地址守卫。"""
+        context = getattr(page, "context", None)
+        target = context if callable(getattr(context, "route", None)) else page
+        if not callable(getattr(target, "route", None)):
+            return
+        if getattr(target, "_ucrawl_kuaishou_nav_whitelist_installed", False) is True:
+            return
+
+        def guard_navigation(route, request=None) -> None:
+            if request is None:
+                request = getattr(route, "request", None)
+            blocked = False
+            try:
+                request_url = str(getattr(request, "url", "") or "")
+                scheme = urllib.parse.urlsplit(request_url).scheme.lower()
+                is_navigation = False
+                checker = getattr(request, "is_navigation_request", None)
+                if callable(checker):
+                    is_navigation = bool(checker())
+                resource_type = str(getattr(request, "resource_type", "") or "").lower()
+            except (AttributeError, TypeError, ValueError):
+                request_url = ""
+                scheme = ""
+                is_navigation = False
+                resource_type = ""
+            is_document_navigation = bool(is_navigation or resource_type == "document")
+            if is_document_navigation and scheme not in {"http", "https"}:
+                blocked = True
+            elif scheme in {"http", "https"} and is_document_navigation:
+                blocked = not self._url_matches_hosts(
+                    request_url,
+                    ("kuaishou.com", "chenzhongtech.com"),
+                )
+            if blocked:
+                self._kuaishou_navigation_blocked = True
+                try:
+                    route.abort("blockedbyclient")
+                except (AttributeError, PlaywrightError):
+                    pass
+                return
+            fallback = getattr(route, "fallback", None)
+            if callable(fallback):
+                fallback()
+                return
+            route.continue_()
+
+        target.route("**/*", guard_navigation)
+        try:
+            setattr(target, "_ucrawl_kuaishou_nav_whitelist_installed", True)
+        except (AttributeError, TypeError):
+            pass
+
+    def _close_playwright_page(self, candidate) -> None:
+        if candidate is None:
+            return
+        try:
+            is_closed = getattr(candidate, "is_closed", None)
+            if callable(is_closed) and is_closed() is True:
+                return
+            candidate.close()
+        except (AttributeError, PlaywrightError, TypeError):
+            pass
+
+    def _close_playwright_session(self, context, browser) -> None:
+        """阻塞调用返回后，在创建浏览器的线程上立刻关闭 context 和 browser。"""
+        owner = getattr(self, "_playwright_owner_thread_id", None)
+        if owner is not None and owner != threading.get_ident():
+            return
+        if context is not None:
+            try:
+                pages = getattr(context, "pages", None)
+                if isinstance(pages, list):
+                    for candidate in pages:
+                        self._close_playwright_page(candidate)
+            except (PlaywrightError, TypeError):
+                pass
+            try:
+                context.close()
+            except PlaywrightError:
+                pass
+        self._close_tracked_playwright_browser(browser)
 
     def _search_user_via_site(self, page, context, keyword: str):
         """通过站内搜索定位用户，并打开其主页。"""
@@ -337,6 +445,7 @@ class KuaishouSpider(
                 except (PlaywrightError, AttributeError):
                     pass
             if not self._page_has_navigable_url(candidate):
+                self._close_playwright_page(candidate)
                 continue
             try:
                 candidate.bring_to_front()
@@ -351,6 +460,51 @@ class KuaishouSpider(
         ):
             return page, True
         return None, saw_new_page
+
+    def _click_search_result(self, page, context, locator, *, label: str, wait_ms: int):
+        """点击搜索结果；弹出页若在后续 Playwright 异常中留下，由 finally 关闭。"""
+        before_pages = list(getattr(context, "pages", []) or [])
+        before_ids = {id(item) for item in before_pages}
+        before_url = str(getattr(page, "url", "") or "").strip()
+        keep_page = False
+        try:
+            locator.click()
+            self.interruptible_page_wait(page, wait_ms)
+            active_page, navigation_started = self._page_after_search_click(
+                page,
+                context,
+                before_pages,
+                before_url,
+            )
+            adopted = self._adopt_opened_search_page(
+                page,
+                active_page,
+                navigation_started,
+                label=label,
+            )
+            if adopted is not False and adopted is not None:
+                keep_page = True
+            return adopted
+        finally:
+            if not keep_page:
+                for candidate in list(getattr(context, "pages", []) or []):
+                    if id(candidate) in before_ids or candidate is page:
+                        continue
+                    self._close_playwright_page(candidate)
+
+    def _adopt_opened_search_page(self, page, active_page, navigation_started: bool, *, label: str):
+        """收下可用主页；搜索点击打开但无法使用的新页面立即关闭。"""
+        if active_page is not None and self._has_video_list(
+            active_page,
+            timeout=self._configured_timeout_ms(default=60),
+        ):
+            self.log(f"👉 已从搜索结果进入主页: {label}")
+            return active_page
+        if active_page is not None and active_page is not page:
+            self._close_playwright_page(active_page)
+        if navigation_started:
+            return None
+        return False
 
     def _open_profile_from_search_results(self, page, context, keyword: str):
         """在用户搜索结果中匹配关键词并打开对应主页。"""
@@ -369,24 +523,15 @@ class KuaishouSpider(
                 if not self._locator_visible(name_link):
                     continue
                 self.log(f"👉 点击搜索结果名字进入主页: {keyword}")
-                before_pages = list(getattr(context, "pages", []) or [])
-                before_url = str(getattr(page, "url", "") or "").strip()
-                name_link.click()
-                self.interruptible_page_wait(page, 3000)
-                active_page, navigation_started = self._page_after_search_click(
+                adopted = self._click_search_result(
                     page,
                     context,
-                    before_pages,
-                    before_url,
+                    name_link,
+                    label=keyword,
+                    wait_ms=3000,
                 )
-                if active_page is not None and self._has_video_list(
-                    active_page,
-                    timeout=self._configured_timeout_ms(default=60),
-                ):
-                    self.log(f"👉 已从搜索结果进入主页: {keyword}")
-                    return active_page
-                if navigation_started:
-                    return None
+                if adopted is not False:
+                    return adopted
             except PlaywrightError:
                 continue
 
@@ -402,24 +547,15 @@ class KuaishouSpider(
                 if not self._locator_visible(avatar):
                     continue
                 self.log(f"👉 点击搜索结果头像进入主页: {keyword}")
-                before_pages = list(getattr(context, "pages", []) or [])
-                before_url = str(getattr(page, "url", "") or "").strip()
-                avatar.click()
-                self.interruptible_page_wait(page, 3000)
-                active_page, navigation_started = self._page_after_search_click(
+                adopted = self._click_search_result(
                     page,
                     context,
-                    before_pages,
-                    before_url,
+                    avatar,
+                    label=keyword,
+                    wait_ms=3000,
                 )
-                if active_page is not None and self._has_video_list(
-                    active_page,
-                    timeout=self._configured_timeout_ms(default=60),
-                ):
-                    self.log(f"👉 已从搜索结果进入主页: {keyword}")
-                    return active_page
-                if navigation_started:
-                    return None
+                if adopted is not False:
+                    return adopted
             except PlaywrightError:
                 continue
 
@@ -439,24 +575,15 @@ class KuaishouSpider(
                 except PlaywrightError:
                     name = keyword
                 self.log(f"👉 点击用户卡片进入主页: {name or keyword}")
-                before_pages = list(getattr(context, "pages", []) or [])
-                before_url = str(getattr(page, "url", "") or "").strip()
-                user_link.click()
-                self.interruptible_page_wait(page, 2000)
-                active_page, navigation_started = self._page_after_search_click(
+                adopted = self._click_search_result(
                     page,
                     context,
-                    before_pages,
-                    before_url,
+                    user_link,
+                    label=name or keyword,
+                    wait_ms=2000,
                 )
-                if active_page is not None and self._has_video_list(
-                    active_page,
-                    timeout=self._configured_timeout_ms(default=60),
-                ):
-                    self.log(f"👉 已从搜索结果进入主页: {name or keyword}")
-                    return active_page
-                if navigation_started:
-                    return None
+                if adopted is not False:
+                    return adopted
             except PlaywrightError:
                 continue
         self.log("❌ 未找到匹配的快手账号主页")
@@ -559,16 +686,23 @@ class KuaishouSpider(
             return False
 
         self.log("🌐 正在从快手分享详情页捕获单条作品...")
-        emitted = False
         stream_ready = threading.Event()
         title = self._extract_detail_title(page)
+        best: tuple[str, str] | None = None
 
-        def submit_stream(stream_url: str) -> bool:
-            nonlocal emitted
-            stream_url = str(stream_url or "").strip()
-            if emitted or not stream_url:
+        def consider(url: str, content_type: str = "", content_length: int | None = None, *, arm_ready: bool = True) -> None:
+            nonlocal best
+            updated = self._choose_kuaishou_stream(best, url, content_type, content_length)
+            if updated == best:
+                return
+            best = updated
+            if best is not None and (best[0] == "playlist" or arm_ready):
+                stream_ready.set()
+
+        def emit_best() -> bool:
+            if not best:
                 return False
-            emitted = True
+            stream_url = best[1]
             trace_id = self.new_trace_id("share")
             self.debug_state(
                 action="emit_share_task",
@@ -584,19 +718,27 @@ class KuaishouSpider(
                 meta=self.task_builder.build_download_meta(trace_id, page.url, stream_url, self._user_agent()),
             )
             self.log(f"✨ 已解析分享作品: {title[:24]}...")
-            stream_ready.set()
             return True
 
         def handle_response(response):
-            submit_stream(self._share_media_response_url(response))
+            try:
+                url = str(response.url or "").strip()
+                headers = getattr(response, "headers", {}) or {}
+                content_type = str(headers.get("content-type", "") or "")
+                length = _response_content_length(headers)
+            except (AttributeError, PlaywrightError, TypeError, ValueError):
+                return
+            consider(url, content_type, length)
 
         page.on("response", handle_response)
         try:
             for stream_url in initial_stream_urls:
-                if submit_stream(stream_url):
-                    return True
-            if submit_stream(self._extract_detail_dom_media_url(page)):
-                return True
+                consider(stream_url, arm_ready=False)
+            if best and best[0] == "playlist":
+                return emit_best()
+            consider(self._extract_detail_dom_media_url(page), arm_ready=False)
+            if best and best[0] == "playlist":
+                return emit_best()
 
             # 有些详情页必须触发一次播放后才发起媒体请求。响应监听器已提前
             # 注册，因此只需短时间泵送 Playwright 事件，无需刷新整个页面。
@@ -605,7 +747,8 @@ class KuaishouSpider(
             except PlaywrightError:
                 pass
             self._wait_for_detail_stream(page, stream_ready)
-            if emitted or submit_stream(self._extract_detail_dom_media_url(page)):
+            consider(self._extract_detail_dom_media_url(page), arm_ready=False)
+            if emit_best():
                 return True
 
             self.log("❌ 未能从快手分享链接中解析出可下载视频")
@@ -655,11 +798,17 @@ class KuaishouSpider(
                     page.mouse.move(vp["width"] / 2, vp["height"] / 2)
             except PlaywrightError:
                 pass
+            if not self.is_running:
+                break
 
             page.evaluate("window.scrollBy(0, 800)")
-            self.interruptible_page_wait(page, 500)
+            if not self.interruptible_page_wait(page, 500):
+                break
+            if not self.is_running:
+                break
             page.mouse.wheel(0, 500)
-            self.interruptible_page_wait(page, 1000)
+            if not self.interruptible_page_wait(page, 1000):
+                break
 
             cards = page.locator(".photo-card, .video-card")
             current_card_count = cards.count()
@@ -680,12 +829,9 @@ class KuaishouSpider(
                 break
             if current_card_count == last_card_count:
                 no_new_content_count += 1
-                if no_new_content_count >= 5:
-                    self.log("🔄 似乎卡住了，尝试回滚刷新...")
-                    page.evaluate("window.scrollBy(0, -1000)")
-                    self.interruptible_page_wait(page, 1000)
-                    page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                    no_new_content_count = 0
+                if no_new_content_count >= self.LIST_SCAN_STALL_LIMIT:
+                    self.log("✅ 列表连续停滞，结束扫描")
+                    break
             else:
                 no_new_content_count = 0
                 last_card_count = current_card_count
@@ -757,137 +903,177 @@ class KuaishouSpider(
         current_focus_index = 0
         total_scrolls = self._capture_scroll_budget(items_for_dialog)
 
+        pending: dict[int, tuple[str, str]] = {}
+        published: dict[int, tuple[str, str]] = {}
+
+        def publish(idx: int, choice: tuple[str, str]) -> None:
+            previous = published.get(idx)
+            if previous == choice or (previous and previous[0] == "playlist"):
+                return
+            published[idx] = choice
+            submitted_indices.add(idx)
+            title = str(items_for_dialog[idx]["title"])
+            stream_url = choice[1]
+            trace_id = self.new_trace_id("stream")
+            self.log(f"   ✨ [捕获] {title[:15]}... -> 加入下载队列")
+            self.debug_state(
+                action="emit_download_task",
+                message="快手视频流已捕获并提交到下载队列",
+                status_code="KUAISHOU_TASK_EMIT",
+                context={"trace_id": trace_id, "target_index": idx},
+                details={
+                    "title": title,
+                    "stream_url": stream_url,
+                    "download_strategy": "m3u8" if choice[0] == "playlist" else "http",
+                    "referer": page.url,
+                },
+            )
+            self.emit_video(
+                url=stream_url,
+                title=title,
+                source="kuaishou",
+                meta=self.task_builder.build_download_meta(trace_id, page.url, stream_url, self._user_agent()),
+            )
+
+        def flush_pending() -> None:
+            with self._lock:
+                for idx, choice in list(pending.items()):
+                    publish(idx, choice)
+
         def handle_response(response):
-            # 网络回调会与焦点滚动交错；锁内先认领索引，才能避免同一媒体响应重复入队。
+            # 网络回调会与焦点滚动交错；播放列表可以替换尚未定稿的普通媒体。
             if not self.is_running:
                 return
-            ctype = response.headers.get("content-type", "")
-            if not (
-                response.request.resource_type == "media"
-                or "video/mp4" in ctype
-                or "mpegurl" in ctype.lower()
-                or ".m3u8" in response.url
-            ):
-                return
             try:
-                if ".mp4" in response.url:
-                    try:
-                        if int(response.headers.get("content-length", 0)) < 5000:
-                            return
-                    except (TypeError, ValueError):
-                        pass
-                url = response.url
+                url = str(response.url or "").strip()
+                headers = getattr(response, "headers", {}) or {}
+                content_type = str(headers.get("content-type", "") or "")
+                length = _response_content_length(headers)
+                if self._kuaishou_media_kind(url, content_type) is None:
+                    return
                 vid_ids = self.parser.extract_all_possible_ids(url)
-                matched_idx = -1
                 with self._lock:
+                    matched_idx = -1
                     if vid_ids:
                         for idx in target_indices_set:
-                            if idx in submitted_indices:
+                            if published.get(idx, ("", ""))[0] == "playlist":
                                 continue
                             cover_ids = target_fingerprints_map.get(idx, set())
                             if not cover_ids.isdisjoint(vid_ids):
                                 matched_idx = idx
                                 break
-                    if matched_idx == -1 and current_focus_index in target_indices_set and current_focus_index not in submitted_indices:
+                    focus_open = (
+                        current_focus_index in target_indices_set
+                        and published.get(current_focus_index, ("", ""))[0] != "playlist"
+                    )
+                    if matched_idx == -1 and focus_open:
                         matched_idx = current_focus_index
                         self.log(f"   🎯 [焦点匹配] {items_for_dialog[matched_idx]['title'][:10]}...")
-                    elif matched_idx == -1 and "pkey" in url:
-                        if current_focus_index in target_indices_set and current_focus_index not in submitted_indices:
-                            matched_idx = current_focus_index
-                            self.log(f"   🔒 [加密流] 匹配焦点: {items_for_dialog[matched_idx]['title'][:10]}...")
-                    if matched_idx != -1:
-                        submitted_indices.add(matched_idx)
-                        title = str(items_for_dialog[matched_idx]["title"])
-                        is_m3u8 = ".m3u8" in url
-                        trace_id = self.new_trace_id("stream")
-                        self.log(f"   ✨ [捕获] {title[:15]}... -> 加入下载队列")
-                        self.debug_state(
-                            action="emit_download_task",
-                            message="快手视频流已捕获并提交到下载队列",
-                            status_code="KUAISHOU_TASK_EMIT",
-                            context={"trace_id": trace_id, "target_index": matched_idx},
-                            details={
-                                "title": title,
-                                "stream_url": url,
-                                "download_strategy": "m3u8" if is_m3u8 else "http",
-                                "referer": page.url,
-                            },
-                        )
-                        self.emit_video(
-                            url=url,
-                            title=title,
-                            source="kuaishou",
-                            meta=self.task_builder.build_download_meta(trace_id, page.url, url, self._user_agent()),
-                        )
-            except (AttributeError, KeyError, TypeError, ValueError, RuntimeError):
+                    elif matched_idx == -1 and "pkey" in url and focus_open:
+                        matched_idx = current_focus_index
+                        self.log(f"   🔒 [加密流] 匹配焦点: {items_for_dialog[matched_idx]['title'][:10]}...")
+                    if matched_idx == -1:
+                        return
+                    current = pending.get(matched_idx) or published.get(matched_idx)
+                    chosen = self._choose_kuaishou_stream(
+                        current,
+                        url,
+                        content_type,
+                        length,
+                    )
+                    if chosen is None or chosen == current:
+                        return
+                    pending[matched_idx] = chosen
+                    if chosen[0] == "playlist":
+                        publish(matched_idx, chosen)
+            except (AttributeError, KeyError, TypeError, ValueError, RuntimeError, PlaywrightError):
                 pass
 
         context = page.context
+        listened_page = page
         page.on("response", handle_response)
-        page = self._resolve_active_page(page, context)
-        if not page:
-            self.log("❌ 详情页已关闭，无法启动捕获流水线")
-            return
-        page.evaluate("window.scrollTo(0, 0)")
-        self.interruptible_page_wait(page, 1000)
-        cards = page.locator(".photo-card, .video-card")
         try:
-            first_card = cards.first
-            if not first_card.is_visible():
-                first_card.scroll_into_view_if_needed()
-            first_card.click()
-            self.interruptible_page_wait(page, 3000)
-            try:
-                page.mouse.click(200, 200)
-            except PlaywrightError:
-                pass
-        except PlaywrightError:
-            self.log("❌ 无法进入详情页")
-            return
-
-        self.log(f"🔄 生产者工作开始 (0 - {total_scrolls})...")
-        while current_focus_index < total_scrolls and self.is_running:
             page = self._resolve_active_page(page, context)
             if not page:
-                self.log("⚠️ 详情页已关闭，提前结束当前捕获流程")
-                break
-            with self._lock:
-                if len(submitted_indices) >= len(target_indices_set):
-                    self.log("🎉 所有任务已实时捕获，提前结束！")
-                    break
-            if (current_focus_index + 1) % 5 == 0:
-                self.log(f"🔄 刷屏进度: {current_focus_index + 1}/{total_scrolls}")
-            page.keyboard.press("ArrowDown")
-            with self._lock:
-                current_focus_index += 1
-            wait_ms = random.randint(1500, 2500) if current_focus_index in target_indices_set else random.randint(600, 1000)
-            if not self.interruptible_page_wait(page, wait_ms):
-                break
+                self.log("❌ 详情页已关闭，无法启动捕获流水线")
+                return
+            if not self.is_running:
+                return
+            page.evaluate("window.scrollTo(0, 0)")
+            if not self.interruptible_page_wait(page, 1000):
+                return
+            cards = page.locator(".photo-card, .video-card")
             try:
-                if page.locator(".close-icon").is_visible():
-                    page.locator(".close-icon").click()
+                first_card = cards.first
+                if not first_card.is_visible():
+                    first_card.scroll_into_view_if_needed()
+                first_card.click()
+                if not self.interruptible_page_wait(page, 3000):
+                    return
+                try:
+                    page.mouse.click(200, 200)
+                except PlaywrightError:
+                    pass
             except PlaywrightError:
-                pass
+                self.log("❌ 无法进入详情页")
+                return
 
-        self.log("\n📊 流程结束。")
-        self.debug_state(
-            action="capture_pipeline_finish",
-            message="快手流捕获流水线结束",
-            status_code="KUAISHOU_CAPTURE_DONE",
-            details={
-                "scroll_budget": total_scrolls,
-                "selected_count": len(target_indices_set),
-                "submitted_count": len(submitted_indices),
-                "not_found_count": len(target_indices_set - submitted_indices),
-            },
-        )
-        not_found = target_indices_set - submitted_indices
-        if not_found:
-            self.log(f"⚠️ {len(not_found)} 个视频未捕获:")
-            for idx in sorted(list(not_found)):
-                self.log(f"   - [{idx + 1}] {items_for_dialog[idx]['title'][:20]}...")
-        else:
-            self.log("✅ 全部任务完成！")
+            self.log(f"🔄 生产者工作开始 (0 - {total_scrolls})...")
+            while current_focus_index < total_scrolls and self.is_running:
+                page = self._resolve_active_page(page, context)
+                if not page:
+                    self.log("⚠️ 详情页已关闭，提前结束当前捕获流程")
+                    break
+                with self._lock:
+                    if len(submitted_indices) >= len(target_indices_set):
+                        self.log("🎉 所有任务已实时捕获，提前结束！")
+                        break
+                if (current_focus_index + 1) % 5 == 0:
+                    self.log(f"🔄 刷屏进度: {current_focus_index + 1}/{total_scrolls}")
+                if not self.is_running:
+                    break
+                page.keyboard.press("ArrowDown")
+                with self._lock:
+                    current_focus_index += 1
+                wait_ms = random.randint(1500, 2500) if current_focus_index in target_indices_set else random.randint(600, 1000)
+                if not self.interruptible_page_wait(page, wait_ms):
+                    break
+                flush_pending()
+                try:
+                    if page.locator(".close-icon").is_visible():
+                        page.locator(".close-icon").click()
+                except PlaywrightError:
+                    pass
+            flush_pending()
+
+            self.log("\n📊 流程结束。")
+            self.debug_state(
+                action="capture_pipeline_finish",
+                message="快手流捕获流水线结束",
+                status_code="KUAISHOU_CAPTURE_DONE",
+                details={
+                    "scroll_budget": total_scrolls,
+                    "selected_count": len(target_indices_set),
+                    "submitted_count": len(submitted_indices),
+                    "not_found_count": len(target_indices_set - submitted_indices),
+                },
+            )
+            not_found = target_indices_set - submitted_indices
+            if not_found:
+                self.log(f"⚠️ {len(not_found)} 个视频未捕获:")
+                for idx in sorted(list(not_found)):
+                    self.log(f"   - [{idx + 1}] {items_for_dialog[idx]['title'][:20]}...")
+            else:
+                self.log("✅ 全部任务完成！")
+        finally:
+            try:
+                flush_pending()
+            except (AttributeError, KeyError, TypeError, ValueError, RuntimeError, PlaywrightError):
+                pass
+            try:
+                listened_page.remove_listener("response", handle_response)
+            except (AttributeError, PlaywrightError):
+                pass
 
     def _entry_url_for_login(self) -> str | None:
         if self._is_detail_url(self.keyword):
@@ -915,6 +1101,7 @@ class KuaishouSpider(
         self._track_playwright_browser(browser)
         previous_request_api = getattr(self, "_profile_request_api", None)
         self._profile_request_api = playwright.request
+        context = None
         try:
             context = self._create_browser_context(
                 browser, auth_file, headless=headless
@@ -922,7 +1109,7 @@ class KuaishouSpider(
             page = context.new_page()
             return self._ensure_login(page, context, auth_file, entry_url=entry_url, allow_manual_login=True)
         finally:
-            self._close_tracked_playwright_browser(browser)
+            self._close_playwright_session(context, browser)
             if previous_request_api is None:
                 self.__dict__.pop("_profile_request_api", None)
             else:
@@ -939,6 +1126,7 @@ class KuaishouSpider(
             )
         )
         self._track_playwright_browser(browser)
+        context = None
         try:
             context = self._create_browser_context(browser, auth_file, headless=True)
             page = context.new_page()
@@ -970,7 +1158,7 @@ class KuaishouSpider(
                 except (AttributeError, PlaywrightError):
                     pass
         finally:
-            self._close_tracked_playwright_browser(browser)
+            self._close_playwright_session(context, browser)
 
     def _run_browser_session(
         self,
@@ -993,6 +1181,7 @@ class KuaishouSpider(
         self._track_playwright_browser(browser)
         previous_request_api = getattr(self, "_profile_request_api", None)
         self._profile_request_api = playwright.request
+        context = None
         try:
             context = self._create_browser_context(
                 browser, auth_file, headless=headless
@@ -1029,7 +1218,7 @@ class KuaishouSpider(
             self._run_capture_pipeline(page, items_for_dialog, target_fingerprints_map)
             return "completed"
         finally:
-            self._close_tracked_playwright_browser(browser)
+            self._close_playwright_session(context, browser)
             if previous_request_api is None:
                 self.__dict__.pop("_profile_request_api", None)
             else:
@@ -1037,6 +1226,7 @@ class KuaishouSpider(
 
     def run(self):
         """按详情链接或列表任务分流，避免同一输入重复经过两套浏览器流程。"""
+        self.run_succeeded = False
         auth_file = cfg.get("auth", "kuaishou_cookie_file", "ks_auth.json")
         candidate = self._extract_first_url(self.keyword)
         share_storage_state = (
@@ -1044,19 +1234,30 @@ class KuaishouSpider(
             if self._is_short_share_url(candidate)
             else None
         )
-        self.keyword = self._normalize_keyword(
-            self.keyword,
-            storage_state=share_storage_state,
-        )
-        self.log(f"🚀 启动快手任务 | 目标: {self.keyword}")
         try:
+            try:
+                self.keyword = self._normalize_keyword(
+                    self.keyword,
+                    storage_state=share_storage_state,
+                )
+            except DomainPolicyViolation as exc:
+                self.log(f"❌ 快手短链解析失败，已中止任务: {exc}")
+                return
+            self.log(f"🚀 启动快手任务 | 目标: {self.keyword}")
             if self._is_detail_url(self.keyword) or self._is_short_share_url(
                 self.keyword
             ):
                 self.log("🎯 检测到快手分享/详情链接，使用静默单资源解析流程")
-                if self._try_direct_share_download():
+                try:
+                    if self._try_direct_share_download():
+                        if self.is_running and not self.interrupt_requested:
+                            self.run_succeeded = True
+                        return
+                except DomainPolicyViolation as exc:
+                    self.log(f"❌ 快手详情主机校验失败，已中止任务: {exc}")
                     return
                 self.log("ℹ️ HTTP 未获得视频直链，切换无头浏览器继续解析")
+                result = "failed"
                 with sync_playwright() as p:
                     result = self._run_share_browser_session(p, auth_file)
                     if result == "login_required" and self.is_running:
@@ -1065,9 +1266,12 @@ class KuaishouSpider(
                         )
                         if login_ok and self.is_running:
                             self.log("✅ 快手登录完成，重新以静默模式执行当前任务")
-                            self._run_share_browser_session(p, auth_file)
+                            result = self._run_share_browser_session(p, auth_file)
+                if result == "completed" and self.is_running and not self.interrupt_requested:
+                    self.run_succeeded = True
                 return
 
+            result = "failed"
             with sync_playwright() as p:
                 headless = self._browser_headless()
                 result = self._run_browser_session(
@@ -1081,12 +1285,14 @@ class KuaishouSpider(
                     login_ok = self._run_login_window_session(p, auth_file, self._entry_url_for_login())
                     if login_ok and self.is_running:
                         self.log("✅ 快手登录完成，重新以静默模式执行当前任务")
-                        self._run_browser_session(
+                        result = self._run_browser_session(
                             p,
                             auth_file,
                             headless=True,
                             allow_manual_login=False,
                         )
+            if result == "completed" and self.is_running and not self.interrupt_requested:
+                self.run_succeeded = True
         except (PlaywrightError, OSError, ValueError, RuntimeError) as e:
             self.log(f"💥 爬虫错误: {e}")
         finally:

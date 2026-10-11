@@ -21,8 +21,14 @@ from app.spiders.missav.challenge_session import (
     ExternalChromeChallengeSession,
     SystemBrowserUnavailable,
 )
-from app.spiders.missav.local_proxy import discover_client_proxy, is_unreachable_loopback_proxy
+from app.spiders.missav.local_proxy import (
+    browser_egress_proxy,
+    chromium_proxy_launch_args,
+    discover_client_proxy,
+    is_unreachable_loopback_proxy,
+)
 from app.spiders.missav.parser import MissAVParser
+from app.spiders.missav.playlist_capture import PlaylistCapture
 from app.spiders.missav.task_builder import MissAVTaskBuilder
 from shared.runtime_options import DomainPolicyViolation
 
@@ -90,13 +96,29 @@ class MissAVSpider(BaseSpider):
             raise DomainPolicyViolation("MissAV 页面链接不属于受支持的平台域名")
         return self._public_domain_policy_engine().require_public_url(url)
 
-    def _launch_challenge_browser(self, playwright, *, headless: bool):
+    def _launch_challenge_browser(
+        self,
+        playwright,
+        *,
+        headless: bool,
+        proxy_server: str | None = None,
+    ):
         """人工验证优先使用系统稳定版浏览器，缺失时再退回随包内核。"""
-        launch_kwargs = self._playwright_launch_kwargs(
-            headless=headless,
-            proxy=(getattr(self, "config", {}) or {}).get("proxy"),
-            args=["--disable-blink-features=AutomationControlled"],
+        launch_kwargs = dict(
+            self._playwright_launch_kwargs(
+                headless=headless,
+                proxy="直连",
+                args=["--disable-blink-features=AutomationControlled"],
+            )
         )
+        launch_args = [
+            item
+            for item in list(launch_kwargs.get("args") or [])
+            if not str(item).startswith("--proxy-") and str(item) != "--no-proxy-server"
+        ]
+        launch_args.extend(chromium_proxy_launch_args(proxy_server))
+        launch_kwargs["args"] = launch_args
+        launch_kwargs.pop("proxy", None)
         if not headless:
             for channel, label in self.SYSTEM_BROWSER_CHANNELS:
                 try:
@@ -207,6 +229,7 @@ class MissAVSpider(BaseSpider):
         session = runtime.external_session
         if session is None:
             return False
+        target_url = self._require_missav_page_url(target_url)
         self._disconnect_external_browser(runtime)
         session.open_url(target_url)
         if not self._wait_for_external_challenge(
@@ -216,6 +239,113 @@ class MissAVSpider(BaseSpider):
         ):
             return False
         return self._attach_external_browser(runtime, target_url)
+
+    def _reopen_missav_page(
+        self,
+        runtime: _ChallengeBrowserRuntime,
+        page,
+        url: str,
+        *,
+        timeout_ms: int,
+        wait_for_challenge: bool = False,
+    ):
+        """校验后再打开页面。可能重新触发挑战的外部导航先断开接管。"""
+        target_url = self._require_missav_page_url(url)
+        if runtime.external_session is not None:
+            if not self._navigate_external_challenge(
+                runtime,
+                target_url,
+                timeout_ms=timeout_ms,
+            ):
+                return None
+            return runtime.page
+        if wait_for_challenge:
+            self.log("⚠️ 没有外部浏览器会话，可能再次触发挑战的导航已中止，不会打开已连接页面。")
+            return None
+        if not self.interruptible_playwright_goto(page, target_url, timeout=timeout_ms):
+            return None
+        return page
+
+    def _open_actress_catalog(
+        self,
+        runtime: _ChallengeBrowserRuntime,
+        page,
+        list_url: str,
+        enable_individual: bool,
+        timeout_ms: int,
+    ):
+        """演员入口使用已校验地址，不从跳转后的 page.url 读取主机。"""
+        try:
+            self.interruptible_sleep(2)
+            links = page.query_selector_all('a[href*="/actresses/"]')
+        except PlaywrightError:
+            return page, list_url
+        actress_link = None
+        for link in links:
+            try:
+                href = link.get_attribute("href")
+            except PlaywrightError:
+                continue
+            if not href or "ranking" in href or "search" in href:
+                continue
+            try:
+                if not link.is_visible():
+                    continue
+            except PlaywrightError:
+                continue
+            actress_link = link
+            break
+        if actress_link is None:
+            return page, list_url
+        try:
+            href = actress_link.get_attribute("href")
+        except PlaywrightError:
+            return page, list_url
+        actress_url = urllib.parse.urljoin(list_url, str(href or ""))
+        self.log(f"✨ 发现演员主页，自动跳转: {href}")
+        try:
+            actress_url = self._require_missav_page_url(actress_url)
+        except DomainPolicyViolation:
+            return page, list_url
+        opened = self._reopen_missav_page(
+            runtime,
+            page,
+            actress_url,
+            timeout_ms=timeout_ms,
+        )
+        if opened is None:
+            return None, list_url
+        page = opened
+        filtered_url = self.parser.inject_url_params(actress_url, enable_individual)
+        if filtered_url == actress_url:
+            return page, actress_url
+        try:
+            filtered_url = self._require_missav_page_url(filtered_url)
+        except DomainPolicyViolation:
+            return page, actress_url
+        opened = self._reopen_missav_page(
+            runtime,
+            page,
+            filtered_url,
+            timeout_ms=timeout_ms,
+            wait_for_challenge=runtime.external_session is None,
+        )
+        if opened is None:
+            return None, actress_url
+        return opened, filtered_url
+
+    def _chinese_verification_url(self, validated_url: str) -> str | None:
+        """只在已经校验过的列表地址上追加中文筛选查询参数。"""
+        filtered = self.parser.add_chinese_filter(validated_url)
+        if filtered == validated_url:
+            return None
+        parsed = urllib.parse.urlsplit(filtered)
+        pairs = [
+            (key, value)
+            for key, value in urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
+            if key != "page"
+        ]
+        return urllib.parse.urlunsplit(parsed._replace(query=urllib.parse.urlencode(pairs)))
 
     def _release_challenge_browser_runtime(
         self,
@@ -245,53 +375,34 @@ class MissAVSpider(BaseSpider):
         runtime = _ChallengeBrowserRuntime()
         browser_timeout_ms = self._configured_timeout_ms(default=60)
         try:
-            if not self._browser_headless():
-                configured_browser = str((getattr(self, "config", {}) or {}).get("browser_executable") or "")
-                try:
-                    browser_executable = resolve_challenge_browser(configured_browser)
-                    runtime.external_session = ExternalChromeChallengeSession(
-                        proxy_server=proxy_server,
-                        browser_executable=browser_executable,
-                    )
-                except SystemBrowserUnavailable:
-                    self.log("⚠️ 未找到系统 Chrome/Edge，改用 Playwright 浏览器")
-                else:
-                    missing_browser = missing_browser_request(configured_browser)
-                    if missing_browser:
-                        self.log(f"⚠️ 指定的浏览器不存在: {missing_browser}")
-                    self.log(
-                        "🌐 启动独立浏览器: "
-                        f"{browser_launch_label(runtime.external_session.browser_executable)}"
-                    )
-                    runtime.external_session.start(target_url)
-                    if self._wait_for_external_challenge(
-                        runtime.external_session,
-                        target_url,
-                        timeout_ms=browser_timeout_ms,
-                    ):
-                        self._attach_external_browser(runtime, target_url)
-
-            if runtime.external_session is None:
-                playwright = sync_playwright().start()
-                self._track_playwright_instance(playwright)
-                browser = self._launch_challenge_browser(
-                    playwright,
+            configured_browser = str((getattr(self, "config", {}) or {}).get("browser_executable") or "")
+            try:
+                browser_executable = resolve_challenge_browser(configured_browser)
+                runtime.external_session = ExternalChromeChallengeSession(
+                    proxy_server=proxy_server,
+                    browser_executable=browser_executable,
                     headless=self._browser_headless(),
                 )
-                self._track_playwright_browser(browser)
-                context = self._create_challenge_context(browser)
-                page = context.new_page()
-                runtime.bind(playwright, browser, context, page)
-                self.log("🚀 正在访问页面...")
-                if not self.interruptible_playwright_goto(
-                    page,
+            except SystemBrowserUnavailable:
+                self.log("⚠️ 未找到系统 Chrome/Edge，可能再次触发挑战的导航已中止，不会打开自动化客户端连接的页面。")
+            else:
+                missing_browser = missing_browser_request(configured_browser)
+                if missing_browser:
+                    self.log(f"⚠️ 指定的浏览器不存在: {missing_browser}")
+                self.log(
+                    "🌐 启动独立浏览器: "
+                    f"{browser_launch_label(runtime.external_session.browser_executable)}"
+                )
+                runtime.external_session.start(self._require_missav_page_url(target_url))
+                if self._wait_for_external_challenge(
+                    runtime.external_session,
                     target_url,
-                    timeout=browser_timeout_ms,
-                ) or not self._wait_for_cloudflare_challenge(
-                    page,
                     timeout_ms=browser_timeout_ms,
                 ):
-                    runtime.page = None
+                    self._attach_external_browser(runtime, target_url)
+
+            if runtime.external_session is None:
+                self.log("⚠️ 没有外部浏览器会话，可能再次触发挑战的导航已中止，不会对已连接页面执行跳转。")
 
             yield runtime
         finally:
@@ -354,8 +465,14 @@ class MissAVSpider(BaseSpider):
 
     def run(self):
         """执行候选扫描、版本筛选、用户选择和详情页 HLS 嗅探。"""
+        self.run_succeeded = False
+
+        def succeed() -> None:
+            if self.is_running and not self.interrupt_requested:
+                self.run_succeeded = True
+
         try:
-            proxy_server = self._effective_proxy_server()
+            proxy_server = browser_egress_proxy(self._effective_proxy_server())
             if proxy_server:
                 self.log(f"🌍 使用代理: {proxy_server}")
             enable_individual = self.config.get('individual_only', False)
@@ -392,7 +509,7 @@ class MissAVSpider(BaseSpider):
             if not is_single_video_mode:
                 target_url = self.parser.inject_url_params(target_url, enable_individual)
                 self.log(f"🔧 修正后 URL: {target_url}")
-            self._require_missav_page_url(target_url)
+            target_url = self._require_missav_page_url(target_url)
             if not self.is_running:
                 return
             with self._challenge_browser_runtime(
@@ -410,37 +527,20 @@ class MissAVSpider(BaseSpider):
                     except (PlaywrightError, TypeError, AttributeError):
                         pass
                     browser_timeout_ms = self._configured_timeout_ms(default=60)
+                    validated_list_url = target_url
                     # 搜索页可能优先返回演员卡片，转入其主页后才能扫描完整作品列表。
                     if is_search_mode and self.is_running:
-                        try:
-                            self.interruptible_sleep(2)
-                            links = page.query_selector_all('a[href*="/actresses/"]')
-                            valid_actress_link = None
-                            for link in links:
-                                href = link.get_attribute("href")
-                                if href and "ranking" not in href and "search" not in href:
-                                    if link.is_visible():
-                                        valid_actress_link = link
-                                        break
-                            if valid_actress_link:
-                                href = valid_actress_link.get_attribute("href")
-                                self.log(f"✨ 发现演员主页，自动跳转: {href}")
-                                valid_actress_link.click()
-                                if not self.interruptible_wait_for_load_state(
-                                    page,
-                                    "domcontentloaded",
-                                    timeout=browser_timeout_ms,
-                                ):
-                                    return
-                                current_url = page.url
-                                new_url = self.parser.inject_url_params(current_url, enable_individual)
-                                if new_url != current_url:
-                                    if not self.interruptible_playwright_goto(page, new_url, timeout=browser_timeout_ms):
-                                        return
-                                    if not self._wait_for_cloudflare_challenge(page, timeout_ms=browser_timeout_ms):
-                                        return
-                        except PlaywrightError:
-                            pass
+                        page, validated_list_url = self._open_actress_catalog(
+                            runtime,
+                            page,
+                            validated_list_url,
+                            enable_individual,
+                            browser_timeout_ms,
+                        )
+                        if page is None:
+                            return
+                        browser = runtime.browser or browser
+                        context = runtime.context or context
                     if not self.is_running:
                         self._close_tracked_playwright_browser(browser)
                         return
@@ -451,54 +551,58 @@ class MissAVSpider(BaseSpider):
                     else:
                         scraped_data = {}
                         verified_chinese = set()
-                        base_url = page.url
                         # 第一遍收集全部候选，用户中途停止时仍可保留已经得到的部分结果。
                         self.log("📜 开始第一遍扫描 (获取所有视频)...")
-                        self._scan_pages(page, scraped_data, is_chinese_pass=False)
+                        self._scan_pages(
+                            page,
+                            scraped_data,
+                            is_chinese_pass=False,
+                            page_url=validated_list_url,
+                            runtime=runtime,
+                        )
+                        page = runtime.page or page
+                        browser = runtime.browser or browser
+                        context = runtime.context or context
 
                         if not self.is_running:
                             self.log("⏸️ 扫描被中断，跳过中文校验，准备生成清单...")
                         if not scraped_data:
                             self.log("❌ 未找到任何视频")
                             self._close_tracked_playwright_browser(browser)
+                            succeed()
                             return
                         # 第二遍只校验中文字幕；停止后跳过，避免为补充标签继续发起页面请求。
                         if self.is_running:
                             self.log("🇨🇳 开始第二遍扫描 (校验中文字幕)...")
-                            chinese_url = self.parser.add_chinese_filter(base_url)
+                            chinese_url = self._chinese_verification_url(validated_list_url)
 
-                            if chinese_url != base_url:
+                            if chinese_url:
                                 self.log(f"   跳转校验: {chinese_url}")
                                 try:
-                                    chinese_url_no_page = re.sub(r'[?&]page=\d+', '', chinese_url)
-                                    if runtime.external_session is not None:
-                                        if not self._navigate_external_challenge(
-                                            runtime,
-                                            chinese_url_no_page,
-                                            timeout_ms=browser_timeout_ms,
-                                        ):
-                                            return
-                                        browser = runtime.browser
-                                        context = runtime.context
-                                        page = runtime.page
-                                    else:
-                                        if not self.interruptible_playwright_goto(
-                                            page,
-                                            chinese_url_no_page,
-                                            timeout=browser_timeout_ms,
-                                        ):
-                                            return
-                                        if not self._wait_for_cloudflare_challenge(
-                                            page,
-                                            timeout_ms=browser_timeout_ms,
-                                        ):
-                                            return
-
+                                    opened = self._reopen_missav_page(
+                                        runtime,
+                                        page,
+                                        chinese_url,
+                                        timeout_ms=browser_timeout_ms,
+                                        wait_for_challenge=runtime.external_session is None,
+                                    )
+                                    if opened is None:
+                                        return
+                                    page = opened
+                                    browser = runtime.browser or browser
+                                    context = runtime.context or context
                                     chinese_data = {}
-                                    self._scan_pages(page, chinese_data, is_chinese_pass=True)
+                                    self._scan_pages(
+                                        page,
+                                        chinese_data,
+                                        is_chinese_pass=True,
+                                        page_url=chinese_url,
+                                        runtime=runtime,
+                                    )
+                                    page = runtime.page or page
                                     verified_chinese = set(chinese_data.keys())
                                     scraped_data.update(chinese_data)
-                                except PlaywrightError as e:
+                                except (PlaywrightError, DomainPolicyViolation) as e:
                                     self.log(f"   ⚠️ 中文校验异常: {e}")
 
                         if not self.revive_for_partial_selection(len(scraped_data), "个候选结果"):
@@ -521,6 +625,7 @@ class MissAVSpider(BaseSpider):
                     if not final_tasks:
                         self.log("❌ 筛选后无有效结果")
                         self._close_tracked_playwright_browser(browser)
+                        succeed()
                         return
                     final_tasks = self._trim_final_tasks(final_tasks)
                     self.log(f"🔔 扫描完成，共 {len(final_tasks)} 个最佳版本")
@@ -529,6 +634,7 @@ class MissAVSpider(BaseSpider):
                     if not selected_indices:
                         self.log("❌ 用户取消下载")
                         self._close_tracked_playwright_browser(browser)
+                        succeed()
                         return
                     self.log(f"✅ 选中 {len(selected_indices)} 个，开始嗅探 m3u8...")
 
@@ -538,59 +644,63 @@ class MissAVSpider(BaseSpider):
                         if not self.is_running:
                             break
                         task = final_tasks[idx]
-                        target_page_url = task['url']
+                        try:
+                            target_page_url = self._require_missav_page_url(task['url'])
+                        except DomainPolicyViolation as exc:
+                            self.log(f"   ❌ 跳过不受支持的详情链接: {exc}")
+                            continue
                         title = task['title']
                         self.log(f"🕵️ [{i + 1}/{len(selected_indices)}] 嗅探: {title[:15]}...")
-                        m3u8_url = None
-                        m3u8_headers = {}
-                        m3u8_status = None
-                        m3u8_ready = False
-                        m3u8_playlist_cache = {}
+                        playlist_capture = PlaylistCapture()
                         # 监听器闭包只归属当前详情页，并在 finally 中移除，防止迟到响应污染下一项。
-                        def handle_request(req):
-                            
-                            nonlocal m3u8_url, m3u8_headers
-                            if "playlist.m3u8" in req.url:
-                                m3u8_url = req.url
-                                m3u8_headers = self._headers_from_request(req)
-                        def handle_response(resp, playlist_cache=m3u8_playlist_cache):
-                            nonlocal m3u8_url, m3u8_headers, m3u8_status, m3u8_ready
+                        def handle_response(resp, capture=playlist_capture):
                             try:
                                 req = resp.request
                                 req_url = req.url
                             except (PlaywrightError, TypeError, AttributeError):
                                 return
-                            if "playlist.m3u8" not in req_url:
+                            if not self._is_m3u8_request_url(req_url):
                                 return
                             try:
                                 status = int(resp.status)
                             except (TypeError, ValueError):
                                 status = 0
-                            m3u8_url = req_url
-                            m3u8_status = status
-                            m3u8_headers = self._headers_from_request(req)
-                            if status in (200, 206):
-                                try:
-                                    playlist_text = resp.text()
-                                except (PlaywrightError, UnicodeDecodeError, TypeError, ValueError):
-                                    playlist_text = ""
-                                if self._looks_like_hls_playlist(playlist_text):
-                                    playlist_cache[req_url] = playlist_text
-                                    m3u8_ready = True
+                            try:
+                                playlist_text = resp.text() if status in (200, 206) else ""
+                            except (PlaywrightError, UnicodeDecodeError, TypeError, ValueError):
+                                playlist_text = ""
+                            capture.observe(
+                                req_url,
+                                status,
+                                self._headers_from_request(req),
+                                playlist_text,
+                            )
                         def on_popup(popup):
-                            
-                            if popup != page:
+                            active_page = runtime.page or page
+                            if popup != active_page:
                                 try:
                                     popup.close()
                                 except PlaywrightError:
                                     pass
-                        context.on("page", on_popup)
-                        page.on("request", handle_request)
-                        page.on("response", handle_response)
+                        listeners_attached = False
                         try:
-                            if not self.interruptible_playwright_goto(page, target_page_url, timeout=browser_timeout_ms):
-                                break
-                            if not self._wait_for_cloudflare_challenge(page, timeout_ms=browser_timeout_ms):
+                            if runtime.external_session is not None:
+                                if not self._navigate_external_challenge(
+                                    runtime,
+                                    target_page_url,
+                                    timeout_ms=browser_timeout_ms,
+                                ):
+                                    break
+                                page = runtime.page
+                                context = runtime.context
+                                browser = runtime.browser
+                                if page is None or context is None:
+                                    break
+                            context.on("page", on_popup)
+                            page.on("response", handle_response)
+                            listeners_attached = True
+                            if runtime.external_session is None:
+                                self.log("⚠️ 详情跳转仍由自动化客户端连接，已停止以避免在挑战页上轮询。")
                                 break
                             try:
                                 self.interruptible_wait_for_selector(page, ".plyr", timeout=self.PLAYER_READY_TIMEOUT_MS)
@@ -598,17 +708,22 @@ class MissAVSpider(BaseSpider):
                                     break
                                 page.mouse.click(400, 300)
                                 self.interruptible_sleep(2)
-                                if not m3u8_url:
+                                if playlist_capture.selected is None:
                                     page.mouse.click(400, 300)
                             except PlaywrightError:
                                 pass
                             for _ in range(self.M3U8_SNIFF_SECONDS):
-                                if m3u8_ready or not self.is_running:
+                                if playlist_capture.selected is not None or not self.is_running:
                                     break
                                 self.interruptible_sleep(1)
                             if not self.is_running:
                                 break
-                            if m3u8_url and m3u8_ready:
+                            submission = playlist_capture.submission()
+                            if submission is not None:
+                                m3u8_url, m3u8_playlist_cache = submission
+                                selected_playlist = playlist_capture.selected
+                                m3u8_headers = {} if selected_playlist is None else selected_playlist.headers
+                                m3u8_status = None if selected_playlist is None else selected_playlist.status
                                 trace_id = self.new_trace_id("m3u8")
                                 download_headers = self._download_headers_for_context(
                                     context,
@@ -658,6 +773,7 @@ class MissAVSpider(BaseSpider):
                                 )
                                 success_count += 1
                             else:
+                                selected_playlist = playlist_capture.selected
                                 self.log("   ⚠️ 嗅探超时 (未找到 playlist.m3u8)")
                                 self.debug_state(
                                     action="sniff_m3u8_timeout",
@@ -667,9 +783,9 @@ class MissAVSpider(BaseSpider):
                                         "title": title,
                                         "target_page_url": target_page_url,
                                         "selected_index": idx,
-                                        "stream_url": m3u8_url,
-                                        "m3u8_status": m3u8_status,
-                                        "m3u8_ready": m3u8_ready,
+                                        "stream_url": None if selected_playlist is None else selected_playlist.url,
+                                        "m3u8_status": None if selected_playlist is None else selected_playlist.status,
+                                        "m3u8_ready": selected_playlist is not None,
                                     },
                                     level="WARNING",
                                 )
@@ -687,21 +803,20 @@ class MissAVSpider(BaseSpider):
                                 level="ERROR",
                             )
                         finally:
-                            try:
-                                page.remove_listener("request", handle_request)
-                            except PlaywrightError:
-                                pass
-                            try:
-                                page.remove_listener("response", handle_response)
-                            except PlaywrightError:
-                                pass
-                            try:
-                                context.remove_listener("page", on_popup)
-                            except PlaywrightError:
-                                pass
+                            if listeners_attached and page is not None:
+                                try:
+                                    page.remove_listener("response", handle_response)
+                                except PlaywrightError:
+                                    pass
+                            if listeners_attached and context is not None:
+                                try:
+                                    context.remove_listener("page", on_popup)
+                                except PlaywrightError:
+                                    pass
                         self.interruptible_sleep(1)
                     if self.is_running:
                         self.log(f"🎉 任务结束，成功提交: {success_count}")
+                        succeed()
                     else:
                         self.log("🛑 任务强制中止")
                 finally:
@@ -740,12 +855,17 @@ class MissAVSpider(BaseSpider):
     def _normalize_keyword(self, raw_text: str) -> str:
         return self._extract_first_url(raw_text)
 
-    def _scan_pages(self, page, data_dict, is_chinese_pass=False):
+    @staticmethod
+    def _is_m3u8_request_url(url: str) -> bool:
+        path = urllib.parse.urlsplit(str(url or "")).path.lower()
+        return ".m3u8" in path
+
+    def _scan_pages(self, page, data_dict, is_chinese_pass=False, *, page_url: str | None = None, runtime=None):
         """列表扫描允许局部页失败，但尽量保住已抓到的候选数据。"""
         current_page = 1
         max_pages = self._max_scan_pages()
         max_items = self._max_items_limit()
-        base_url = page.url
+        base_url = str(page_url or getattr(page, "url", "") or "")
         while self.is_running and current_page <= max_pages:
             self.log(f"   📄 扫描第 {current_page} 页...")
             try:
@@ -770,6 +890,8 @@ class MissAVSpider(BaseSpider):
                         break
                     url = item['url']
                     title = item['title']
+                    if not self._url_matches_hosts(url, self.PAGE_HOSTS):
+                        continue
                     if "/cn/" in url and code_pattern.search(url):
                         if not any(x in url for x in ['contact', 'dmca']):
                             if url not in data_dict:
@@ -788,13 +910,28 @@ class MissAVSpider(BaseSpider):
                     sep = "&" if "?" in base_url else "?"
                     next_url = f"{base_url}{sep}page={current_page}"
                 try:
-                    if not self.interruptible_playwright_goto(
+                    next_url = self._require_missav_page_url(next_url)
+                    timeout_ms = self._configured_timeout_ms(default=60)
+                    if runtime is not None and runtime.external_session is not None:
+                        if not self._navigate_external_challenge(
+                            runtime,
+                            next_url,
+                            timeout_ms=timeout_ms,
+                        ):
+                            break
+                        page = runtime.page
+                        if page is None:
+                            break
+                    elif runtime is not None and runtime.external_session is None:
+                        self.log("⚠️ 没有外部浏览器会话，已停止可能再次触发挑战的翻页，不会跳转已连接页面。")
+                        break
+                    elif not self.interruptible_playwright_goto(
                         page,
                         next_url,
-                        timeout=self._configured_timeout_ms(default=60),
+                        timeout=timeout_ms,
                     ):
                         break
-                except PlaywrightError:
+                except (PlaywrightError, DomainPolicyViolation):
                     break
             except (PlaywrightError, ValueError, TypeError) as e:
                 self.log(f"   ⚠️ 页面扫描异常: {e}")

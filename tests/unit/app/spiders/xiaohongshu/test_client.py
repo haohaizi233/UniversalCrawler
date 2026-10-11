@@ -336,11 +336,23 @@ def test_html_detail_uses_http_and_parser_boundaries_then_adds_security_context(
             True,
             id="logged-in-payload",
         ),
-        pytest.param(_Response(payload={}), False, id="guest-payload"),
+        pytest.param(_Response(payload={}), None, id="empty-object"),
+        pytest.param(_Response(payload=[]), None, id="non-object"),
+        pytest.param(_Response(payload="guest"), None, id="non-object-text"),
+        pytest.param(
+            _Response(payload={"success": False, "data": {}}),
+            False,
+            id="guest-object",
+        ),
         pytest.param(
             _Response(status_error=requests.HTTPError("unauthorized")),
-            False,
+            None,
             id="http-error",
+        ),
+        pytest.param(
+            _Response(status_error=requests.HTTPError("gateway")),
+            None,
+            id="http-5xx",
         ),
         pytest.param(
             _Response(json_error=ValueError("invalid JSON")),
@@ -373,6 +385,100 @@ def test_login_probe_returns_true_false_or_none(
     assert session.calls[0]["url"] == (
         "https://edith.xiaohongshu.com/api/sns/web/v1/user/selfinfo"
     )
+
+
+def test_post_rejects_success_with_empty_data(
+    monkeypatch: pytest.MonkeyPatch,
+    signing_calls: list[dict[str, Any]],
+) -> None:
+    response = _Response(payload={"success": True, "data": None}, text='{"success":true}')
+    client, session = _make_client(monkeypatch, response)
+
+    with pytest.raises(SpiderParseError, match="data 为空"):
+        client.post("/api/sns/web/v1/test", {"note_id": "note-1"})
+
+    assert len(signing_calls) == 1
+    assert len(session.calls) == 1
+
+
+def test_feed_returns_only_note_card_matching_requested_id(
+    monkeypatch: pytest.MonkeyPatch,
+    signing_calls: list[dict[str, Any]],
+) -> None:
+    response = _Response(
+        payload={
+            "success": True,
+            "data": {
+                "items": [
+                    {"id": "recommended", "note_card": {"note_id": "recommended", "title": "推荐"}},
+                    {
+                        "id": "wanted",
+                        "noteCard": {"noteId": "wanted", "title": "目标"},
+                    },
+                ]
+            },
+        }
+    )
+    client, _session = _make_client(monkeypatch, response)
+
+    detail = client.get_note_detail(note_id="wanted", xsec_token="token", xsec_source="pc_search")
+
+    assert detail["note_id"] == "wanted"
+    assert detail["title"] == "目标"
+    assert detail["xsec_token"] == "token"
+    assert detail["xsec_source"] == "pc_search"
+    assert signing_calls[0]["uri"] == "/api/sns/web/v1/feed"
+
+
+def test_feed_without_matching_note_card_does_not_return_recommendation(
+    monkeypatch: pytest.MonkeyPatch,
+    signing_calls: list[dict[str, Any]],
+) -> None:
+    response = _Response(
+        payload={
+            "success": True,
+            "data": {"items": [{"note_card": {"note_id": "recommended", "title": "推荐"}}]},
+        }
+    )
+    client, _session = _make_client(monkeypatch, response)
+
+    assert client.get_note_detail(note_id="wanted") == {}
+    assert signing_calls
+
+
+def test_html_detail_quotes_note_id_and_security_query(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    response = _Response(text="<html></html>")
+    client, session = _make_client(monkeypatch, response)
+
+    def parse_boundary(note_id: str, _page_html: str) -> dict[str, Any]:
+        return {"note_id": note_id, "title": "quoted"}
+
+    monkeypatch.setattr(client_module, "extract_note_detail_from_html", parse_boundary)
+
+    detail = client.get_note_detail_from_html(
+        note_id="note id",
+        xsec_token="a b/c?",
+        xsec_source="pc search",
+    )
+
+    assert detail["title"] == "quoted"
+    assert session.calls[0]["url"] == (
+        "https://www.xiaohongshu.com/explore/note%20id"
+        "?xsec_token=a%20b%2Fc%3F&xsec_source=pc%20search"
+    )
+
+
+def test_html_detail_raises_when_parser_finds_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    response = _Response(text="<html>missing</html>")
+    client, _session = _make_client(monkeypatch, response)
+    monkeypatch.setattr(client_module, "extract_note_detail_from_html", lambda *_args: None)
+
+    with pytest.raises(SpiderParseError, match="未解析到笔记"):
+        client.get_note_detail_from_html(note_id="note-1", xsec_token="t", xsec_source="pc_search")
 
 
 @pytest.mark.parametrize(

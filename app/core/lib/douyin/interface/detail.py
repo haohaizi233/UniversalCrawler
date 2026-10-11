@@ -44,6 +44,12 @@ class Detail(API):
             "version_name": "19.5.0",
         }
 
+    def _response_matches_detail_id(self) -> bool:
+        payload = self.response
+        if not isinstance(payload, dict):
+            return False
+        return str(payload.get("aweme_id", "")) == str(self.detail_id)
+
     async def run(
             self,
             referer: str = None,
@@ -59,7 +65,8 @@ class Detail(API):
             *args,
             **kwargs,
     ):
-        return await super().run(
+        self.response = []
+        result = await super().run(
             referer,
             single_page,
             data_key,
@@ -73,6 +80,10 @@ class Detail(API):
             *args,
             **kwargs,
         )
+        if not self._response_matches_detail_id():
+            self.response = []
+            return self.response
+        return result
 
     def check_response(
             self,
@@ -87,10 +98,15 @@ class Detail(API):
         
         try:
             if not (d := data_dict[data_key]):
+                self.response = []
                 self.log.warning(error_text)
-            else:
+            elif isinstance(d, dict) and str(d.get("aweme_id", "")) == str(self.detail_id):
                 self.response = d
+            else:
+                self.response = []
+                self.log.warning(error_text or _("作品详情与请求的作品 ID 不一致"))
         except KeyError:
+            self.response = []
             self.log.error(
                 _("数据解析失败，请告知作者处理: {data}").format(data=data_dict)
             )

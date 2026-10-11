@@ -392,23 +392,22 @@ class SpiderHelperTests(unittest.TestCase):
         )
         self.assertEqual(title, "sunny77小合集 · P03 · 我的好利来女友")
 
-    def test_bilibili_parser_parse_play_url_response_allows_missing_audio(self):
-        """验证 `test_bilibili_parser_parse_play_url_response_allows_missing_audio` 对应场景是否符合预期，供 `SpiderHelperTests` 使用。"""
+    def test_bilibili_parser_parse_play_url_response_rejects_video_only_dash(self):
+        """只有视频没有音频、也没有含音画 durl 时，不能当成可合并结果。"""
         parser = BilibiliParser()
 
-        result = parser.parse_play_url_response(
-            {
-                "code": 0,
-                "data": {
-                    "dash": {
-                        "video": [{"baseUrl": "https://cdn.example.com/video.m4s", "id": 64}],
-                        "audio": [],
-                    }
-                },
-            }
-        )
-
-        self.assertEqual(result, ("https://cdn.example.com/video.m4s", None, 64))
+        with self.assertRaises(SpiderParseError):
+            parser.parse_play_url_response(
+                {
+                    "code": 0,
+                    "data": {
+                        "dash": {
+                            "video": [{"baseUrl": "https://cdn.example.com/video.m4s", "id": 64}],
+                            "audio": [],
+                        }
+                    },
+                }
+            )
 
     def test_bilibili_parser_parse_play_url_response_raises_on_incomplete_payload(self):
         """验证 `test_bilibili_parser_parse_play_url_response_raises_on_incomplete_payload` 对应场景是否符合预期，供 `SpiderHelperTests` 使用。"""
@@ -617,34 +616,55 @@ class SpiderHelperTests(unittest.TestCase):
         self.assertEqual(mocked_log_exception.call_args.args[:2], ("DouyinSpider", "user_search"))
         self.assertEqual(mocked_log_exception.call_args.kwargs["details"], {"user_id": "testuser"})
 
-    @patch("app.spiders.douyin.spider.httpx.AsyncClient")
+    @patch("app.core.lib.douyin.link.requester.PinnedTransport")
     @patch("app.core.lib.douyin.interface.search.Search")
-    def test_douyin_user_page_fallback_does_not_inherit_system_proxy(
+    def test_douyin_user_page_fallback_uses_pinned_transport(
         self,
         mock_search_class,
-        mock_async_client,
+        mock_transport_cls,
     ):
         spider = DouyinSpider.__new__(DouyinSpider)
         spider.log = Mock()
         spider.config = {}
+        spider.is_running = True
+        spider._interrupt_requested = False
         search = Mock()
         search.run = AsyncMock(return_value=[])
+        search.response = []
         mock_search_class.return_value = search
-        response = Mock(text="")
-        response.raise_for_status = Mock()
-        client = AsyncMock()
-        client.get.return_value = response
-        mock_async_client.return_value.__aenter__ = AsyncMock(return_value=client)
-        mock_async_client.return_value.__aexit__ = AsyncMock(return_value=None)
-
-        asyncio.run(
-            spider._process_user_search(
-                SimpleNamespace(cookie_str="", proxy=""),
-                "testuser",
-            )
+        transport = Mock()
+        transport.request.return_value = SimpleNamespace(
+            status_code=200,
+            url="https://www.douyin.com:443/user/testuser",
+            headers={},
+            text="",
+            body=b"",
+        )
+        mock_transport_cls.return_value = transport
+        params = SimpleNamespace(
+            cookie_str="sid=secret",
+            proxy="",
+            logger=SimpleNamespace(
+                info=lambda *args, **kwargs: None,
+                warning=lambda *args, **kwargs: None,
+                error=lambda *args, **kwargs: None,
+            ),
+            max_retry=0,
+            timeout=7,
+            client=AsyncMock(),
+            headers={"User-Agent": "ua"},
         )
 
-        self.assertFalse(mock_async_client.call_args.kwargs["trust_env"])
+        asyncio.run(spider._process_user_search(params, "testuser"))
+
+        transport.request.assert_called()
+        self.assertEqual(transport.request.call_args.args[0], "GET")
+        self.assertEqual(
+            transport.request.call_args.args[1],
+            "https://www.douyin.com/user/testuser",
+        )
+        self.assertEqual(transport.request.call_args.kwargs["max_redirects"], 0)
+        self.assertEqual(transport.request.call_args.kwargs["headers"]["Cookie"], "sid=secret")
 
     def test_kuaishou_parser_extracts_cache_key(self):
         """验证 `test_kuaishou_parser_extracts_cache_key` 对应场景是否符合预期，供 `SpiderHelperTests` 使用。"""
@@ -1218,8 +1238,9 @@ class SpiderHelperTests(unittest.TestCase):
             spider._perform_scan_login()
 
         self.assertEqual(mock_process.call_args.kwargs["args"][-1], 90000)
+        self.assertIn("stop_event", mock_process.call_args.kwargs["kwargs"])
         process.terminate.assert_called_once()
-        process.join.assert_called_once_with(timeout=2)
+        process.join.assert_any_call(timeout=2)
 
     @patch("app.spiders.douyin.spider.Process")
     @patch("app.spiders.douyin.spider.Queue")
@@ -1483,18 +1504,24 @@ class SpiderHelperTests(unittest.TestCase):
         self.assertEqual(result, malicious)
         mocked_get.assert_not_called()
 
+    @patch("app.spiders.kuaishou.share_runtime.curl_get")
     @patch("app.spiders.kuaishou.share_runtime.requests.get")
-    def test_kuaishou_detail_fetch_rejects_private_url_with_platform_path(self, mocked_get):
+    def test_kuaishou_detail_fetch_rejects_private_url_with_platform_path(
+        self,
+        mocked_requests_get,
+        mocked_curl_get,
+    ):
         spider = self._make_kuaishou_capture_spider()
 
-        result = spider._fetch_share_detail_via_http(
-            "http://127.0.0.1/short-video/3xj8abcde"
-        )
+        with self.assertRaises(DomainPolicyViolation):
+            spider._fetch_share_detail_via_http(
+                "http://127.0.0.1/short-video/3xj8abcde"
+            )
 
-        self.assertEqual(result, ("", ""))
-        mocked_get.assert_not_called()
+        mocked_requests_get.assert_not_called()
+        mocked_curl_get.assert_not_called()
 
-    @patch("app.spiders.kuaishou.share_runtime.requests.get")
+    @patch("app.spiders.kuaishou.share_runtime.curl_get")
     def test_kuaishou_try_direct_share_download_emits_without_browser(self, mocked_get):
         """分享详情链接应优先走 HTTP 直连，不依赖浏览器捕获媒体流。"""
         spider = self._make_kuaishou_capture_spider()
@@ -1509,8 +1536,17 @@ class SpiderHelperTests(unittest.TestCase):
         )
         response.iter_content.return_value = [response.text.encode("utf-8")]
         response.encoding = "utf-8"
+        response.status_code = 200
+        response.headers = {}
         response.raise_for_status = Mock()
-        mocked_get.return_value = response
+        response.close = Mock()
+
+        def fake_curl_get(_url, **kwargs):
+            payload = response.text.encode("utf-8")
+            kwargs["content_callback"](payload)
+            return response
+
+        mocked_get.side_effect = fake_curl_get
 
         result = spider._try_direct_share_download()
 
@@ -1522,21 +1558,28 @@ class SpiderHelperTests(unittest.TestCase):
             meta={"trace_id": "ks-trace-1"},
         )
 
-    @patch("app.spiders.kuaishou.share_runtime.requests.get")
+    @patch("app.spiders.kuaishou.share_runtime.curl_get")
     def test_kuaishou_fetch_share_detail_uses_task_timeout(self, mocked_get):
         spider = self._make_kuaishou_capture_spider()
         spider.config = {"timeout": 90}
         response = Mock()
         response.url = "https://www.kuaishou.com/short-video/3xj8abcde"
         response.text = ""
-        response.iter_content.return_value = []
+        response.status_code = 200
+        response.headers = {}
         response.encoding = "utf-8"
         response.raise_for_status = Mock()
+        response.close = Mock()
         mocked_get.return_value = response
 
         spider._fetch_share_detail_via_http(response.url)
 
-        self.assertEqual(mocked_get.call_args.kwargs["timeout"], 90)
+        connect_timeout, read_timeout = mocked_get.call_args.kwargs["timeout"]
+        self.assertLessEqual(connect_timeout, spider.SHORT_LINK_CONNECT_TIMEOUT_SECONDS)
+        self.assertLessEqual(read_timeout, spider.SHORT_LINK_READ_TIMEOUT_SECONDS)
+        self.assertGreater(connect_timeout, 0)
+        self.assertGreater(read_timeout, 0)
+        self.assertNotEqual(mocked_get.call_args.kwargs["timeout"], 90)
 
     def test_kuaishou_run_skips_playwright_when_direct_share_download_succeeds(self):
         """HTTP 直连成功时，run 不应再打开浏览器。"""
@@ -2295,9 +2338,12 @@ class SpiderHelperTests(unittest.TestCase):
         spider.log = Mock()
         response = Mock(status_code=200)
         response.text = """
-            <a href="/video/BV19nRWBtEnF">unavailable representative</a>
-            <a href="/video/BV1xgDNBUEXg">first playable</a>
-            <script>{"bvid":"BV1QY411b7Kf","jump_url":"//www.bilibili.com/video/BV1xgDNBUEXg"}</script>
+            <div class="video-list">
+              <div class="bili-video-card"><a href="/video/BV19nRWBtEnF">unavailable representative</a></div>
+              <div class="bili-video-card"><a href="/video/BV1xgDNBUEXg">first playable</a></div>
+              <div class="bili-video-card"><a href="/video/BV1QY411b7Kf">second playable</a></div>
+            </div>
+            <div class="rank-list"><a href="/video/BV1rank00001">ranking</a></div>
         """
 
         with patch("app.spiders.bilibili.spider.requests.get", return_value=response) as mocked_get:
@@ -2322,8 +2368,11 @@ class SpiderHelperTests(unittest.TestCase):
         spider.log = Mock()
         response = Mock(status_code=200)
         response.text = """
-            <a href="/video/BV1xgDNBUEXg">first playable</a>
-            <a href="/video/BV1QY411b7Kf">second playable</a>
+            <div class="video-list">
+              <div class="bili-video-card"><a href="/video/BV1xgDNBUEXg">first playable</a></div>
+              <div class="bili-video-card"><a href="/video/BV1QY411b7Kf">second playable</a></div>
+            </div>
+            <div class="rank-list"><a href="/video/BV1rank00001">ranking</a></div>
         """
 
         with patch("app.spiders.bilibili.spider.requests.get", return_value=response):
@@ -2344,7 +2393,7 @@ class SpiderHelperTests(unittest.TestCase):
         spider.raw_bv_queue = Mock()
         spider.log = Mock()
         response = Mock(status_code=200)
-        response.text = '<a href="/video/BV1xgDNBUEXg">first playable</a>'
+        response.text = '<div class="video-list"><div class="bili-video-card"><a href="/video/BV1xgDNBUEXg">first playable</a></div></div>'
 
         with patch("app.spiders.bilibili.spider.requests.get", return_value=response):
             count = spider._scan_static_bilibili_candidates(
@@ -3099,6 +3148,213 @@ class SpiderHelperTests(unittest.TestCase):
         )
         spider._process_mix.assert_awaited_once_with(params, "7480000000000000001")
         spider._process_detail.assert_not_awaited()
+
+    @patch("app.spiders.douyin.spider.LinkExtractor")
+    @patch("app.spiders.douyin.spider.Parameter")
+    def test_douyin_async_main_rejects_empty_keyword_before_request(self, mock_parameter, mock_link_extractor):
+        spider = self._make_douyin_spider("   ")
+        params = Mock(chunk=1024 * 1024, max_retry=3)
+        params.update_params = AsyncMock()
+        mock_parameter.return_value = params
+        extractor = Mock()
+        mock_link_extractor.return_value = extractor
+
+        asyncio.run(spider._async_main("sessionid_ss=1"))
+
+        extractor.run.assert_not_called()
+        spider._process_search.assert_not_awaited()
+        spider._process_user.assert_not_awaited()
+        self.assertTrue(any("输入为空" in str(call.args[0]) for call in spider.log.call_args_list))
+
+    @patch("app.spiders.douyin.spider.LinkExtractor")
+    @patch("app.spiders.douyin.spider.Parameter")
+    def test_douyin_async_main_rejects_off_platform_user_marker_before_request(
+        self,
+        mock_parameter,
+        mock_link_extractor,
+    ):
+        spider = self._make_douyin_spider("https://evil.example/user/abc")
+        params = Mock(chunk=1024 * 1024, max_retry=3)
+        params.update_params = AsyncMock()
+        mock_parameter.return_value = params
+        extractor = Mock()
+        mock_link_extractor.return_value = extractor
+
+        asyncio.run(spider._async_main("sessionid_ss=1"))
+
+        extractor.run.assert_not_called()
+        extractor.requester.run.assert_not_called()
+        spider._process_user.assert_not_awaited()
+
+    @patch("app.spiders.douyin.spider.LinkExtractor")
+    @patch("app.spiders.douyin.spider.Parameter")
+    def test_douyin_async_main_uses_path_not_query_for_user_pages(self, mock_parameter, mock_link_extractor):
+        spider = self._make_douyin_spider(
+            "https://www.douyin.com/video/7480000000000000001?next=user/collection/mix/"
+        )
+        params = Mock(chunk=1024 * 1024, max_retry=3)
+        params.update_params = AsyncMock()
+        extractor = Mock()
+        extractor.run = AsyncMock(return_value=["aweme_1"])
+        mock_parameter.return_value = params
+        mock_link_extractor.return_value = extractor
+
+        asyncio.run(spider._async_main("sessionid_ss=1"))
+
+        extractor.run.assert_awaited_once_with(
+            "https://www.douyin.com/video/7480000000000000001?next=user/collection/mix/",
+            type_="detail",
+        )
+        spider._process_user.assert_not_awaited()
+        spider._process_mix.assert_not_awaited()
+
+    def test_douyin_parser_prefers_download_addr_and_rewrites_playwm_path(self):
+        parser = DouyinItemParser()
+
+        item = parser.parse_aweme(
+            {
+                "aweme_id": "1005",
+                "desc": "download",
+                "author": {"nickname": "author"},
+                "video": {
+                    "download_addr": {
+                        "url_list": [
+                            "https://cdn.example.com/aweme/v1/playwm/?video_id=1&playwm=keep"
+                        ]
+                    },
+                    "bit_rate": [
+                        {
+                            "bit_rate": 99999,
+                            "play_addr": {
+                                "height": 1080,
+                                "width": 1920,
+                                "url_list": ["https://cdn.example.com/high.mp4"],
+                            },
+                        }
+                    ],
+                },
+            }
+        )
+
+        self.assertIsNotNone(item)
+        self.assertEqual(item.url, "https://cdn.example.com/aweme/v1/play/?video_id=1&playwm=keep")
+
+    @patch("app.spiders.douyin.spider.Detail")
+    def test_douyin_detail_does_not_enqueue_previous_success_after_failure(self, mock_detail):
+        spider = DouyinSpider.__new__(DouyinSpider)
+        spider.is_running = True
+        spider._interrupt_requested = False
+        spider.log = Mock()
+        spider.parser = DouyinItemParser()
+        spider.debug_api = Mock()
+        spider._trim_items = Mock(side_effect=lambda items, _hint: items)
+        spider._submit_tasks = Mock()
+        spider._handle_selection = Mock()
+        spider._interrupt_active_client = AsyncMock()
+        api = Mock()
+        seen_responses = []
+
+        async def run(**_kwargs):
+            seen_responses.append(api.response)
+            if api.detail_id == "2222222222222222222":
+                return {"aweme_id": "1111111111111111111"}
+            return {
+                "aweme_id": api.detail_id,
+                "desc": "ok",
+                "author": {"nickname": "author"},
+                "video": {"play_addr": {"url_list": ["https://cdn.example.com/a.mp4"]}},
+            }
+
+        api.run = AsyncMock(side_effect=run)
+        mock_detail.return_value = api
+
+        asyncio.run(
+            spider._process_detail(
+                Mock(),
+                ["1111111111111111111", "2222222222222222222"],
+            )
+        )
+
+        self.assertEqual(seen_responses, [[], []])
+        spider._submit_tasks.assert_called_once()
+        submitted = spider._submit_tasks.call_args.args[0]
+        self.assertEqual(len(submitted), 1)
+        self.assertEqual(submitted[0].meta["aweme_id"], "1111111111111111111")
+
+    @patch("app.spiders.douyin.spider.subprocess.run")
+    @patch("app.spiders.douyin.spider.Process")
+    @patch("app.spiders.douyin.spider.Queue")
+    def test_douyin_scan_login_kills_process_tree_when_cooperative_stop_stalls(
+        self,
+        _mock_queue,
+        mock_process,
+        mocked_run,
+    ):
+        spider = DouyinSpider.__new__(DouyinSpider)
+        spider.auth_file = "dy_auth.json"
+        spider.config = {"timeout": 90}
+        spider.is_running = False
+        spider.log = Mock()
+        spider.auth_service = Mock(spec=AuthService)
+        process = Mock()
+        process.pid = 5151
+        process.is_alive.return_value = True
+        mock_process.return_value = process
+        mocked_run.return_value.returncode = 0
+
+        with self.assertRaises(LoginCancelledError):
+            spider._perform_scan_login()
+
+        if os.name == "nt":
+            command = mocked_run.call_args.args[0]
+            self.assertEqual(command[:4], ["taskkill", "/PID", "5151", "/T"])
+            self.assertIn("/F", command)
+            process.terminate.assert_not_called()
+            process.kill.assert_not_called()
+        else:
+            process.kill.assert_called_once()
+
+    def test_douyin_login_process_closes_browser_when_stop_event_is_set(self):
+        context = Mock()
+        page = Mock()
+        context.new_page.return_value = page
+        context.cookies.return_value = []
+        browser = Mock()
+        browser.new_context.return_value = context
+        playwright = Mock()
+        playwright.chromium.launch.return_value = browser
+        playwright_manager = Mock()
+        playwright_manager.__enter__ = Mock(return_value=playwright)
+        playwright_manager.__exit__ = Mock(return_value=False)
+        anti_context = Mock()
+        anti_context.browser_launch_kwargs.return_value = {}
+        anti_context.browser_context_kwargs.return_value = {"user_agent": "ua-demo"}
+        auth_service = Mock()
+        auth_service.has_cookie.return_value = False
+        result_queue = Mock()
+        stop_event = Mock()
+        stop_event.is_set.return_value = True
+
+        with patch("playwright.sync_api.sync_playwright", return_value=playwright_manager), patch.object(
+            douyin_spider_module,
+            "build_browser_anti_detection",
+            return_value=anti_context,
+        ), patch.object(
+            douyin_spider_module,
+            "AuthService",
+            return_value=auth_service,
+        ), patch(
+            "shared.playwright_network_guard.install_public_network_guard",
+        ), patch("app.spiders.douyin.spider.time.sleep", side_effect=AssertionError("login wait should stop")):
+            douyin_spider_module._run_login_process(
+                "douyin-auth.json",
+                "ua-demo",
+                result_queue,
+                stop_event=stop_event,
+            )
+
+        result_queue.put.assert_called_with("cancelled")
+        browser.close.assert_called()
 
 if __name__ == "__main__":
     unittest.main()

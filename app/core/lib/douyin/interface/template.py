@@ -3,7 +3,7 @@
 import json
 import re
 from time import time as time_func
-from typing import TYPE_CHECKING, Callable, Coroutine, Type, Union
+from typing import TYPE_CHECKING, Callable, Coroutine, Mapping, Type, Union
 from urllib.parse import quote, urlencode
 
 from httpx import AsyncClient, HTTPStatusError, get, post
@@ -25,6 +25,7 @@ try:
         Retry,
         capture_error_request,
     )
+    from ..tools.retry import abort_if_stopped
 except ImportError:
     PROGRESS = "bold magenta"
     USERAGENT = ""
@@ -67,6 +68,9 @@ except ImportError:
         
         return func
 
+    async def abort_if_stopped(_owner):
+        return False
+
 try:
     from ..translation import _
 except ImportError:
@@ -90,6 +94,53 @@ def _extract_chrome_version(user_agent: str) -> str:
     return match.group(1) if match else "139.0.0.0"
 
 CHROME_VERSION = _extract_chrome_version(USERAGENT)
+_SENSITIVE_LOG_HEADERS = frozenset({"authorization", "cookie", "set-cookie"})
+_WORK_ID_PATTERN = re.compile(r"(?:^|&)(?:aweme_id|item_id)=(\d{1,32})(?:&|$)")
+
+
+def redact_logged_headers(headers: Mapping[str, object] | None) -> dict[str, object]:
+    """删除记录前的凭据头，避免 Cookie 和 Authorization 进入日志。"""
+    if not isinstance(headers, Mapping):
+        return {}
+    return {
+        str(key): value
+        for key, value in headers.items()
+        if str(key).lower() not in _SENSITIVE_LOG_HEADERS
+    }
+
+
+try:
+    from ..tools.log_redact import redact_logged_text, strip_ms_token_query
+except ImportError:
+    def strip_ms_token_query(value: str | None) -> str:
+        return value or ""
+
+    def redact_logged_text(value: object) -> str:
+        return "" if value is None else str(value)
+
+
+def extract_work_id(params: dict | str | None) -> str:
+    """从查询参数中提取作品 ID，不返回令牌或其他查询值。"""
+    if isinstance(params, dict):
+        for key in ("aweme_id", "item_id"):
+            value = params.get(key)
+            if isinstance(value, bool):
+                continue
+            if isinstance(value, int):
+                text = str(value)
+            elif isinstance(value, str):
+                text = value
+            else:
+                continue
+            if text.isdigit() and len(text) <= 32:
+                return text
+        return ""
+    if not isinstance(params, str):
+        return ""
+    query = strip_ms_token_query(params)
+    query = query.split("?", 1)[-1]
+    match = _WORK_ID_PATTERN.search(query)
+    return match.group(1) if match else ""
 
 class API:
     """抖音接口基类，统一处理分页、a_bogus 签名、重试和响应解析。"""
@@ -150,12 +201,26 @@ class API:
         self.timeout = params.timeout
         self.cookie = cookie
         self.client: AsyncClient = params.client
+        shared_params = getattr(params, "params", None)
+        if isinstance(shared_params, dict):
+            self.params = shared_params
+        else:
+            self.params = dict(getattr(type(self), "params", {}) or {})
+        self._stop_check = getattr(params, "stop_requested", None)
+        self._logged_work_id = ""
         self.pages = 99999
         self.cursor = 0
         self.response = []
         self.finished = False
         self.text = ""
         self.set_temp_cookie(cookie)
+
+    async def _abort_request(self) -> bool:
+        """请求开始前检查停止标志，并关闭当前客户端。"""
+        if await abort_if_stopped(self):
+            self.finished = True
+            return True
+        return False
 
     def set_temp_cookie(self, cookie: str = ""):
         """仅在显式传入 Cookie 时覆盖当前实例的请求头。"""
@@ -269,6 +334,8 @@ class API:
                 total=None,
             )
             while not self.finished and self.pages > 0:
+                if await self._abort_request():
+                    break
                 progress.update(task_id)
                 await self.run_single(
                     data_key,
@@ -384,6 +451,8 @@ class API:
             **kwargs,
     ):
         
+        if await self._abort_request():
+            return None
         self.__record_request_messages(
             url,
             params,
@@ -409,6 +478,8 @@ class API:
             **kwargs,
     ):
         
+        if await self._abort_request():
+            return None
         verify = kwargs.pop("verify", True)
         self.__record_request_messages(
             url,
@@ -434,6 +505,8 @@ class API:
             self, url: str, params: str, data: dict, headers: dict, finished=False, **kwargs
     ):
         
+        if await self._abort_request():
+            return None
         self.__record_request_messages(
             url,
             params,
@@ -455,10 +528,11 @@ class API:
             self, url: str, params: str, data: dict, headers: dict, finished=False, **kwargs
     ):
         
+        if await self._abort_request():
+            return None
         verify = kwargs.pop("verify", True)
         self.__record_request_messages(
             url,
-            params,
             params,
             data,
             headers,
@@ -478,17 +552,15 @@ class API:
 
     async def __return_response(self, response):
         """校验 HTTP 状态并解析 JSON；请求或解析失败时返回 None。"""
-        self.log.info(f"Response URL: {response.url}", False)
         self.log.info(f"Response Code: {response.status_code}", False)
-
-        # 仅失败时记录响应头，减少正常请求的日志体积。
-        if response.status_code != 200:
-            self.log.info(f"Response Headers: {dict(response.headers)}", False)
+        work_id = getattr(self, "_logged_work_id", "")
+        if work_id:
+            self.log.info(f"Work ID: {work_id}", False)
 
         try:
             response.raise_for_status()
         except HTTPStatusError as e:
-            self.log.error(f"HTTP 请求异常: {e}")
+            self.log.error(f"HTTP 请求异常: {redact_logged_text(e)}")
             return None
 
         await wait()
@@ -511,15 +583,12 @@ class API:
             headers: dict,
             **kwargs,
     ):
-        """记录请求上下文；当前兼容行为会原样写出请求头。"""
-        self.log.info(f"URL: {url}", False)
-        self.log.info(f"Params: {params}", False)
-        if data:
-            self.log.info(f"Data: {data}", False)
-
-        # 为兼容现有诊断输出，headers 会原样记录；日志可能含 Cookie，必须限制访问和留存。
-        desensitize = {k: v for k, v in headers.items()}
-        self.log.info(f"Headers: {desensitize}", False)
+        """只记录作品 ID；URL、查询串、请求体和请求头一律不进入日志。"""
+        del url, data, headers
+        work_id = extract_work_id(params)
+        self._logged_work_id = work_id
+        if work_id:
+            self.log.info(f"Work ID: {work_id}", False)
 
     def deal_url_params(
             self,
@@ -652,8 +721,12 @@ class APITikTok(API):
         self.xb = params.xb
         self.xg = params.xg
         self.headers = params.headers_tiktok.copy()
+        shared_params = getattr(params, "params_tiktok", None)
+        if isinstance(shared_params, dict):
+            self.params = shared_params
         self.cookie = cookie
         self.client: AsyncClient = params.client_tiktok
+        self._stop_check = getattr(params, "stop_requested", None)
         self.set_temp_cookie(cookie)
 
     async def request_data(

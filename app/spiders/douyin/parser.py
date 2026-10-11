@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 from app.debug_logger import debug_logger
 from app.models import VideoItem
@@ -29,11 +30,35 @@ class DouyinItemParser:
                 return url
         return ""
 
+    @staticmethod
+    def _play_path(url: str) -> str:
+        """只替换路径里的 playwm，避免无水印地址被水印路径入队。"""
+        if not url or "playwm" not in url:
+            return url
+        parts = urlsplit(url)
+        if "playwm" not in parts.path:
+            return url
+        return urlunsplit(
+            (
+                parts.scheme,
+                parts.netloc,
+                parts.path.replace("playwm", "play"),
+                parts.query,
+                parts.fragment,
+            )
+        )
+
     @classmethod
     def _select_video_url(cls, video: Any) -> str:
-        """从 bit_rate 候选中选择质量最高的视频地址，过滤误混入的音频地址。"""
+        """优先使用 download_addr，否则从 bit_rate 候选中选择质量最高的视频地址。"""
         if not isinstance(video, dict):
             return ""
+
+        download_addr = video.get("download_addr")
+        if isinstance(download_addr, dict):
+            download_url = cls._last_video_url(download_addr.get("url_list"))
+            if download_url:
+                return cls._play_path(download_url)
 
         candidates: list[tuple[int, int, int, int, str]] = []
         for item in video.get("bit_rate") or []:
@@ -55,11 +80,11 @@ class DouyinItemParser:
         if candidates:
             # 排序维度依次偏向分辨率、帧率、码率和体积，避免只按列表顺序拿到低清流。
             candidates.sort(key=lambda candidate: candidate[:4])
-            return candidates[-1][-1]
+            return cls._play_path(candidates[-1][-1])
 
         play_addr = video.get("play_addr") or {}
         if isinstance(play_addr, dict):
-            return cls._last_video_url(play_addr.get("url_list"))
+            return cls._play_path(cls._last_video_url(play_addr.get("url_list")))
         return ""
 
     def parse_aweme(self, data: dict[str, Any]) -> VideoItem | None:
@@ -96,7 +121,7 @@ class DouyinItemParser:
                     if live_addr:
                         live_urls = live_addr.get("url_list", [])
                         if live_urls:
-                            live_video_url = live_urls[-1]
+                            live_video_url = self._play_path(live_urls[-1])
                             has_live_photo = True
                 images_data.append(
                     {

@@ -50,6 +50,8 @@ class BaseSpider(threading.Thread):
         self._playwright_pw_owner_thread_id: int | None = None
         self._selection_epoch = 0
         self._interrupt_requested = False
+        # 宿主在 sig_finished 回调里读取该标志，区分正常结束和异常结束。
+        self.run_succeeded = False
 
     @staticmethod
     def _url_matches_hosts(
@@ -685,14 +687,19 @@ class BaseSpider(threading.Thread):
 
     def run(self):
         """线程入口：执行子类 `_run_impl()`，并保证任何退出路径都会通知宿主。"""
+        self.run_succeeded = False
         try:
             self._run_impl()
         except BudgetExhausted:
             import logging
             logging.getLogger(__name__).info("Spider budget exhausted, stopping gracefully.")
+            self.run_succeeded = False
         except Exception:
             import logging
             logging.getLogger(__name__).exception("Spider _run_impl failed")
+            self.run_succeeded = False
+        else:
+            self.run_succeeded = True
         finally:
             self._emit_finished()
 

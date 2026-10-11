@@ -77,7 +77,12 @@ class XiaohongshuClient:
         if not isinstance(payload, dict):
             raise SpiderParseError("小红书响应结构非法")
         if payload.get("success") is True:
-            return payload.get("data") or {}
+            data = payload.get("data")
+            if data is None or data == {} or data == [] or data == "":
+                raise SpiderParseError("小红书接口 success 但 data 为空")
+            if not isinstance(data, dict):
+                raise SpiderParseError("小红书响应 data 结构非法")
+            return data
         code = payload.get("code")
         msg = payload.get("msg") or payload.get("message") or response.text[:200]
         raise SpiderParseError(f"小红书接口返回失败 code={code}: {msg}")
@@ -154,12 +159,25 @@ class XiaohongshuClient:
         }
         data = self.post("/api/sns/web/v1/feed", payload)
         items = data.get("items") or []
-        if items:
-            note_card = items[0].get("note_card") or {}
-            if note_card:
-                note_card["xsec_token"] = xsec_token
-                note_card["xsec_source"] = xsec_source or "pc_search"
-                return note_card
+        if not isinstance(items, list):
+            return {}
+        requested_id = str(note_id or "").strip()
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            note_card = item.get("note_card")
+            if not isinstance(note_card, dict):
+                note_card = item.get("noteCard")
+            if not isinstance(note_card, dict):
+                continue
+            card_note_id = str(note_card.get("note_id") or note_card.get("noteId") or "").strip()
+            if not card_note_id or card_note_id != requested_id:
+                continue
+            matched = dict(note_card)
+            matched["note_id"] = card_note_id
+            matched["xsec_token"] = xsec_token
+            matched["xsec_source"] = xsec_source or "pc_search"
+            return matched
         return {}
 
     def get_note_detail_from_html(
@@ -169,9 +187,14 @@ class XiaohongshuClient:
         xsec_source: str = "",
         xsec_token: str = "",
     ) -> dict[str, Any]:
-        uri = f"/explore/{note_id}"
-        if xsec_token and xsec_source:
-            uri = f"{uri}?xsec_token={xsec_token}&xsec_source={xsec_source}"
+        query_parts: list[str] = []
+        if xsec_token:
+            query_parts.append(f"xsec_token={quote(str(xsec_token), safe='')}")
+        if xsec_source:
+            query_parts.append(f"xsec_source={quote(str(xsec_source), safe='')}")
+        uri = f"/explore/{quote(str(note_id), safe='')}"
+        if query_parts:
+            uri = f"{uri}?{'&'.join(query_parts)}"
         response = self.session.get(
             f"{self.domain}{uri}",
             headers=dict(self.session.headers),
@@ -180,11 +203,11 @@ class XiaohongshuClient:
         )
         response.raise_for_status()
         detail = extract_note_detail_from_html(note_id, response.text)
-        if detail:
-            detail["xsec_token"] = xsec_token
-            detail["xsec_source"] = xsec_source or "pc_search"
-            return detail
-        return {}
+        if not isinstance(detail, dict) or not detail:
+            raise SpiderParseError(f"小红书 HTML 未解析到笔记: {note_id}")
+        detail["xsec_token"] = xsec_token
+        detail["xsec_source"] = xsec_source or "pc_search"
+        return detail
 
     def get_creator_notes(
         self,
@@ -225,7 +248,7 @@ class XiaohongshuClient:
                 return True
         return False
 
-    def query_self(self) -> dict[str, Any]:
+    def query_self(self) -> Any:
         uri = "/api/sns/web/v1/user/selfinfo"
         headers = self._signed_headers(uri=uri, data={}, method="GET")
         response = self.session.get(
@@ -235,17 +258,16 @@ class XiaohongshuClient:
             proxies=self.proxies,
         )
         response.raise_for_status()
-        payload = response.json()
-        return payload if isinstance(payload, dict) else {}
+        return response.json()
 
     def probe_login_status(self) -> bool | None:
         """已登录返回 True，确认游客态返回 False，探测失败返回 None。"""
-        # 网络或解析故障不能当成游客态，否则调用方会误触发登录回退并覆盖可用 Cookie。
+        # 空对象和非对象正文不能当成游客态，否则会删掉仍然可用的 Cookie。
         try:
             payload = self.query_self()
-        except requests.HTTPError:
-            return False
-        except (requests.RequestException, ValueError):
+        except (requests.HTTPError, requests.RequestException, ValueError):
+            return None
+        if not isinstance(payload, dict) or not payload:
             return None
         return self._self_info_indicates_login(payload)
 

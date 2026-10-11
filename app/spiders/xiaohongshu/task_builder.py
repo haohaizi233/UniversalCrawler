@@ -39,13 +39,19 @@ class XiaohongshuTaskBuilder(BaseTaskBuilder):
             author=author,
         )
 
+        note_type = str(note.get("type") or note.get("note_type") or note.get("noteType") or "").lower()
+        if note_type == "video" and not video_candidates:
+            # 没有可播放地址时不退回封面图。
+            return []
+
         if video_candidates:
             # 小红书视频候选通常是同一资源的不同地址，下载器失败时仍可从 meta 查候选。
             item = VideoItem(url=video_candidates[0], title=title, source="xiaohongshu")
             item.meta = {
                 **base_meta,
                 "content_type": "video",
-                "download_strategy": "http",
+                # 留空表示自动。写死 http 会让策略链先走单文件，HLS 播放列表被跳过。
+                "download_strategy": "",
                 "video_candidates": video_candidates,
             }
             return [item]

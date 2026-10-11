@@ -14,7 +14,7 @@ from curl_cffi.requests import get as real_curl_get
 
 from app.services.auth_service import AuthService
 from app.spiders.kuaishou.spider import KuaishouSpider
-from shared.runtime_options import DomainPolicyEngine
+from shared.runtime_options import DomainPolicyEngine, DomainPolicyViolation
 
 
 def _public_policy(*addresses: str) -> DomainPolicyEngine:
@@ -270,7 +270,8 @@ def test_short_link_transport_fails_closed_when_no_address_is_resolved(
     spider._public_domain_policy_engine = Mock(return_value=policy)
     url = "https://www.kuaishou.com/f/example"
 
-    assert spider._resolve_short_share_url(url) == url
+    with pytest.raises(DomainPolicyViolation):
+        spider._resolve_short_share_url(url)
     request_get.assert_not_called()
 
 
@@ -293,7 +294,8 @@ def test_short_link_transport_fails_closed_for_invalid_pinned_address(
     spider._public_domain_policy_engine = Mock(return_value=policy)
     url = "https://www.kuaishou.com/f/example"
 
-    assert spider._resolve_short_share_url(url) == url
+    with pytest.raises(DomainPolicyViolation):
+        spider._resolve_short_share_url(url)
     request_get.assert_not_called()
 
 
@@ -305,7 +307,8 @@ def test_short_link_transport_fails_closed_for_zero_port(request_get: Mock) -> N
     spider._public_domain_policy_engine = Mock(return_value=policy)
     url = "https://www.kuaishou.com:0/f/example"
 
-    assert spider._resolve_short_share_url(url) == url
+    with pytest.raises(DomainPolicyViolation):
+        spider._resolve_short_share_url(url)
     request_get.assert_not_called()
 
 
@@ -373,7 +376,8 @@ def test_short_link_rejects_sixth_redirect_and_closes_every_response(
     ]
     request_get.side_effect = responses
 
-    assert spider._resolve_short_share_url(start_url) == start_url
+    with pytest.raises(DomainPolicyViolation, match="任务中止"):
+        spider._resolve_short_share_url(start_url)
 
     assert request_get.call_count == spider.SHORT_LINK_MAX_REDIRECTS + 1
     for response in responses:
@@ -498,7 +502,8 @@ def test_short_link_transport_fails_closed_when_proxy_controls_dns(
     spider._effective_proxy_server.return_value = proxy
     url = "https://www.kuaishou.com/f/example"
 
-    assert spider._resolve_short_share_url(url) == url
+    with pytest.raises(DomainPolicyViolation, match="任务中止"):
+        spider._resolve_short_share_url(url)
     request_get.assert_not_called()
 
 
@@ -775,7 +780,7 @@ def test_corrupt_saved_state_keeps_http_anonymous_and_uses_browser_fallback(
     response.close.assert_called_once()
 
 
-def test_overlong_idna_label_preserves_short_link_and_runs_browser_fallback() -> None:
+def test_overlong_idna_label_aborts_before_browser_fallback() -> None:
     spider = _spider()
     overlong_label = "\u00e9" * 64
     short_url = f"https://{overlong_label}.kuaishou.com/f/example"
@@ -799,11 +804,11 @@ def test_overlong_idna_label_preserves_short_link_and_runs_browser_fallback() ->
         sync.return_value.__enter__.return_value = playwright
         spider.run()
 
-    assert spider.keyword == short_url
-    assert spider._is_short_share_url(spider.keyword)
     request_get.assert_not_called()
-    spider._run_share_browser_session.assert_called_once()
+    spider._run_share_browser_session.assert_not_called()
     spider._run_browser_session.assert_not_called()
+    sync.assert_not_called()
+    assert spider.run_succeeded is False
 
 
 def test_cached_short_link_http_error_falls_back_to_share_browser() -> None:
@@ -839,7 +844,8 @@ def test_short_link_network_failure_preserves_share_classification(
     short_url = "https://v.kuaishou.com/example"
     request_get.side_effect = CurlRequestsError("offline")
 
-    assert spider._resolve_short_share_url(short_url) == short_url
+    with pytest.raises(DomainPolicyViolation, match="任务中止"):
+        spider._resolve_short_share_url(short_url)
     assert spider._is_short_share_url(short_url)
 
 
@@ -916,6 +922,156 @@ def test_bounded_html_reader_stops_at_total_deadline() -> None:
 
 
 @patch("app.spiders.kuaishou.share_runtime.curl_get")
+def test_short_link_host_rejection_aborts_before_browser_goto(request_get: Mock) -> None:
+    spider = _spider()
+    short_url = "https://v.kuaishou.com/example"
+    spider.keyword = short_url
+    spider.is_running = True
+    spider._emit_finished = Mock()
+    response = Mock(
+        url=short_url,
+        status_code=302,
+        headers={"Location": "https://evil.example/phish"},
+    )
+    request_get.return_value = response
+
+    with patch("app.spiders.kuaishou.spider.sync_playwright") as sync_playwright:
+        spider.run()
+
+    sync_playwright.assert_not_called()
+    response.close.assert_called_once()
+    spider._emit_finished.assert_called_once()
+    assert any(
+        "已中止任务" in str(call.args[0]) for call in spider.log.call_args_list
+    )
+
+
+@patch("app.spiders.kuaishou.share_runtime.requests.get")
+@patch("app.spiders.kuaishou.share_runtime.curl_get")
+def test_detail_request_reuses_pinned_dns_without_requests_redirects(
+    request_get: Mock,
+    requests_get: Mock,
+) -> None:
+    spider = _spider()
+    detail_url = "https://www.kuaishou.com/short-video/3xj8abcde"
+    spider._kuaishou_dns_pins = {
+        "www.kuaishou.com:443": {
+            CurlOpt.RESOLVE: ["www.kuaishou.com:443:93.184.216.34"],
+            CurlOpt.PROXY: "",
+        }
+    }
+    html = (
+        '<script>window.__APOLLO_STATE__='
+        '{"defaultClient":{"VisionVideoDetailPhoto:3xj8abcde":'
+        '{"caption":"详情作品","photoUrl":"https://cdn.example.com/video.mp4"}}};'
+        "</script>"
+    )
+    response = Mock(url=detail_url, status_code=200, headers={}, encoding="utf-8")
+
+    def perform(_url, **kwargs):
+        assert kwargs["allow_redirects"] is False
+        assert kwargs["curl_options"][CurlOpt.RESOLVE] == [
+            "www.kuaishou.com:443:93.184.216.34"
+        ]
+        assert kwargs["curl_options"][CurlOpt.PROXY] == ""
+        payload = html.encode("utf-8")
+        assert kwargs["content_callback"](payload) == len(payload)
+        return response
+
+    request_get.side_effect = perform
+    policy = Mock(spec=DomainPolicyEngine)
+    policy.REDIRECT_STATUS_CODES = DomainPolicyEngine.REDIRECT_STATUS_CODES
+    policy.resolve_public_addresses.side_effect = AssertionError(
+        "detail request resolved DNS again"
+    )
+    spider._public_domain_policy_engine = Mock(return_value=policy)
+
+    assert spider._fetch_share_detail_via_http(detail_url) == (
+        "详情作品",
+        "https://cdn.example.com/video.mp4",
+    )
+    requests_get.assert_not_called()
+    response.close.assert_called_once()
+
+
+@patch("app.spiders.kuaishou.share_runtime.requests.get")
+@patch("app.spiders.kuaishou.share_runtime.curl_get")
+def test_detail_request_repins_each_redirect_hop(
+    request_get: Mock,
+    requests_get: Mock,
+) -> None:
+    spider = _spider()
+    policy = Mock(spec=DomainPolicyEngine)
+    policy.REDIRECT_STATUS_CODES = DomainPolicyEngine.REDIRECT_STATUS_CODES
+    policy.resolve_public_addresses.side_effect = [
+        ("93.184.216.34",),
+        ("2001:4860:4860::8888",),
+    ]
+    spider._public_domain_policy_engine = Mock(return_value=policy)
+    start_url = "https://www.kuaishou.com/short-video/3xj8abcde"
+    final_url = "https://www.chenzhongtech.com/short-video/3xj8abcde"
+    first = Mock(url=start_url, status_code=302, headers={"Location": final_url})
+    final = Mock(url=final_url, status_code=200, headers={}, encoding="utf-8")
+    request_get.side_effect = [first, final]
+
+    assert spider._fetch_share_detail_via_http(start_url) == ("", "")
+
+    assert request_get.call_args_list[0].kwargs["allow_redirects"] is False
+    assert request_get.call_args_list[1].kwargs["allow_redirects"] is False
+    assert request_get.call_args_list[0].kwargs["curl_options"][CurlOpt.RESOLVE] == [
+        "www.kuaishou.com:443:93.184.216.34"
+    ]
+    assert request_get.call_args_list[1].kwargs["curl_options"][CurlOpt.RESOLVE] == [
+        "www.chenzhongtech.com:443:[2001:4860:4860::8888]"
+    ]
+    requests_get.assert_not_called()
+    first.close.assert_called_once()
+    final.close.assert_called_once()
+
+
+@patch("app.spiders.kuaishou.share_runtime.requests.get")
+@patch("app.spiders.kuaishou.share_runtime.curl_get")
+def test_detail_request_is_skipped_when_proxy_blocks_pinned_dns(
+    request_get: Mock,
+    requests_get: Mock,
+) -> None:
+    spider = _spider()
+    spider._effective_proxy_server.return_value = "http://127.0.0.1:7890"
+
+    assert spider._fetch_share_detail_via_http(
+        "https://www.kuaishou.com/short-video/3xj8abcde"
+    ) == ("", "")
+
+    request_get.assert_not_called()
+    requests_get.assert_not_called()
+
+
+@patch("app.spiders.kuaishou.share_runtime.curl_get")
+def test_detail_redirect_host_rejection_aborts_before_browser_goto(
+    request_get: Mock,
+) -> None:
+    spider = _spider()
+    detail_url = "https://www.kuaishou.com/short-video/3xj8abcde"
+    spider.keyword = detail_url
+    spider.is_running = True
+    spider._emit_finished = Mock()
+    response = Mock(
+        url=detail_url,
+        status_code=302,
+        headers={"Location": "https://evil.example/phish"},
+    )
+    request_get.return_value = response
+
+    with patch("app.spiders.kuaishou.spider.sync_playwright") as sync_playwright:
+        spider.run()
+
+    sync_playwright.assert_not_called()
+    response.close.assert_called_once()
+    with pytest.raises(DomainPolicyViolation, match="重定向目标不属于目标平台"):
+        spider._fetch_share_detail_via_http(detail_url)
+
+
+@patch("app.spiders.kuaishou.share_runtime.curl_get")
 def test_short_link_transport_aborts_body_after_total_deadline(
     request_get: Mock,
 ) -> None:
@@ -931,4 +1087,45 @@ def test_short_link_transport_aborts_body_after_total_deadline(
         "app.spiders.kuaishou.share_runtime.time.monotonic",
         side_effect=[0.0, 0.0, 16.0],
     ):
-        assert spider._resolve_short_share_url(short_url) == short_url
+        with pytest.raises(DomainPolicyViolation, match="任务中止"):
+            spider._resolve_short_share_url(short_url)
+
+
+def test_completed_list_session_marks_run_succeeded() -> None:
+    spider = _spider()
+    spider.keyword = "demo"
+    spider.is_running = True
+    spider._interrupt_requested = False
+    spider._extract_first_url = Mock(return_value="demo")
+    spider._is_short_share_url = Mock(return_value=False)
+    spider._normalize_keyword = Mock(return_value="demo")
+    spider._is_detail_url = Mock(return_value=False)
+    spider._browser_headless = Mock(return_value=True)
+    spider._run_browser_session = Mock(return_value="completed")
+    spider._emit_finished = Mock()
+
+    with patch("app.spiders.kuaishou.spider.sync_playwright") as sync:
+        sync.return_value.__enter__.return_value = Mock()
+        spider.run()
+
+    assert spider.run_succeeded is True
+
+
+def test_stopped_list_session_does_not_mark_run_succeeded() -> None:
+    spider = _spider()
+    spider.keyword = "demo"
+    spider.is_running = False
+    spider._interrupt_requested = True
+    spider._extract_first_url = Mock(return_value="demo")
+    spider._is_short_share_url = Mock(return_value=False)
+    spider._normalize_keyword = Mock(return_value="demo")
+    spider._is_detail_url = Mock(return_value=False)
+    spider._browser_headless = Mock(return_value=True)
+    spider._run_browser_session = Mock(return_value="stopped")
+    spider._emit_finished = Mock()
+
+    with patch("app.spiders.kuaishou.spider.sync_playwright") as sync:
+        sync.return_value.__enter__.return_value = Mock()
+        spider.run()
+
+    assert spider.run_succeeded is False

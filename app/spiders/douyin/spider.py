@@ -5,9 +5,10 @@ import asyncio
 import math
 import queue as queue_module
 import re
+import subprocess
 import time
 import traceback
-import httpx
+from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 from playwright.sync_api import Error as PlaywrightError
 
@@ -31,9 +32,153 @@ from app.core.lib.douyin.interface.detail import Detail
 from app.core.lib.douyin.interface.account import Account
 from app.core.lib.douyin.interface.mix import Mix
 from app.core.lib.douyin.link.extractor import Extractor as LinkExtractor
-from multiprocessing import Process, Queue
+from app.core.lib.douyin.link.requester import Requester, is_douyin_public_url
+from multiprocessing import Event, Process, Queue
 
-def _run_login_process(auth_file, user_agent, result_queue, proxy_server=None, timeout_ms=60000):
+_PLATFORM_SUFFIXES = ("douyin.com", "iesdouyin.com", "tiktok.com", "tiktokv.com")
+_URL_IN_TEXT = re.compile(r"https?://[^\s\"'<>]+")
+_WORK_ID = re.compile(r"^\d{19}$")
+_ID_SEGMENT = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+def _platform_host(host: str) -> bool:
+    normalized = (host or "").rstrip(".").lower()
+    return any(
+        normalized == suffix or normalized.endswith(f".{suffix}")
+        for suffix in _PLATFORM_SUFFIXES
+    )
+
+
+def _path_segments(path: str) -> list[str]:
+    return [unquote(part) for part in (path or "").split("/") if part]
+
+
+def _user_identifier(segments: list[str]) -> str:
+    for index, segment in enumerate(segments[:-1]):
+        if segment != "user":
+            continue
+        identifier = segments[index + 1]
+        if _ID_SEGMENT.fullmatch(identifier or ""):
+            return identifier
+    return ""
+
+
+def _mix_identifier(segments: list[str]) -> str:
+    if len(segments) >= 2 and segments[0] == "collection" and _WORK_ID.fullmatch(segments[1]):
+        return segments[1]
+    if "mix" in segments:
+        for segment in segments:
+            if _WORK_ID.fullmatch(segment):
+                return segment
+    return ""
+
+
+def _detail_identifier(segments: list[str], host: str) -> bool:
+    if (
+        len(segments) >= 2
+        and segments[0] in {"video", "note", "slides"}
+        and _WORK_ID.fullmatch(segments[1])
+    ):
+        return True
+    if (
+        len(segments) >= 3
+        and segments[0] == "share"
+        and segments[1] in {"video", "note", "slides"}
+        and _WORK_ID.fullmatch(segments[2])
+    ):
+        return True
+    return bool(host.startswith("v.") and len(segments) == 1 and _ID_SEGMENT.fullmatch(segments[0] or ""))
+
+
+def classify_douyin_link(raw_text: str) -> str | None:
+    """按解析后的主机和路径区分用户页、合集和作品，无法提取平台 ID 时返回空。"""
+    match = _URL_IN_TEXT.search(raw_text or "")
+    if match is None:
+        return None
+    parts = urlsplit(match.group(0))
+    host = (parts.hostname or "").rstrip(".").lower()
+    short_http_hop = parts.scheme == "http" and host.startswith("v.") and _platform_host(host)
+    if parts.scheme != "https" and not short_http_hop:
+        return None
+    if not _platform_host(host):
+        return None
+    segments = _path_segments(parts.path)
+    if _user_identifier(segments):
+        return "user"
+    if _mix_identifier(segments):
+        return "mix"
+    modal_id = parse_qs(parts.query).get("modal_id", [""])[0]
+    if _WORK_ID.fullmatch(modal_id):
+        return "modal"
+    if _detail_identifier(segments, host):
+        return "detail"
+    return None
+
+
+def _login_stop_requested(stop_event) -> bool:
+    if stop_event is None:
+        return False
+    is_set = getattr(stop_event, "is_set", None)
+    if not callable(is_set):
+        return False
+    try:
+        return is_set() is True
+    except Exception:
+        return False
+
+
+def _wait_for_login_or_stop(stop_event) -> bool:
+    """把 1 秒等待切成短片，方便登录子进程协作退出。"""
+    for _ in range(10):
+        if _login_stop_requested(stop_event):
+            return False
+        time.sleep(0.1)
+    return True
+
+
+def _close_login_browser(browser) -> None:
+    if not browser:
+        return
+    try:
+        browser.close()
+    except (PlaywrightError, RuntimeError, AttributeError) as exc:
+        debug_logger.log_exception("DouyinLoginProcess", "close_browser", exc)
+
+
+def _terminate_process_tree(process) -> None:
+    """按进程树结束登录子进程及其拉起的 Chromium。"""
+    pid = getattr(process, "pid", None)
+    if isinstance(pid, int) and pid > 0 and os.name == "nt":
+        taskkill_failed = True
+        try:
+            completed = subprocess.run(
+                ["taskkill", "/PID", str(pid), "/T", "/F"],
+                check=False,
+                capture_output=True,
+            )
+            returncode = getattr(completed, "returncode", 1)
+            taskkill_failed = int(returncode) != 0
+        except (OSError, TypeError, ValueError):
+            taskkill_failed = True
+        if not taskkill_failed:
+            return
+        kill = getattr(process, "kill", None)
+        if callable(kill):
+            try:
+                kill()
+            except OSError:
+                pass
+            return
+    if isinstance(pid, int) and pid > 0:
+        kill = getattr(process, "kill", None)
+        if callable(kill):
+            kill()
+            return
+    terminate = getattr(process, "terminate", None)
+    if callable(terminate):
+        terminate()
+
+def _run_login_process(auth_file, user_agent, result_queue, proxy_server=None, timeout_ms=60000, stop_event=None):
     """在独立进程中运行 Playwright，避免与 PyQt 线程冲突"""
     import os
     browser = None
@@ -67,8 +212,12 @@ def _run_login_process(auth_file, user_agent, result_queue, proxy_server=None, t
             except PlaywrightError:
                 pass
 
-            # 轮询检查登录态，一旦拿到核心 Cookie 就立即持久化并返回主进程。
+            # 轮询检查登录态，一旦拿到核心 Cookie 或收到停止信号就关闭浏览器并返回。
             for _ in range(120):
+                if _login_stop_requested(stop_event):
+                    result_queue.put("cancelled")
+                    _close_login_browser(browser)
+                    return
                 cookies = context.cookies()
                 if auth_service.has_cookie(cookies, "sessionid_ss"):
                     try:
@@ -81,23 +230,20 @@ def _run_login_process(auth_file, user_agent, result_queue, proxy_server=None, t
                         err_msg = f"Cookie保存失败: {save_err} (路径: {auth_file})"
                         result_queue.put(err_msg)
                     finally:
-                        if browser:
-                            browser.close()
+                        _close_login_browser(browser)
                     return
-                time.sleep(1)
+                if not _wait_for_login_or_stop(stop_event):
+                    result_queue.put("cancelled")
+                    _close_login_browser(browser)
+                    return
 
             result_queue.put("timeout")
-            if browser:
-                browser.close()
+            _close_login_browser(browser)
     except Exception as e:
         err_msg = f"登录进程异常: {type(e).__name__}: {e}\n{traceback.format_exc()}"
         result_queue.put(err_msg)
     finally:
-        if browser:
-            try:
-                browser.close()
-            except (PlaywrightError, RuntimeError, AttributeError) as exc:
-                debug_logger.log_exception("DouyinLoginProcess", "close_browser", exc)
+        _close_login_browser(browser)
 class MockSettings:
     """为 DouK ``Parameter`` 提供最小 Settings 占位对象。"""
 
@@ -201,6 +347,34 @@ class DouyinSpider(BaseSpider):
             get_setting_default("auth", "douyin_cookie_file"),
         )
 
+    def stop(self):
+        """停止任务时先关掉正在使用的抖音客户端，再走基类的取消流程。"""
+        params = getattr(self, "_active_douyin_params", None)
+        request_stop = getattr(params, "request_stop", None)
+        if callable(request_stop):
+            try:
+                request_stop()
+            except Exception as exc:
+                debug_logger.log_exception("DouyinSpider", "request_stop", exc)
+        super().stop()
+
+    def _should_stop(self) -> bool:
+        return not self.is_running or self.interrupt_requested
+
+    async def _interrupt_active_client(self) -> None:
+        params = getattr(self, "_active_douyin_params", None)
+        if params is None:
+            return
+        request_stop = getattr(params, "request_stop", None)
+        if callable(request_stop):
+            request_stop()
+        close = getattr(params, "close_client", None)
+        if not callable(close):
+            return
+        result = close()
+        if hasattr(result, "__await__"):
+            await result
+
     def _max_items_limit(self) -> int:
         """读取最大资源数限制，并对非法配置做兜底。"""
         default_limit = get_setting_default("douyin", "max_items")
@@ -220,6 +394,7 @@ class DouyinSpider(BaseSpider):
 
     def run(self):
         """完成登录态准备后启动异步主流程，并在结束时统一发出完成信号。"""
+        self.run_succeeded = False
         self.log(f"🚀 启动抖音任务 | 目标: {self.keyword}")
         self.debug_state(
             action="run_start",
@@ -244,9 +419,11 @@ class DouyinSpider(BaseSpider):
             self._emit_finished()
             return
 
+        failed = False
         try:
             asyncio.run(self._async_main(cookie_str))
         except (RuntimeError, OSError, ValueError, TypeError, KeyError) as e:
+            failed = True
             self.log(f"💥 运行时异常: {e}")
             self.debug_state(
                 action="run_error",
@@ -261,6 +438,8 @@ class DouyinSpider(BaseSpider):
                 message="抖音爬虫任务结束",
                 status_code="DOUYIN_SPIDER_FINISH",
             )
+            if not failed and not self._should_stop():
+                self.run_succeeded = True
             self._emit_finished()
 
     def _load_or_login(self) -> str:
@@ -295,19 +474,24 @@ class DouyinSpider(BaseSpider):
         self.log(f"📝 Cookie 将保存到: {self.auth_file}")
 
         result_queue = Queue()
+        stop_event = Event()
         # 注意：这里不能传递 self.log 或 self，因为它们包含 PyQt 对象，无法被 pickle。
         proxy_server = self._effective_proxy_server((getattr(self, "config", {}) or {}).get("proxy"))
         p = Process(
             target=_run_login_process,
             args=(self.auth_file, USERAGENT, result_queue, proxy_server, self._configured_timeout_ms(default=60)),
+            kwargs={"stop_event": stop_event},
         )
         p.start()
 
-        # 等待进程结束，同时保持响应停止信号。
+        # 先通知子进程协作退出；仍未结束时按进程树关闭 Chromium。
         while p.is_alive():
             if not self.is_running:
-                p.terminate()
+                stop_event.set()
                 p.join(timeout=2)
+                if p.is_alive():
+                    _terminate_process_tree(p)
+                    p.join(timeout=2)
                 self._close_login_result_queue(result_queue)
                 raise LoginCancelledError("用户在登录过程中终止任务")
             p.join(timeout=1)
@@ -322,6 +506,8 @@ class DouyinSpider(BaseSpider):
         finally:
             self._close_login_result_queue(result_queue)
 
+        if res == "cancelled":
+            raise LoginCancelledError("用户在登录过程中终止任务")
         if res == "success":
             self.log("✅ 扫码登录成功！")
             try:
@@ -398,23 +584,31 @@ class DouyinSpider(BaseSpider):
 
     async def _route_input(self, params, raw_text: str, link_extractor) -> None:
         """根据输入内容选择作品、合集、用户主页或关键词搜索路径。"""
-        if "http" in raw_text:
+        raw_text = (raw_text or "").strip()
+        if not raw_text:
+            self.log("⚠️ 输入为空，已停止")
+            return
+        if _URL_IN_TEXT.search(raw_text):
+            kind = classify_douyin_link(raw_text)
+            if kind is None:
+                self.log("⚠️ 无法识别的链接格式")
+                return
             self.log("🔍 正在解析链接重定向...")
 
-            if "user/" in raw_text:
+            if kind == "user":
                 res = await link_extractor.run(raw_text, type_="user")
                 if res:
                     for sec_uid in res:
                         await self._process_user(params, sec_uid)
                 return
 
-            if "collection/" in raw_text or "mix/" in raw_text:
+            if kind == "mix":
                 is_mix, ids = link_extractor.mix(await link_extractor.requester.run(raw_text))
                 if is_mix and ids:
                     await self._process_mix(params, ids[0])
                 return
 
-            if "modal_id=" in raw_text:
+            if kind == "modal":
                 await self._handle_modal_link(params, raw_text, link_extractor)
                 return
 
@@ -480,9 +674,20 @@ class DouyinSpider(BaseSpider):
 
     async def _async_main_body(self, cookie_str: str):
         """根据输入自动分流到作品、合集、用户主页或关键词搜索。"""
+        raw_text = (self.keyword or "").strip()
+        if not raw_text:
+            self.log("⚠️ 输入为空，已停止")
+            return
+        if self._should_stop():
+            return
+
         params = self._build_runtime_params(cookie_str)
         self._active_douyin_params = params
+        params._owner_loop = asyncio.get_running_loop()
         proxy_str = self._effective_proxy_server((getattr(self, "config", {}) or {}).get("proxy")) or ""
+        if self._should_stop():
+            await self._interrupt_active_client()
+            return
 
         await params.update_params()
         self.debug_state(
@@ -509,11 +714,13 @@ class DouyinSpider(BaseSpider):
         all_items = []
         # 详情接口一次只接一个 aweme_id，这里串行拉取并逐条转换为统一的 VideoItem。
         for vid in ids:
-            if not self.is_running:
+            if self._should_stop():
+                await self._interrupt_active_client()
                 break
             api.detail_id = vid
+            api.response = []
             data = await api.run(single_page=True, data_key="aweme_detail")
-            if data:
+            if isinstance(data, dict) and str(data.get("aweme_id", "")) == str(vid):
                 trace_id = f"dy_{str(vid).replace('-', '_')}"
                 self.debug_api(
                     api_name="detail",
@@ -545,7 +752,7 @@ class DouyinSpider(BaseSpider):
         all_data = []
         page = 0
         # 账号主页是分页接口，需要持续拉取直到接口声明 finished 或达到条目上限。
-        while self.is_running and not account_api.finished:
+        while not self._should_stop() and not account_api.finished:
             page += 1
             self.log(f"📄 正在获取第 {page} 页...")
 
@@ -595,7 +802,7 @@ class DouyinSpider(BaseSpider):
         mix_title = None
 
         # ``finished`` 是合集接口的权威终止信号，空响应不能替代分页状态。
-        while self.is_running and not mix_api.finished:
+        while not self._should_stop() and not mix_api.finished:
             await mix_api.run_single(data_key="aweme_list")
             raw_list = mix_api.response
             self.debug_api(
@@ -652,7 +859,8 @@ class DouyinSpider(BaseSpider):
 
         all_data = []
         for i in range(max_pages):
-            if not self.is_running:
+            if self._should_stop():
+                await self._interrupt_active_client()
                 break
             self.log(f"   📄 搜索第 {i + 1} 页...")
 
@@ -701,6 +909,30 @@ class DouyinSpider(BaseSpider):
             elif isinstance(item, list):
                 normalized.extend(entry for entry in item if isinstance(entry, dict))
         return normalized
+
+    async def _fetch_platform_page(self, params, url: str) -> str:
+        """用短链同一套钉扎传输读取平台用户页，http 首跳不携带 Cookie。"""
+        if self._should_stop():
+            await self._interrupt_active_client()
+            return ""
+        if classify_douyin_link(url) != "user" or not is_douyin_public_url(url):
+            self.log("⚠️ 用户主页地址不在抖音平台范围内")
+            return ""
+        headers = {
+            "User-Agent": USERAGENT,
+            "Referer": "https://www.douyin.com/",
+        }
+        if urlsplit(url).scheme == "https" and getattr(params, "cookie_str", ""):
+            headers["Cookie"] = params.cookie_str
+        requester = Requester(
+            params,
+            getattr(params, "client", None),
+            headers,
+        )
+        html = await requester.request_url(url, content="text")
+        if not isinstance(html, str) or html == url:
+            return ""
+        return html
 
     async def _process_user_search(self, params, user_id: str):
         """通过用户 ID 或抖音号搜索用户，再获取其主页作品。"""
@@ -804,35 +1036,18 @@ class DouyinSpider(BaseSpider):
             await self._process_user(params, user_id)
             return
         
-        # 最后尝试从主页 HTML 提取 sec_user_id；SPA 未渲染时通常拿不到该字段。
+        # 最后尝试从主页 HTML 提取 sec_user_id；离开平台或非公网地址时不发请求。
         try:
             self.log("🔑 尝试请求用户主页获取 sec_user_id...")
-            test_url = f"https://www.douyin.com/user/{user_id}"
-            
-            async with httpx.AsyncClient(
-                headers={
-                    "User-Agent": USERAGENT,
-                    "Referer": "https://www.douyin.com/",
-                    "Cookie": params.cookie_str
-                },
-                timeout=self._configured_timeout_seconds(default=60),
-                follow_redirects=True,
-                proxy=params.proxy or None,
-                trust_env=False,
-            ) as client:
-                resp = await client.get(test_url)
-                resp.raise_for_status()
-                html = resp.text
-            
-            # 从 HTML 中提取 sec_user_id（仅对包含 RENDER_DATA 的页面有效）
-            import re
-            match = re.search(r'"secUid":"([^"]+)"', html)
+            test_url = f"https://www.douyin.com/user/{quote(str(user_id), safe='')}"
+            html = await self._fetch_platform_page(params, test_url)
+            match = re.search(r'"secUid":"([^"]+)"', html or "")
             if match:
                 sec_uid = match.group(1)
                 self.log(f"✅ 从 HTML 提取到 sec_user_id: {sec_uid[:20]}...")
                 await self._process_user(params, sec_uid)
                 return
-        except (httpx.HTTPError, OSError, RuntimeError, ValueError) as e:
+        except (OSError, RuntimeError, ValueError, TypeError) as e:
             self.log(f"⚠️ 主页请求失败: {e}")
         
         self.log(f"❌ 无法找到用户 '{user_id}'")

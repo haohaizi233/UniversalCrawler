@@ -1,5 +1,6 @@
 """校验抓取配置，并构造请求头、签名器、代理客户端和缓存目录。"""
 
+import asyncio
 from pathlib import Path
 from shutil import move
 from time import localtime, strftime
@@ -145,6 +146,10 @@ class Parameter:
         self.ROOT = PROJECT_ROOT
         self.cache = user_cache_root()
         self.logger = logger(PROJECT_ROOT, console)
+        try:
+            self.logger._stop_check = self.stop_requested
+        except (AttributeError, TypeError):
+            pass
         self.ab = ABogus()
         self.xb = XBogus()
         self.xg = XGnarly()
@@ -154,13 +159,7 @@ class Parameter:
         self.ms_token = ""
         self.ms_token_tiktok = ""
 
-        self.headers = DATA_HEADERS
-        self.headers_tiktok = DATA_HEADERS_TIKTOK
-        self.headers_download = DOWNLOAD_HEADERS
-        self.headers_download_tiktok = DOWNLOAD_HEADERS_TIKTOK
-        self.headers_params = PARAMS_HEADERS
-        self.headers_params_tiktok = PARAMS_HEADERS_TIKTOK
-        self.headers_qrcode = QRCODE_HEADERS
+        self._bind_isolated_request_state()
 
         self.owner_url_tiktok: SimpleNamespace | None = None
 
@@ -332,19 +331,11 @@ class Parameter:
         if isinstance(cookie, dict):
             for i in parameters:
                 if i:
-                    self.logger.info(
-                        f"参数: {i}",
-                        False,
-                    )
                     cookie |= i
             return None
         elif isinstance(cookie, str):
             for i in parameters:
                 if i:
-                    self.logger.info(
-                        f"参数: {i}",
-                        False,
-                    )
                     cookie += f"; {cookie_dict_to_str(i)}"
             return cookie
         raise DownloaderError
@@ -357,7 +348,7 @@ class Parameter:
             proxy=self.proxy,
             timeout=min(self.timeout, 3),
         ):
-            self.logger.info(f"抖音 {TtWid.NAME} 请求值: {tt_wid[TtWid.NAME]}", False)
+            self.logger.info(f"抖音 {TtWid.NAME} 参数已更新", False)
             return tt_wid
         return {}
 
@@ -376,9 +367,7 @@ class Parameter:
             }",
             proxy=self.proxy_tiktok,
         ):
-            self.logger.info(
-                f"TikTok {TtWidTikTok.NAME} 请求值: {tt_wid[TtWidTikTok.NAME]}", False
-            )
+            self.logger.info(f"TikTok {TtWidTikTok.NAME} 参数已更新", False)
             return tt_wid
         return {}
 
@@ -594,9 +583,57 @@ class Parameter:
         """拆分后逆序保存附加命令参数。"""
         return run_command.split()[::-1] if run_command else []
 
+    def _bind_isolated_request_state(self) -> None:
+        """为当前实例复制请求头和查询参数，避免并发任务共享同一份 Cookie 或令牌。"""
+        self.headers = dict(DATA_HEADERS)
+        self.headers_tiktok = dict(DATA_HEADERS_TIKTOK)
+        self.headers_download = dict(DOWNLOAD_HEADERS)
+        self.headers_download_tiktok = dict(DOWNLOAD_HEADERS_TIKTOK)
+        self.headers_params = dict(PARAMS_HEADERS)
+        self.headers_params_tiktok = dict(PARAMS_HEADERS_TIKTOK)
+        self.headers_qrcode = dict(QRCODE_HEADERS)
+        api, api_tiktok = _get_api_classes()
+        api_params = getattr(api, "params", None) if api is not None else None
+        tiktok_params = getattr(api_tiktok, "params", None) if api_tiktok is not None else None
+        self.params = dict(api_params) if isinstance(api_params, dict) else {}
+        self.params_tiktok = dict(tiktok_params) if isinstance(tiktok_params, dict) else {}
+        self._stop_requested = False
+        self._owner_loop = None
+
+    def request_stop(self) -> None:
+        """标记停止，并关闭当前事件循环上正在使用的客户端以打断挂起请求。"""
+        self._stop_requested = True
+        loop = getattr(self, "_owner_loop", None)
+        if loop is None:
+            return
+        try:
+            running = loop.is_running()
+        except RuntimeError:
+            return
+        if not running:
+            return
+        for client in (
+            getattr(self, "client", None),
+            getattr(self, "client_tiktok", None),
+        ):
+            close = getattr(client, "aclose", None)
+            if not callable(close):
+                continue
+            try:
+                asyncio.run_coroutine_threadsafe(close(), loop)
+            except RuntimeError:
+                continue
+
+    def stop_requested(self) -> bool:
+        """返回当前实例是否已收到停止请求。"""
+        return getattr(self, "_stop_requested", False) is True
+
     async def update_params(self) -> None:
-        """刷新双平台的 msToken 与 ttwid，并同步 API 参数和 Cookie 请求头。"""
-        API, APITikTok = _get_api_classes()
+        """刷新双平台的 msToken 与 ttwid，并同步当前实例的参数副本和 Cookie 请求头。"""
+        if not isinstance(getattr(self, "params", None), dict):
+            self.params = {}
+        if not isinstance(getattr(self, "params_tiktok", None), dict):
+            self.params_tiktok = {}
 
         if self.douyin_platform:
             if any(
@@ -608,14 +645,12 @@ class Parameter:
                 self.console.info(
                     _("正在更新抖音参数，请稍等..."),
                 )
-                # 本地 Cookie 最可信，其次复用 API 缓存，最后才生成离线兜底值。
+                # 只读当前实例的参数副本，不回写类属性，避免并发任务互相覆盖令牌。
                 local_ms_token = self.cookie_dict.get(MsToken.NAME) or self.get_cookie_value(
                     self.cookie_str,
                     MsToken.NAME,
                 )
-                cached_ms_token = ""
-                if API and isinstance(getattr(API, "params", None), dict):
-                    cached_ms_token = API.params.get("msToken", "")
+                cached_ms_token = self.params.get(MsToken.NAME, "")
                 if local_ms_token:
                     ms_token = {MsToken.NAME: local_ms_token}
                 elif cached_ms_token:
@@ -630,9 +665,8 @@ class Parameter:
                     tt_wid = {TtWid.NAME: local_tt_wid}
                 else:
                     tt_wid = await self.__get_tt_wid_params()
-                # 查询参数与 Cookie 必须使用同一组令牌，避免签名上下文不一致。
-                if API and ms_token:
-                    API.params["msToken"] = ms_token.get(MsToken.NAME, "")
+                if ms_token:
+                    self.params[MsToken.NAME] = ms_token.get(MsToken.NAME, "")
                 params_to_add = [p for p in (ms_token, tt_wid) if p]
                 await self.__update_cookie(
                     tuple(params_to_add),
@@ -662,9 +696,8 @@ class Parameter:
                 )
                 ms_token = await self.__get_token_params_tiktok()
                 tt_wid = await self.__get_tt_wid_params_tiktok()
-                # TikTok API 参数与请求头同样需要共享令牌状态。
-                if APITikTok and ms_token:
-                    APITikTok.params["msToken"] = ms_token.get(MsTokenTikTok.NAME, "")
+                if ms_token:
+                    self.params_tiktok[MsTokenTikTok.NAME] = ms_token.get(MsTokenTikTok.NAME, "")
                 params_to_add = [p for p in (ms_token, tt_wid) if p]
                 await self.__update_cookie(
                     tuple(params_to_add),
@@ -751,18 +784,12 @@ class Parameter:
             MsToken.NAME,
         )
         if ms_token:
-            self.logger.info(
-                f"抖音 MsToken 本地值: {ms_token}",
-                False,
-            )
+            self.logger.info("抖音 MsToken 使用本地 Cookie", False)
             return {MsToken.NAME: ms_token}
 
         # 不在启动关键路径请求远程 msToken，避免网络抖动拖慢初始化。
         fake_ms_token = MsToken.get_fake_ms_token()
-        self.logger.info(
-            f"抖音 MsToken 使用本地兜底值: {fake_ms_token[MsToken.NAME]}",
-            False,
-        )
+        self.logger.info("抖音 MsToken 使用本地兜底值", False)
         return fake_ms_token
 
     async def __get_token_params_tiktok(self) -> dict:

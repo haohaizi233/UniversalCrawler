@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from app.spiders.missav.local_proxy import chromium_proxy_bypass_switch, chromium_proxy_switch
+from app.spiders.missav.local_proxy import chromium_proxy_launch_args
 from app.utils.runtime_paths import user_cache_root
 
 
@@ -72,8 +72,10 @@ class ExternalChromeChallengeSession:
         browser_executable: str | Path | None = None,
         profile_dir: str | Path | None = None,
         poll_interval_seconds: float = 0.5,
+        headless: bool = False,
     ) -> None:
         self.proxy_server = str(proxy_server or "").strip() or None
+        self.headless = bool(headless)
         self.browser_executable = (
             Path(browser_executable)
             if browser_executable is not None
@@ -83,6 +85,7 @@ class ExternalChromeChallengeSession:
         self.debug_port = self._allocate_loopback_port()
         self.cdp_endpoint = f"http://127.0.0.1:{self.debug_port}"
         self._process: subprocess.Popen | None = None
+        self._processes: list[subprocess.Popen] = []
         self._temporary_profile: tempfile.TemporaryDirectory[str] | None = None
         if profile_dir is None:
             profile_root = user_cache_root() / "browser_profiles"
@@ -123,20 +126,21 @@ class ExternalChromeChallengeSession:
             "--no-first-run",
             "--no-default-browser-check",
         ]
-        if self.proxy_server:
-            command.append(chromium_proxy_switch(self.proxy_server))
-            command.append(chromium_proxy_bypass_switch())
+        if self.headless:
+            command.append("--headless=new")
+        command.extend(chromium_proxy_launch_args(self.proxy_server))
         return command
 
-    @staticmethod
-    def _spawn(command: list[str]) -> subprocess.Popen:
+    def _spawn(self, command: list[str]) -> subprocess.Popen:
         creation_flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-        return subprocess.Popen(
+        process = subprocess.Popen(
             command,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             creationflags=creation_flags,
         )
+        self._processes.append(process)
+        return process
 
     def start(self, url: str) -> None:
         """首次打开页面；此时没有 Playwright 客户端连接 CDP。"""
@@ -268,28 +272,69 @@ class ExternalChromeChallengeSession:
         return BrowserAttachment(browser=browser, context=context, page=page)
 
     def close(self) -> None:
-        """仅终止本会话启动的浏览器进程树，并清理临时用户目录。"""
-        process = self._process
+        """先结束全部已记录的浏览器进程，确认退出后再删除临时用户目录。"""
+        processes = list(self._processes)
+        self._processes = []
         self._process = None
-        if process is not None and process.poll() is None:
-            try:
-                if os.name == "nt":
-                    subprocess.run(
-                        ["taskkill", "/PID", str(process.pid), "/T", "/F"],
-                        check=False,
-                        capture_output=True,
-                    )
-                else:
-                    process.terminate()
-                    try:
-                        process.wait(timeout=5)
-                    except subprocess.TimeoutExpired:
-                        process.kill()
-            except OSError:
-                pass
+        self._terminate_recorded_processes(processes)
+        if any(process.poll() is None for process in processes):
+            return
         if self._temporary_profile is not None:
             self._temporary_profile.cleanup()
             self._temporary_profile = None
+
+    def _terminate_recorded_processes(self, processes: list[subprocess.Popen]) -> None:
+        for process in processes:
+            self._terminate_process(process)
+        for process in processes:
+            self._wait_for_process_exit(process)
+
+    def _terminate_process(self, process: subprocess.Popen) -> None:
+        if process.poll() is not None:
+            return
+        if os.name == "nt":
+            failed = True
+            try:
+                completed = subprocess.run(
+                    ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                    check=False,
+                    capture_output=True,
+                )
+                failed = completed.returncode != 0
+            except OSError:
+                failed = True
+            if failed and process.poll() is None:
+                try:
+                    process.kill()
+                except OSError:
+                    pass
+            return
+        try:
+            process.terminate()
+        except OSError:
+            pass
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            try:
+                process.kill()
+            except OSError:
+                pass
+
+    def _wait_for_process_exit(self, process: subprocess.Popen) -> None:
+        if process.poll() is not None:
+            return
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            try:
+                process.kill()
+            except OSError:
+                pass
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
 
     def __enter__(self) -> "ExternalChromeChallengeSession":
         return self

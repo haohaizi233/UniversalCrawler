@@ -13,11 +13,46 @@ from curl_cffi.requests import RequestsError as CurlRequestsError
 from curl_cffi.requests import get as curl_get
 from playwright.sync_api import Error as PlaywrightError
 
-from shared.network_proxy import requests_proxy_mapping
 from shared.runtime_options import DomainPolicyViolation
 
 
 _SHORT_LINK_POLICY_SLOTS = threading.BoundedSemaphore(2)
+_KUAISHOU_PLATFORM_HOSTS = ("kuaishou.com", "chenzhongtech.com")
+_TINY_PROGRESSIVE_MEDIA_BYTES = 5000
+_PLATFORM_HOST_REJECTIONS = frozenset(
+    {
+        "url 主机不属于目标平台",
+        "重定向目标不属于目标平台",
+    }
+)
+
+
+def _is_platform_host_rejection(exc: BaseException) -> bool:
+    return str(exc) in _PLATFORM_HOST_REJECTIONS
+
+
+def _kuaishou_pin_key(transport_url: str) -> str:
+    parts = urllib.parse.urlsplit(transport_url)
+    host = str(parts.hostname or "")
+    port = parts.port
+    if port is None:
+        port = 443 if parts.scheme.lower() == "https" else 80
+    return f"{host}:{port}"
+
+
+def _response_content_length(headers) -> int | None:
+    if not headers:
+        return None
+    try:
+        raw = headers.get("content-length", headers.get("Content-Length"))
+    except AttributeError:
+        return None
+    if raw in (None, ""):
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
 
 
 def _short_link_transport_url(url: str) -> str:
@@ -100,7 +135,7 @@ class KuaishouShareRuntimeMixin:
         """判断输入是否为快手相关 URL。"""
         return self._url_matches_hosts(
             str(raw_text or ""),
-            ("kuaishou.com", "chenzhongtech.com"),
+            _KUAISHOU_PLATFORM_HOSTS,
         )
 
     def _is_detail_url(self, raw_text: str) -> bool:
@@ -158,8 +193,7 @@ class KuaishouShareRuntimeMixin:
         response = None
         deadline = time.monotonic() + self.SHORT_LINK_TOTAL_TIMEOUT_SECONDS
         try:
-            proxy = self._effective_proxy_server((getattr(self, "config", {}) or {}).get("proxy"))
-            if str(proxy or "").strip():
+            if self._kuaishou_proxy_blocks_pinned_dns():
                 raise CurlRequestsError(
                     "short-link pinned DNS unavailable with configured proxy"
                 )
@@ -232,7 +266,7 @@ class KuaishouShareRuntimeMixin:
                     )
                     if not self._url_matches_hosts(
                         next_url,
-                        ("kuaishou.com", "chenzhongtech.com"),
+                        _KUAISHOU_PLATFORM_HOSTS,
                     ):
                         raise DomainPolicyViolation("重定向目标不属于目标平台")
                     response.close()
@@ -263,24 +297,18 @@ class KuaishouShareRuntimeMixin:
                 self.log(f"🔗 [分享链接解析] {candidate} -> {resolved}")
                 return resolved
             raise requests.TooManyRedirects("short-link redirect limit exceeded")
+        except DomainPolicyViolation as exc:
+            self._discard_short_link_response(response)
+            self.log(f"⚠️ [分享链接解析失败] {exc}")
+            raise
         except (
             requests.RequestException,
             CurlRequestsError,
-            DomainPolicyViolation,
             OSError,
         ) as exc:
-            if response is not None:
-                try:
-                    response.close()
-                except (
-                    AttributeError,
-                    OSError,
-                    requests.RequestException,
-                    CurlRequestsError,
-                ):
-                    pass
+            self._discard_short_link_response(response)
             self.log(f"⚠️ [分享链接解析失败] {exc}")
-            return candidate
+            raise DomainPolicyViolation("快手短链解析失败，任务中止") from exc
 
     def _short_link_timeout(
         self,
@@ -326,7 +354,7 @@ class KuaishouShareRuntimeMixin:
             try:
                 if not self._url_matches_hosts(
                     url,
-                    ("kuaishou.com", "chenzhongtech.com"),
+                    _KUAISHOU_PLATFORM_HOSTS,
                 ):
                     raise DomainPolicyViolation("url 主机不属于目标平台")
                 transport_url = _short_link_transport_url(url)
@@ -341,6 +369,7 @@ class KuaishouShareRuntimeMixin:
                     )
                 )
                 curl_options[CurlOpt.PROXY] = ""
+                self._remember_kuaishou_dns_pin(transport_url, curl_options)
                 result["value"] = (
                     transport_url,
                     {"curl_options": curl_options},
@@ -528,6 +557,144 @@ class KuaishouShareRuntimeMixin:
         media_url = str(detail.get("photoUrl") or "").strip()
         return title, media_url
 
+    def _discard_short_link_response(self, response) -> None:
+        if response is None:
+            return
+        try:
+            response.close()
+        except (
+            AttributeError,
+            OSError,
+            requests.RequestException,
+            CurlRequestsError,
+        ):
+            pass
+
+    def _kuaishou_proxy_blocks_pinned_dns(self) -> bool:
+        proxy = self._effective_proxy_server(
+            (getattr(self, "config", {}) or {}).get("proxy")
+        )
+        return bool(str(proxy or "").strip())
+
+    def _remember_kuaishou_dns_pin(self, transport_url: str, curl_options: dict) -> None:
+        resolve = curl_options.get(CurlOpt.RESOLVE)
+        if not resolve:
+            return
+        pins = getattr(self, "_kuaishou_dns_pins", None)
+        if not isinstance(pins, dict):
+            pins = {}
+            self._kuaishou_dns_pins = pins
+        pins[_kuaishou_pin_key(transport_url)] = {
+            CurlOpt.RESOLVE: list(resolve),
+            CurlOpt.PROXY: "",
+        }
+
+    def _pinned_kuaishou_request_kwargs(
+        self,
+        url: str,
+        *,
+        deadline: float,
+    ) -> tuple[str, dict[str, object]]:
+        """复用同一主机端口上已经固定的 DNS；没有缓存时再做一次短链校验。"""
+        if not self._url_matches_hosts(url, _KUAISHOU_PLATFORM_HOSTS):
+            raise DomainPolicyViolation("url 主机不属于目标平台")
+        transport_url = _short_link_transport_url(url)
+        cached = getattr(self, "_kuaishou_dns_pins", None)
+        key = _kuaishou_pin_key(transport_url)
+        if isinstance(cached, dict) and key in cached:
+            options = cached[key]
+            return transport_url, {
+                "curl_options": {
+                    CurlOpt.RESOLVE: list(options[CurlOpt.RESOLVE]),
+                    CurlOpt.PROXY: "",
+                }
+            }
+        return self._restricted_short_link_request_kwargs(url, deadline=deadline)
+
+    def _exchange_pinned_kuaishou_document(self, url: str):
+        """按短链同一白名单逐跳固定 DNS，禁止普通 requests 跟随重定向。"""
+        deadline = time.monotonic() + self.SHORT_LINK_TOTAL_TIMEOUT_SECONDS
+        current_url = str(url or "").strip()
+        response = None
+        try:
+            for redirect_count in range(self.SHORT_LINK_MAX_REDIRECTS + 1):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise CurlRequestsError("detail pinned request timeout")
+                transport_url, request_kwargs = self._pinned_kuaishou_request_kwargs(
+                    current_url,
+                    deadline=deadline,
+                )
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise CurlRequestsError("detail pinned request timeout")
+                body = bytearray()
+                aborted_reason = None
+
+                def collect_body(chunk: bytes, payload=body) -> int:
+                    nonlocal aborted_reason
+                    if time.monotonic() >= deadline:
+                        aborted_reason = "timeout"
+                        return 0
+                    if hasattr(self, "_is_running") and not self.is_running:
+                        aborted_reason = "cancelled"
+                        return 0
+                    if len(payload) + len(chunk) > self.SHARE_DETAIL_HTML_MAX_BYTES:
+                        aborted_reason = "oversized"
+                        return 0
+                    payload.extend(chunk)
+                    return len(chunk)
+
+                try:
+                    response = curl_get(
+                        transport_url,
+                        headers=self._build_detail_request_headers(),
+                        timeout=self._short_link_timeout(remaining),
+                        allow_redirects=False,
+                        content_callback=collect_body,
+                        **request_kwargs,
+                    )
+                except CurlRequestsError:
+                    if aborted_reason == "oversized":
+                        self.log("⚠️ 快手分享页 HTML 超过解析预算，将回退浏览器链路")
+                    raise
+                try:
+                    status_code = int(getattr(response, "status_code", 0) or 0)
+                except (TypeError, ValueError):
+                    status_code = 0
+                headers = getattr(response, "headers", {}) or {}
+                location = headers.get("Location") or headers.get("location")
+                if (
+                    status_code in self._public_domain_policy_engine().REDIRECT_STATUS_CODES
+                    and location
+                ):
+                    if redirect_count >= self.SHORT_LINK_MAX_REDIRECTS:
+                        raise requests.TooManyRedirects("detail redirect limit exceeded")
+                    next_url = urllib.parse.urljoin(
+                        str(getattr(response, "url", "") or current_url),
+                        str(location),
+                    )
+                    if not self._url_matches_hosts(next_url, _KUAISHOU_PLATFORM_HOSTS):
+                        raise DomainPolicyViolation("重定向目标不属于目标平台")
+                    response.close()
+                    response = None
+                    current_url = next_url
+                    continue
+                encoding = getattr(response, "encoding", None)
+                if not isinstance(encoding, str) or not encoding:
+                    encoding = "utf-8"
+                try:
+                    response._ucrawl_bounded_text = body.decode(encoding, errors="replace")
+                except LookupError:
+                    response._ucrawl_bounded_text = body.decode("utf-8", errors="replace")
+                owned = response
+                response = None
+                return owned, deadline
+            raise requests.TooManyRedirects("detail redirect limit exceeded")
+        except Exception:
+            self._discard_short_link_response(response)
+            raise
+
     def _fetch_share_detail_via_http(self, detail_url: str) -> tuple[str, str]:
         """通过纯 HTTP 抓取快手分享/详情页，避免弹浏览器。"""
         pending = self._take_pending_share_response(detail_url)
@@ -537,25 +704,10 @@ class KuaishouShareRuntimeMixin:
             response, deadline = pending
         try:
             if response is None:
-                deadline = (
-                    time.monotonic()
-                    + self._configured_timeout_seconds(default=60)
-                )
-                request_kwargs = self._restricted_public_request_kwargs(
-                    detail_url,
-                    allowed_hosts=("kuaishou.com", "chenzhongtech.com"),
-                )
-                proxy = self._effective_proxy_server((getattr(self, "config", {}) or {}).get("proxy"))
-                proxies = requests_proxy_mapping(proxy)
-                response = requests.get(
-                    detail_url,
-                    headers=self._build_detail_request_headers(),
-                    timeout=self._configured_timeout_seconds(default=60),
-                    allow_redirects=True,
-                    stream=True,
-                    proxies=proxies,
-                    **request_kwargs,
-                )
+                if self._kuaishou_proxy_blocks_pinned_dns():
+                    self.log("⚠️ 已配置代理且无法固定 DNS，跳过快手详情直连")
+                    return "", ""
+                response, deadline = self._exchange_pinned_kuaishou_document(detail_url)
             response.raise_for_status()
             detail_id = self._extract_detail_id(response.url or detail_url)
             if not detail_id:
@@ -573,10 +725,14 @@ class KuaishouShareRuntimeMixin:
 
             self.log("⚠️ 快手分享页未解析到 __APOLLO_STATE__ 视频直链，将回退浏览器链路")
             return "", ""
+        except DomainPolicyViolation as exc:
+            if _is_platform_host_rejection(exc):
+                raise
+            self.log(f"⚠️ 快手分享详情页请求失败: {exc}")
+            return "", ""
         except (
             requests.RequestException,
             CurlRequestsError,
-            DomainPolicyViolation,
         ) as exc:
             self.log(f"⚠️ 快手分享详情页请求失败: {exc}")
             return "", ""
@@ -617,23 +773,87 @@ class KuaishouShareRuntimeMixin:
         self.log(f"✨ 已无浏览器解析分享作品: {title[:24]}...")
         return True
 
-    @staticmethod
-    def _share_media_response_url(response) -> str:
+    def _kuaishou_media_kind(self, url: str, content_type: str = "") -> str | None:
+        """同时看路径后缀和 Content-Type，拒绝 blob 与非播放列表的 MPEG-TS。"""
+        raw = str(url or "").strip()
+        if not raw or raw.lower().startswith("blob:"):
+            return None
+        try:
+            path = urllib.parse.urlsplit(raw).path.lower()
+        except ValueError:
+            return None
+        media_type = str(content_type or "").split(";", 1)[0].strip().lower()
+        playlist = path.endswith(".m3u8") or "mpegurl" in media_type
+        transport_stream = (
+            media_type == "video/mp2t"
+            or path.endswith(".ts")
+            or path.endswith(".m2ts")
+        )
+        if transport_stream and not playlist:
+            return None
+        if playlist:
+            return "playlist"
+        progressive = path.endswith((".mp4", ".m4s", ".webm", ".mov")) or (
+            media_type.startswith("video/") and media_type != "video/mp2t"
+        )
+        if progressive:
+            return "file"
+        return None
+
+    def _is_tiny_kuaishou_mp4(
+        self,
+        url: str,
+        content_type: str,
+        content_length: int | None,
+    ) -> bool:
+        path = urllib.parse.urlsplit(str(url or "")).path.lower()
+        media_type = str(content_type or "").split(";", 1)[0].strip().lower()
+        if path.endswith(".m3u8") or "mpegurl" in media_type:
+            return False
+        if not path.endswith(".mp4") and media_type != "video/mp4":
+            return False
+        if content_length is None:
+            return False
+        try:
+            return int(content_length) < _TINY_PROGRESSIVE_MEDIA_BYTES
+        except (TypeError, ValueError):
+            return False
+
+    def _choose_kuaishou_stream(
+        self,
+        current: tuple[str, str] | None,
+        url: str,
+        content_type: str = "",
+        content_length: int | None = None,
+    ) -> tuple[str, str] | None:
+        """同一作品优先保留播放列表；小 mp4 不能挤掉小 m3u8。"""
+        kind = self._kuaishou_media_kind(url, content_type)
+        if kind is None:
+            return current
+        if kind == "file" and self._is_tiny_kuaishou_mp4(
+            url,
+            content_type,
+            content_length,
+        ):
+            return current
+        choice = (kind, str(url).strip())
+        if current is None:
+            return choice
+        if current[0] == "playlist" and kind != "playlist":
+            return current
+        if kind == "playlist":
+            return choice
+        return current
+
+    def _share_media_response_url(self, response) -> str:
         """从详情页响应中筛出可提交给下载器的视频或 HLS 地址。"""
         try:
             url = str(response.url or "").strip()
-            content_type = str(response.headers.get("content-type", "") or "").lower()
-            resource_type = str(response.request.resource_type or "").lower()
-        except (AttributeError, PlaywrightError):
+            content_type = str(response.headers.get("content-type", "") or "")
+            length = _response_content_length(getattr(response, "headers", {}) or {})
+        except (AttributeError, PlaywrightError, TypeError, ValueError):
             return ""
-        if not url:
+        chosen = self._choose_kuaishou_stream(None, url, content_type, length)
+        if chosen is None:
             return ""
-        path = urllib.parse.urlsplit(url).path.lower()
-        if (
-            resource_type == "media"
-            or content_type.startswith("video/")
-            or "mpegurl" in content_type
-            or path.endswith(".m3u8")
-        ):
-            return url
-        return ""
+        return chosen[1]

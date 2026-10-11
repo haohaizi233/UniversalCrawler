@@ -3,6 +3,26 @@
 from __future__ import annotations
 
 from typing import Any
+from urllib.parse import urlsplit
+
+_HLS_SEGMENT_SUFFIXES = (".ts", ".m4s", ".aac", ".m4a", ".vtt", ".mp2t")
+
+
+def infer_media_download_strategy(stream_url: str) -> str:
+    """播放列表和 HLS 分片都显式走 m3u8，其余渐进文件走 HTTP。
+
+    只看 ``.m3u8`` 会把分片地址判成 HTTP，策略链会先把分片当单文件下载。
+    """
+    lowered = str(stream_url or "").strip().lower()
+    path = urlsplit(lowered).path
+    if ".m3u8" in lowered or path.endswith(".m3u8"):
+        return "m3u8"
+    if path.endswith(_HLS_SEGMENT_SUFFIXES):
+        return "m3u8"
+    if "/hls/" in path or path.endswith("/hls") or "mpegurl" in lowered:
+        return "m3u8"
+    return "http"
+
 
 class BaseTaskBuilder:
     """平台任务装配公共基类。
@@ -21,7 +41,7 @@ class BaseTaskBuilder:
         download_strategy: str | None = None,
         **extra: Any,
     ) -> dict[str, Any]:
-        """构建下载 meta，并过滤空值以避免覆盖下载层自己的默认策略。"""
+        """构建下载 meta。空的 download_strategy 保留为空字符串，表示自动选择。"""
         payload = {
             "trace_id": trace_id,
             "referer": referer,
@@ -30,8 +50,12 @@ class BaseTaskBuilder:
             "download_strategy": download_strategy,
             **extra,
         }
-        return {
+        strategy = payload.get("download_strategy")
+        cleaned = {
             key: value
             for key, value in payload.items()
-            if value not in (None, "", [], {})
+            if key != "download_strategy" and value not in (None, "", [], {})
         }
+        # 缺省策略必须留在 meta 里。丢掉之后下载器会按 URL 猜，HLS 可能被 HTTP 抢走。
+        cleaned["download_strategy"] = "" if strategy is None else strategy
+        return cleaned

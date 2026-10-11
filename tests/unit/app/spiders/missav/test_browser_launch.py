@@ -10,6 +10,8 @@ from app.spiders.base import BaseSpider
 from app.spiders.missav.browser_executable import resolve_challenge_browser
 from app.spiders.missav.challenge_session import SystemBrowserUnavailable
 from app.spiders.missav.local_proxy import (
+    browser_egress_proxy,
+    chromium_proxy_launch_args,
     chromium_proxy_switch,
     discover_client_proxy,
     endpoints_from_config_text,
@@ -130,6 +132,18 @@ def test_pac_only_accepts_loopback_proxy() -> None:
     assert proxy_from_pac_text('return "PROXY 127.0.0.1:7897; DIRECT";') == "http://127.0.0.1:7897"
     assert proxy_from_pac_text('return "SOCKS5 127.0.0.1:7898";') == "socks5://127.0.0.1:7898"
     assert proxy_from_pac_text('return "PROXY 8.8.8.8:80";') is None
+
+
+def test_download_proxy_matches_browser_egress() -> None:
+    assert browser_egress_proxy(None) is None
+    assert browser_egress_proxy("  ") is None
+    assert chromium_proxy_launch_args(browser_egress_proxy(None)) == ["--no-proxy-server"]
+    proxy = browser_egress_proxy(" http://127.0.0.1:7890 ")
+    assert proxy == "http://127.0.0.1:7890"
+    assert chromium_proxy_launch_args(proxy) == [
+        "--proxy-server=http=127.0.0.1:7890;https=127.0.0.1:7890",
+        "--proxy-bypass-list=localhost;127.0.0.1;::1;<local>",
+    ]
 
 
 def test_http_proxy_switch_covers_https() -> None:

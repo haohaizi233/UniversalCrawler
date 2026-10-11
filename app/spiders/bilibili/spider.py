@@ -12,36 +12,24 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from playwright.sync_api import Error as PlaywrightError, sync_playwright
 from app.config import DEFAULT_USER_AGENT, cfg, get_setting_default
 from app.exceptions import (
-    InvalidCookieStateError,
     LoginCancelledError,
     LoginCheckError,
     LoginTimeoutError,
     SpiderAuthError,
     SpiderParseError,
-    StreamResolveError,
 )
 from shared.runtime_options import DomainPolicyViolation
 from app.spiders.base import BaseSpider
 from app.spiders.bilibili import input_router
+from app.spiders.bilibili.api_client import HEADERS, BiliAPI, BilibiliRequestStopped
 from app.spiders.bilibili.input_router import BilibiliInputRoute
 from app.spiders.bilibili.parser import BilibiliParser
 from app.spiders.bilibili.task_builder import BilibiliTaskBuilder
 from app.debug_logger import debug_logger
 from app.models import VideoItem
 from app.services.auth_service import AuthService
-from app.utils.bilibili_wbi import BILIBILI_WBI_SIGNER
 from app.utils.user_agents import resolve_user_agent
-from shared.network_proxy import configure_requests_session, requests_proxy_mapping
-
-HEADERS = {
-    'User-Agent': resolve_user_agent(
-        "bilibili",
-        None,
-        configured_user_agent=cfg.get("bilibili", "user_agent", DEFAULT_USER_AGENT),
-        default_user_agent=DEFAULT_USER_AGENT,
-    ),
-    'Referer': 'https://www.bilibili.com'
-}
+from shared.network_proxy import requests_proxy_mapping
 
 
 @dataclass(frozen=True)
@@ -50,262 +38,6 @@ class BilibiliBrowserPageState:
     reason: str = ""
     terminal: bool = False
 
-class BiliAPI:
-    """B 站 API 访问层，负责登录态检查、详情读取和取流。"""
-
-    def __init__(self, cookie_path, parser: BilibiliParser):
-        """配置持久会话、解析器、认证服务和 Cookie。"""
-        self.sess = configure_requests_session(requests.Session())
-        self._session_lock = threading.RLock()
-        with self._session_guard():
-            self.sess.headers.update(HEADERS)
-        self.cookie_path = cookie_path
-        self.parser = parser
-        self.auth_service = AuthService()
-        self.request_timeout = cfg.get("bilibili", "timeout", get_setting_default("bilibili", "timeout"))
-        self._video_info_errors: dict[str, dict[str, object]] = {}
-        self.load_cookies()
-
-    def _request_timeout(self):
-        """兼容直接 `__new__` 构造的测试对象，延迟读取超时配置。"""
-        return getattr(self, "request_timeout", cfg.get("bilibili", "timeout", get_setting_default("bilibili", "timeout")))
-
-    def close(self) -> None:
-        with self._session_guard():
-            close = getattr(getattr(self, "sess", None), "close", None)
-            if callable(close):
-                close()
-
-    def _session_guard(self) -> threading.RLock:
-        lock = getattr(self, "_session_lock", None)
-        if lock is None:
-            lock = threading.RLock()
-            self._session_lock = lock
-        return lock
-
-    def _remember_video_info_error(self, target: str, resp: dict, http_status: int) -> None:
-        errors = getattr(self, "_video_info_errors", None)
-        if not isinstance(errors, dict):
-            errors = {}
-            self._video_info_errors = errors
-        errors[str(target)] = {
-            "code": resp.get("code"),
-            "message": resp.get("message") or resp.get("msg") or "",
-            "http_status": http_status,
-        }
-
-    def consume_video_info_error(self, target: object) -> dict[str, object] | None:
-        errors = getattr(self, "_video_info_errors", None)
-        if not isinstance(errors, dict):
-            return None
-        return errors.pop(str(target), None)
-
-    def load_cookies(self):
-        """从认证文件加载 Cookie，并写入持久 HTTP 会话。"""
-        cookies = self.auth_service.load_json_file(self.cookie_path)
-        cookie_dict = self.auth_service.extract_cookie_dict(cookies)
-        with self._session_guard():
-            if cookie_dict:
-                for key, value in cookie_dict.items():
-                    self.sess.cookies.set(key, value, domain=".bilibili.com")
-            elif cookies is not None:
-                raise InvalidCookieStateError("Bilibili Cookie 格式非法")
-
-    def snapshot_cookies(self) -> dict[str, str]:
-        with self._session_guard():
-            return {c.name: c.value for c in self.sess.cookies if c.name}
-
-    def check_login(self):
-        
-        try:
-            url = "https://api.bilibili.com/x/web-interface/nav"
-            with self._session_guard():
-                response = self.sess.get(url, timeout=self._request_timeout())
-            resp = response.json()
-            BILIBILI_WBI_SIGNER.update_from_nav_data(resp.get("data") if isinstance(resp, dict) else None)
-            debug_logger.log_api(
-                component="BiliAPI",
-                api_name="check_login",
-                request={"url": url},
-                response_summary={
-                    "api_code": resp.get("code"),
-                    "is_login": resp.get("data", {}).get("isLogin", False),
-                    "mid": resp.get("data", {}).get("mid"),
-                    "uname": resp.get("data", {}).get("uname"),
-                },
-                message="检查 Bilibili 登录状态",
-                status_code=response.status_code,
-            )
-            return resp['code'] == 0 and resp['data']['isLogin']
-        except (requests.RequestException, ValueError, KeyError) as e:
-            debug_logger.log_exception("BiliAPI", "check_login", e, context={"cookie_path": self.cookie_path})
-            raise LoginCheckError("Bilibili 登录状态校验失败") from e
-
-    def _signed_api_get(
-        self,
-        endpoint: str,
-        params: dict[str, object],
-        *,
-        unsigned_endpoint: str | None = None,
-    ) -> tuple[requests.Response, bool, str]:
-        headers = getattr(self.sess, "headers", None)
-        if not isinstance(headers, dict):
-            headers = HEADERS
-        with self._session_guard():
-            signed_params, signed = BILIBILI_WBI_SIGNER.sign_params(
-                params,
-                request_get=self.sess.get,
-                headers=headers,
-                timeout=self._request_timeout(),
-            )
-            request_endpoint = endpoint if signed or not unsigned_endpoint else unsigned_endpoint
-            response = self.sess.get(request_endpoint, params=signed_params, timeout=self._request_timeout())
-        response_url = getattr(response, "url", None)
-        if not isinstance(response_url, str) or not response_url:
-            response_url = f"{request_endpoint}?{urllib.parse.urlencode(signed_params)}"
-        return response, signed, response_url
-
-    def _unsigned_api_get(
-        self,
-        endpoint: str,
-        params: dict[str, object],
-    ) -> tuple[requests.Response, str]:
-        with self._session_guard():
-            response = self.sess.get(endpoint, params=params, timeout=self._request_timeout())
-        response_url = getattr(response, "url", None)
-        if not isinstance(response_url, str) or not response_url:
-            response_url = f"{endpoint}?{urllib.parse.urlencode(params)}"
-        return response, response_url
-
-    def get_video_info(self, bvid: str | None = None, trace_id=None, *, aid: str | int | None = None):
-        """按 bvid 获取视频详情；旧版 av 链接则按 aid 查询。"""
-        target = str(aid if aid is not None else bvid or "").strip()
-        if not target:
-            raise SpiderParseError("missing Bilibili video id")
-        query_key = "aid" if aid is not None else "bvid"
-        try:
-            endpoint = "https://api.bilibili.com/x/web-interface/view"
-            response, signed, request_url = self._signed_api_get(endpoint, {query_key: target})
-            resp = response.json()
-            if not isinstance(resp, dict):
-                raise ValueError("unexpected Bilibili video detail response")
-            unsigned_retry_attempted = False
-            unsigned_retry_used = False
-            if signed and resp.get("code") != 0:
-                unsigned_retry_attempted = True
-                try:
-                    retry_response, retry_url = self._unsigned_api_get(endpoint, {query_key: target})
-                    retry_resp = retry_response.json()
-                    if not isinstance(retry_resp, dict):
-                        raise ValueError("unexpected unsigned Bilibili video detail response")
-                    if retry_resp.get("code") == 0:
-                        response = retry_response
-                        resp = retry_resp
-                        request_url = retry_url
-                        signed = False
-                        unsigned_retry_used = True
-                except (requests.RequestException, ValueError, TypeError) as retry_exc:
-                    debug_logger.log_exception(
-                        "BiliAPI",
-                        "get_video_info_unsigned_retry",
-                        retry_exc,
-                        context={"bvid": bvid, "aid": aid},
-                        trace_id=trace_id,
-                    )
-            data = resp.get('data') or {}
-            debug_logger.log_api(
-                component="BiliAPI",
-                api_name="get_video_info",
-                request={
-                    "trace_id": trace_id,
-                    "url": request_url,
-                    "bvid": bvid,
-                    "aid": aid,
-                    "wbi_signed": signed,
-                    "unsigned_retry_attempted": unsigned_retry_attempted,
-                    "unsigned_retry_used": unsigned_retry_used,
-                },
-                response_summary={
-                    "api_code": resp.get("code"),
-                    "title": data.get("title"),
-                    "owner": data.get("owner", {}).get("name"),
-                    "pages": len(data.get("pages", [])),
-                    "is_season": bool(data.get("ugc_season")),
-                    "season_title": (data.get("ugc_season") or {}).get("title"),
-                },
-                message="fetch video detail",
-                status_code=response.status_code,
-                trace_id=trace_id,
-            )
-            if resp.get('code') != 0:
-                self._remember_video_info_error(target, resp, response.status_code)
-                return None
-            self.consume_video_info_error(target)
-            return self.parser.parse_video_info_response(data)
-        except (requests.RequestException, ValueError, KeyError, TypeError) as e:
-            debug_logger.log_exception(
-                "BiliAPI",
-                "get_video_info",
-                e,
-                context={"bvid": bvid, "aid": aid},
-                trace_id=trace_id,
-            )
-            raise SpiderParseError(f"failed to fetch Bilibili video info: {query_key}={target}") from e
-
-    def get_play_url(self, bvid, cid, trace_id=None):
-        
-        def _request(fnval):
-            """按指定 fnval 请求播放流，并保留签名状态与原始响应。"""
-            endpoint = "https://api.bilibili.com/x/player/wbi/playurl"
-            params = {
-                "bvid": bvid,
-                "cid": cid,
-                "qn": 120,
-                "fnval": fnval,
-                "fourk": 1,
-                "platform": "pc",
-            }
-            response, signed, request_url = self._signed_api_get(
-                endpoint,
-                params,
-                unsigned_endpoint="https://api.bilibili.com/x/player/playurl",
-            )
-            return request_url, response.status_code, response.json(), signed
-        request_url, http_status, resp, signed = _request(4048)
-        request_mode = 4048
-        if resp['code'] != 0 or 'data' not in resp or 'dash' not in resp['data']:
-            request_url, http_status, resp, signed = _request(80)
-            request_mode = 80
-        if resp.get("code") != 0 or "data" not in resp:
-            raise StreamResolveError(f"B站取流失败: code={resp.get('code')}")
-        dash = resp.get('data', {}).get('dash', {})
-        video_stream = dash.get('video', [{}])[0] if dash.get('video') else {}
-        audio_stream = dash.get('audio', [{}])[0] if dash.get('audio') else {}
-        debug_logger.log_api(
-            component="BiliAPI",
-            api_name="get_play_url",
-            request={
-                "trace_id": trace_id,
-                "url": request_url,
-                "bvid": bvid,
-                "cid": cid,
-                "fnval": request_mode,
-                "wbi_signed": signed,
-            },
-            response_summary={
-                "api_code": resp.get("code"),
-                "accept_quality": resp.get("data", {}).get("accept_quality", []),
-                "video_quality_id": video_stream.get("id"),
-                "video_bandwidth": video_stream.get("bandwidth"),
-                "has_audio": bool(dash.get("audio")),
-                "video_url": video_stream.get("baseUrl"),
-                "audio_url": audio_stream.get("baseUrl"),
-            },
-            message="获取播放流地址",
-            status_code=http_status,
-            trace_id=trace_id,
-        )
-        return self.parser.parse_play_url_response(resp)
 
 class BilibiliSpider(BaseSpider):
     """Bilibili 爬虫，采用浏览器扫描和 API 解析并行的流水线模型。"""
@@ -404,6 +136,7 @@ class BilibiliSpider(BaseSpider):
         parser = getattr(self, "parser", None) or BilibiliParser()
         api = BiliAPI(self._bilibili_cookie_file(), parser=parser)
         api.request_timeout = self._bilibili_request_timeout_seconds()
+        self._bind_api_stop_check(api)
         local.api = api
         with self._worker_api_guard():
             apis = getattr(self, "_worker_apis", None)
@@ -412,6 +145,36 @@ class BilibiliSpider(BaseSpider):
                 self._worker_apis = apis
             apis.append(api)
         return api
+
+    def _crawl_stopped(self) -> bool:
+        """已初始化的运行标志或中断请求才算停止；裸构造的测试对象不算已停止。"""
+        if bool(getattr(self, "_interrupt_requested", False)):
+            return True
+        if not hasattr(self, "_is_running"):
+            return False
+        return not self.is_running
+
+    def _bind_api_stop_check(self, api: BiliAPI | None) -> None:
+        if api is None:
+            return
+        api.stop_check = self._crawl_stopped
+
+    def _close_api_sessions(self) -> None:
+        self._close_worker_apis()
+        api = getattr(self, "api", None)
+        if api is None:
+            return
+        try:
+            api.close()
+        except Exception as exc:
+            debug_logger.log_exception("BilibiliSpider", "close_api_session", exc)
+
+    def _shutdown_executor(self, executor: ThreadPoolExecutor) -> None:
+        """停止时关闭会话，并取消尚未开始的线程池任务。"""
+        stopped = self._crawl_stopped()
+        if stopped:
+            self._close_api_sessions()
+        executor.shutdown(wait=True, cancel_futures=stopped)
 
     def _close_worker_apis(self) -> None:
         with self._worker_api_guard():
@@ -462,13 +225,92 @@ class BilibiliSpider(BaseSpider):
         episode_title = episode.get("title") or f"第 {fallback_index + 1} 集"
         return f"{parent} · P{num_str} · {episode_title}"
 
+    def _record_episode_parse_failure(self, label: object) -> None:
+        message = f"⚠️ 视频信息解析失败: {label}"
+        self.log(message)
+        debug = getattr(self, "debug_state", None)
+        if not callable(debug):
+            return
+        debug(
+            action="episode_list_invalid",
+            message="Bilibili 分集为空或下标超出范围，已跳过",
+            status_code="BILI_EPISODE_PARSE_FAIL",
+            details={"label": str(label)},
+            level="WARNING",
+        )
+
+    @staticmethod
+    def _episode_index(value: object, size: int) -> int | None:
+        try:
+            index = int(value)
+        except (TypeError, ValueError):
+            return None
+        if index < 0 or index >= size:
+            return None
+        return index
+
+    def _build_selected_download_tasks(self, stage1_indices, cached_data: dict) -> list[dict]:
+        """按用户选择装配下载任务；空分集或越界下标记为解析失败并跳过。"""
+        final_download_queue: list[dict] = []
+        max_download_items = self._max_items_limit()
+        for idx in stage1_indices or []:
+            if not self.is_running or len(final_download_queue) >= max_download_items:
+                break
+            item = cached_data.get(idx) if isinstance(cached_data, dict) else None
+            if not isinstance(item, dict):
+                self._record_episode_parse_failure(f"选择项不存在: {idx}")
+                continue
+            info = item.get("info") if isinstance(item.get("info"), dict) else {}
+            episodes = info.get("episodes") or []
+            if not isinstance(episodes, list) or not episodes:
+                self._record_episode_parse_failure(info.get("title") or info.get("bvid") or "未知视频")
+                continue
+            item_type = item.get("type")
+            if item_type == "single":
+                ep = episodes[0]
+                final_download_queue.append(
+                    self.task_builder.build_single_task(
+                        ep,
+                        referer=f"https://www.bilibili.com/video/{ep['bvid']}",
+                        video_title=info.get("title"),
+                    )
+                )
+                continue
+            sub_dialog_items = []
+            remaining_slots = max_download_items - len(final_download_queue)
+            parent_label = info.get("season_title") or info.get("title") or "未命名项目"
+            selectable = episodes[:remaining_slots]
+            for i, ep in enumerate(selectable):
+                sub_dialog_items.append({
+                    "title": ep.get("title") or f"第 {i + 1} 集",
+                    "subtitle": f"P{str(ep.get('page_num', i + 1)).zfill(2)}",
+                    "group_title": parent_label,
+                    "index": i,
+                })
+            if len(episodes) > remaining_slots:
+                self.log(f"ℹ️ 已按视频数上限 {max_download_items} 裁剪可选分集")
+            self.log(f"🔔 正在展开: {info.get('season_title') or info.get('title') or '未命名项目'}")
+            sub_indices = self.ask_user_selection(sub_dialog_items)
+            if not sub_indices:
+                continue
+            for sub_idx in sub_indices:
+                if len(final_download_queue) >= max_download_items:
+                    break
+                episode_index = self._episode_index(sub_idx, len(episodes))
+                if episode_index is None:
+                    self._record_episode_parse_failure(f"分集下标超出范围: {sub_idx}")
+                    continue
+                ep = episodes[episode_index]
+                final_download_queue.append(self.task_builder.build_episode_task(info, ep, episode_index))
+        return final_download_queue
+
     def _resolve_download_item(self, task: dict, api: BiliAPI | None = None) -> VideoItem | None:
         """把单个 Bilibili 任务解析成下载项，但暂不发射。"""
         self.log(f"🎬 解析流: {task['file_name'][:15]}...")
         try:
             api = api or self.api
             v_url, a_url, q_id = api.get_play_url(task['bvid'], task['cid'], trace_id=task['trace_id'])
-            if not v_url:
+            if not isinstance(v_url, str) or not v_url:
                 self.log("   ❌ 获取流失败")
                 self.debug_state(
                     action="resolve_stream_empty",
@@ -483,14 +325,14 @@ class BilibiliSpider(BaseSpider):
                     level="WARNING",
                     trace_id=task["trace_id"],
                 )
-                return False
+                return None
 
             q_map = {127: "8K", 120: "4K", 116: "1080P60", 80: "1080P", 64: "720P"}
             q_text = q_map.get(q_id, "高清")
             self.log(f"   ✨ 获取成功 [{q_text}]")
             folder_name = task.get("folder_name")
             proxy_str = self._effective_proxy_server((getattr(self, "config", {}) or {}).get("proxy"))
-            cookie_dict = api.snapshot_cookies()
+            # 登录 Cookie 会随 VideoItem.meta 广播到前端；下载器仍从 meta 读 cookie 时也不再写入。
             meta = {
                 "trace_id": task["trace_id"],
                 "content_type": "video",
@@ -502,7 +344,6 @@ class BilibiliSpider(BaseSpider):
                 "bvid": task["bvid"],
                 "cid": task["cid"],
                 "preferred_filename": task["file_name"],
-                "cookies": cookie_dict,
             }
             if proxy_str:
                 meta["proxy"] = proxy_str
@@ -525,6 +366,8 @@ class BilibiliSpider(BaseSpider):
                 trace_id=task["trace_id"],
             )
             return item
+        except BilibiliRequestStopped:
+            return None
         except Exception as exc:
             self.log(f"   ❌ 获取流失败: {exc}")
             self.debug_state(
@@ -545,7 +388,7 @@ class BilibiliSpider(BaseSpider):
     def _process_download_task(self, task: dict) -> bool:
         """逐条取流并提交下载，单条失败不影响后续任务继续执行。"""
         item = self._resolve_download_item(task, api=getattr(self, "api", None))
-        if item is None:
+        if not isinstance(item, VideoItem):
             self.interruptible_sleep(0.5)
             return False
         self.emit_video(url=item.url, title=item.title, source=item.source, meta=item.meta)
@@ -562,9 +405,15 @@ class BilibiliSpider(BaseSpider):
             success_count = 0
             failure_count = 0
             for task in task_list:
-                if not self.is_running:
+                if not self.is_running or self.interrupt_requested:
                     break
-                if self._process_download_task(task):
+                try:
+                    succeeded = self._process_download_task(task)
+                except Exception as exc:
+                    failure_count += 1
+                    self.log(f"   ❌ 获取流失败: {exc}")
+                    continue
+                if succeeded:
                     success_count += 1
                 else:
                     failure_count += 1
@@ -581,14 +430,15 @@ class BilibiliSpider(BaseSpider):
         ready_items: list[VideoItem] = []
 
         def resolve_one(task: dict) -> VideoItem | None:
-            if not self.is_running:
+            if not self.is_running or self.interrupt_requested:
                 return None
             return self._resolve_download_item(task, api=self._worker_api_for_thread())
 
-        with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="bili-submit") as executor:
+        executor = ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="bili-submit")
+        try:
             future_map = {executor.submit(resolve_one, task): task for task in task_list}
             for future in as_completed(future_map):
-                if not self.is_running:
+                if not self.is_running or self.interrupt_requested:
                     break
                 try:
                     item = future.result()
@@ -610,11 +460,13 @@ class BilibiliSpider(BaseSpider):
                         trace_id=task.get("trace_id"),
                     )
                     continue
-                if item is None:
+                if not isinstance(item, VideoItem):
                     failure_count += 1
                     continue
                 ready_items.append(item)
                 success_count += 1
+        finally:
+            self._shutdown_executor(executor)
 
         # worker 只汇总结果，统一由当前线程批量发射，避免并发回调持续挤压宿主队列。
         emitted = self.emit_videos(ready_items)
@@ -625,6 +477,12 @@ class BilibiliSpider(BaseSpider):
 
     def run(self):
         """执行登录回退、并行扫描解析、交互选择和下载任务提交。"""
+        self.run_succeeded = False
+
+        def succeed() -> None:
+            if self.is_running and not self.interrupt_requested:
+                self.run_succeeded = True
+
         try:
             self.debug_state(
                 action="run_start",
@@ -633,25 +491,41 @@ class BilibiliSpider(BaseSpider):
                 context={"keyword": self.keyword},
                 details={"config": self.config},
             )
+            if not self.is_running or self.interrupt_requested:
+                return
             cookie_file = self._bilibili_cookie_file()
             self.api = BiliAPI(cookie_file, parser=self.parser)
             self.api.request_timeout = self._bilibili_request_timeout_seconds()
+            self._bind_api_stop_check(self.api)
             # 登录探测异常仍可尝试扫码；扫码失败再降级游客态，公开内容不会被认证故障阻断。
             try:
                 is_logged_in = self.api.check_login()
+            except BilibiliRequestStopped:
+                return
             except LoginCheckError as exc:
                 self.log(f"⚠️ 登录状态校验失败，尝试继续执行: {exc}")
                 is_logged_in = False
+            if not self.is_running or self.interrupt_requested:
+                return
             if not is_logged_in:
                 self.log("🔒 未检测到登录，启动浏览器扫码...")
                 try:
                     self._perform_login_scan(cookie_file)
+                except LoginCancelledError:
+                    return
+                except BilibiliRequestStopped:
+                    return
+                except (PlaywrightError, OSError) as exc:
+                    self.log(f"❌ Bilibili 登录浏览器异常，任务结束: {exc}")
+                    return
                 except SpiderAuthError as exc:
                     self.log(f"⚠️ 登录失败，以游客身份爬取: {exc}")
                 else:
                     self.log("✅ 已完成扫码登录")
             else:
                 self.log("👤 已登录，Cookie 有效")
+            if not self.is_running or self.interrupt_requested:
+                return
             self.log(f"🚀 启动 Bilibili 任务 | 目标: {self.keyword}")
             # 固定 API worker 数只限制同时执行的请求；原始队列和执行器待执行项均无容量上限，
             # 生产速度更快时仍可能在内存积压，解析结果再回流主线程。
@@ -711,54 +585,18 @@ class BilibiliSpider(BaseSpider):
                     self._log_api_failure_summary(failures=api_failures)
             if not display_items:
                 self.log("❌ 未找到任何有效视频")
+                succeed()
                 return
             # 第一阶段选择视频、合集或多 P 项目。
             self.log(f"🔔 扫描结束，共 {len(display_items)} 个项目，请选择...")
             stage1_indices = self.ask_user_selection(display_items)
             if not stage1_indices:
                 self.log("❌ 用户取消下载")
+                succeed()
                 return
             # 第二阶段展开分集选择，并装配最终下载队列。
-            final_download_queue = []
+            final_download_queue = self._build_selected_download_tasks(stage1_indices, cached_data)
             max_download_items = self._max_items_limit()
-            for idx in stage1_indices:
-                if not self.is_running or len(final_download_queue) >= max_download_items:
-                    break
-                item = cached_data[idx]
-                info = item['info']
-                episodes = info['episodes']
-                item_type = item['type']
-                if item_type == 'single':
-                    ep = episodes[0]
-                    final_download_queue.append(
-                        self.task_builder.build_single_task(
-                            ep,
-                            referer=f"https://www.bilibili.com/video/{ep['bvid']}",
-                            video_title=info.get("title"),
-                        )
-                    )
-                    continue
-                sub_dialog_items = []
-                remaining_slots = max_download_items - len(final_download_queue)
-                parent_label = info.get('season_title') or info.get('title') or "未命名项目"
-                for i, ep in enumerate(episodes[:remaining_slots]):
-                    sub_dialog_items.append({
-                        'title': ep.get('title') or f"第 {i + 1} 集",
-                        'subtitle': f"P{str(ep.get('page_num', i + 1)).zfill(2)}",
-                        'group_title': parent_label,
-                        'index': i
-                    })
-                if len(episodes) > remaining_slots:
-                    self.log(f"ℹ️ 已按视频数上限 {max_download_items} 裁剪可选分集")
-                self.log(f"🔔 正在展开: {info.get('season_title') or info['title']}")
-                sub_indices = self.ask_user_selection(sub_dialog_items)
-                if not sub_indices:
-                    continue
-                for sub_idx in sub_indices:
-                    if len(final_download_queue) >= max_download_items:
-                        break
-                    ep = episodes[sub_idx]
-                    final_download_queue.append(self.task_builder.build_episode_task(info, ep, sub_idx))
             if len(final_download_queue) >= max_download_items:
                 self.log(f"ℹ️ 已达到视频数上限 {max_download_items}，剩余选择不会进入下载队列")
             self.log(f"✅ 最终确认 {len(final_download_queue)} 个任务，开始下载...")
@@ -773,6 +611,7 @@ class BilibiliSpider(BaseSpider):
             )
             success_count, failure_count = self._process_download_tasks_async(final_download_queue)
             self.log(f"🎉 全部完成: 成功 {success_count}/{len(final_download_queue)} | 失败 {failure_count}")
+            succeed()
         finally:
             # worker 可能仍在请求超时窗口内；关闭会话后只做有界等待，防止退出永久挂起。
             self._close_worker_apis()
@@ -832,19 +671,31 @@ class BilibiliSpider(BaseSpider):
             fallback_url = str(kwargs.pop("fallback_url", "") or "").strip()
             if not fallback_urls and fallback_url:
                 fallback_urls = [fallback_url]
+            static_search_attempted = False
+            static_found = False
             for fallback_url in fallback_urls or []:
+                if self._crawl_stopped():
+                    break
                 fallback_url = str(fallback_url or "").strip()
                 if not fallback_url:
                     continue
                 scan_kwargs = dict(kwargs)
-                if "search.bilibili.com" in fallback_url:
+                is_search_target = "search.bilibili.com" in fallback_url
+                if is_search_target:
                     scan_kwargs["is_search"] = True
-                self._scan_with_browser_queue(
+                elif static_search_attempted and not static_found:
+                    self.log("⚠️ 静态搜索没有结果，不再启动浏览器")
+                    continue
+                found = self._scan_with_browser_queue(
                     fallback_url,
                     max_pages=max_pages,
                     exclude_bvids=exclude_bvids,
                     **scan_kwargs,
                 )
+                if is_search_target:
+                    static_search_attempted = True
+                if found:
+                    static_found = True
             return
         if route.kind == "aid":
             self.log("Bilibili route: direct av video")
@@ -874,6 +725,8 @@ class BilibiliSpider(BaseSpider):
             elif candidate.lower().startswith(("www.bilibili.com/", "bilibili.com/")):
                 candidate = f"https://{candidate.lstrip('/')}"
         if not self._url_matches_hosts(candidate, self.SHORT_LINK_HOSTS, allow_subdomains=False):
+            return candidate
+        if self._crawl_stopped():
             return candidate
         try:
             request_timeout = getattr(
@@ -1037,20 +890,31 @@ class BilibiliSpider(BaseSpider):
             for bvid in [self._bvid_from_text(str(failure.get("raw_id") or ""))]
             if bvid
         }
+        static_search_attempted = False
+        static_found = False
         for failure in failures:
             raw_id = failure.get("raw_id")
             for url in self._fallback_scan_urls_for_api_failure(raw_id):
-                if not self.is_running:
+                if self._crawl_stopped():
                     return valid_idx
+                is_search_target = "search.bilibili.com" in url
+                if not is_search_target and static_search_attempted and not static_found:
+                    self.log("⚠️ 静态搜索没有结果，不再启动浏览器")
+                    continue
                 self.log(f"↩️ Bilibili API 失败，尝试网页兜底扫描: {url}")
-                scan_kwargs = {"is_search": "search.bilibili.com" in url, "is_space": False}
-                for bvid in self._scan_with_browser_queue(
+                scan_kwargs = {"is_search": is_search_target, "is_space": False}
+                found = self._scan_with_browser_queue(
                     url,
                     max_pages=max_pages,
                     enqueue=False,
                     exclude_bvids=failed_bvids,
                     **scan_kwargs,
-                ):
+                )
+                if is_search_target:
+                    static_search_attempted = True
+                if found:
+                    static_found = True
+                for bvid in found or []:
                     if bvid in seen_candidates:
                         continue
                     seen_candidates.add(bvid)
@@ -1118,23 +982,26 @@ class BilibiliSpider(BaseSpider):
         """消费原始 ID 队列，用固定线程池解析详情并提交结构化结果。"""
         def process_one(raw_id):
             """把队列中的 bvid/aid 解析为结构化视频信息。"""
-            if not self.is_running:
+            if not self.is_running or self.interrupt_requested:
                 return None, None
             api = self._worker_api_for_thread()
-            if isinstance(raw_id, dict):
-                aid = str(raw_id.get("aid") or "").strip()
-                if aid:
-                    result = api.get_video_info(None, trace_id=f"bilibili_av{aid}", aid=aid)
-                    error = None if result else api.consume_video_info_error(aid)
-                    return result, error
-                bvid = str(raw_id.get("bvid") or "").strip()
-            else:
-                bvid = str(raw_id or "").strip()
-            if not bvid:
+            try:
+                if isinstance(raw_id, dict):
+                    aid = str(raw_id.get("aid") or "").strip()
+                    if aid:
+                        result = api.get_video_info(None, trace_id=f"bilibili_av{aid}", aid=aid)
+                        error = None if result else api.consume_video_info_error(aid)
+                        return result, error
+                    bvid = str(raw_id.get("bvid") or "").strip()
+                else:
+                    bvid = str(raw_id or "").strip()
+                if not bvid:
+                    return None, None
+                result = api.get_video_info(bvid, trace_id=f"bilibili_{bvid}")
+                error = None if result else api.consume_video_info_error(bvid)
+                return result, error
+            except BilibiliRequestStopped:
                 return None, None
-            result = api.get_video_info(bvid, trace_id=f"bilibili_{bvid}")
-            error = None if result else api.consume_video_info_error(bvid)
-            return result, error
 
         try:
             api_workers = self._bilibili_api_worker_count()
@@ -1143,14 +1010,14 @@ class BilibiliSpider(BaseSpider):
         executor = ThreadPoolExecutor(max_workers=api_workers, thread_name_prefix="bili-detail")
         try:
             while True:
-                if not self.is_running:
+                if not self.is_running or self.interrupt_requested:
                     break
                 try:
                     bvid = self.raw_bv_queue.get(timeout=0.5)
                     future = executor.submit(process_one, bvid)
                     def callback(f, raw_id=bvid):
                         
-                        if not self.is_running:
+                        if not self.is_running or self.interrupt_requested:
                             return
                         try:
                             res, error = f.result()
@@ -1165,6 +1032,8 @@ class BilibiliSpider(BaseSpider):
                                     )
                                 else:
                                     self.log(f"⚠️ Bilibili API 未返回可用视频信息: {raw_id}")
+                        except BilibiliRequestStopped:
+                            return
                         except SpiderParseError as exc:
                             self.log(f"⚠️ 视频信息解析失败: {exc}")
                         except (RuntimeError, ValueError, KeyError, TypeError) as exc:
@@ -1175,11 +1044,8 @@ class BilibiliSpider(BaseSpider):
                         break
                     continue
         finally:
-            # 停止时取消尚未启动的 future；无论哪条路径，都等已运行回调结束后再置完成事件。
-            if self.is_running:
-                executor.shutdown(wait=True, cancel_futures=False)
-            else:
-                executor.shutdown(wait=True, cancel_futures=True)
+            # 停止时关闭会话并取消尚未启动的 future；无论哪条路径，都等已运行回调结束后再置完成事件。
+            self._shutdown_executor(executor)
             self.api_pool_finished.set()
 
     def _restore_scan_cookies(self, page) -> None:
@@ -1424,6 +1290,10 @@ class BilibiliSpider(BaseSpider):
             if static_count > 0:
                 self.log(f"   📄 静态搜索页: 发现 {static_count} 个")
                 return _scan_result()
+            self.log("⚠️ 静态搜索没有结果区视频，不再启动浏览器")
+            return _scan_result()
+        if self._crawl_stopped():
+            return _scan_result()
         try:
             with sync_playwright() as p:
                 browser = p.chromium.launch(
@@ -1512,6 +1382,7 @@ class BilibiliSpider(BaseSpider):
                         bv_set,
                         enqueue=enqueue,
                         excluded_bvids=excluded,
+                        search_results_only=bool(is_search),
                     )
                     self.log(f"   📄 第 {page_count} 页: 发现 {new_count} 个")
                     if not self._has_bvid_capacity(bv_set, excluded):
@@ -1521,12 +1392,25 @@ class BilibiliSpider(BaseSpider):
                         break
                     if page_count < max_pages:
                         if is_search:
-                            next_page = page_count + 1
-                            next_url = self._build_search_page_url(page.url, next_page)
+                            previous_url = str(getattr(page, "url", "") or current_url)
+                            previous_number = self._search_page_number(previous_url)
+                            next_url = self._build_search_page_url(previous_url, previous_number + 1)
                             current_url = next_url
                             if not self.interruptible_playwright_goto(page, next_url, timeout=browser_timeout_ms):
                                 break
                             if not self.interruptible_page_wait(page, 2000):
+                                break
+                            landed_url = str(getattr(page, "url", "") or "")
+                            if self._search_page_number(landed_url) <= previous_number:
+                                self.log("⚠️ 搜索页码没有前进，停止翻页")
+                                break
+                            landed_state = self._read_bilibili_browser_page_state(page)
+                            if landed_state.kind == "empty":
+                                self._log_bilibili_terminal_page_state(
+                                    landed_state,
+                                    url=landed_url or next_url,
+                                    page_count=page_count + 1,
+                                )
                                 break
                             continue
                         elif is_space:
@@ -1575,10 +1459,12 @@ class BilibiliSpider(BaseSpider):
         *,
         enqueue: bool = True,
         excluded_bvids: set[str] | None = None,
+        search_results_only: bool = False,
     ) -> int:
         """提取当前页新增 BV；若首轮为空则补滚动一次再重试。"""
+        extract = self._extract_search_result_hrefs if search_results_only else self._extract_video_hrefs
         new_count = self._enqueue_new_bvids(
-            self._extract_video_hrefs(page),
+            extract(page),
             bv_set,
             enqueue=enqueue,
             excluded_bvids=excluded_bvids,
@@ -1591,7 +1477,7 @@ class BilibiliSpider(BaseSpider):
         if not self.interruptible_sleep(1):
             return new_count
         return self._enqueue_new_bvids(
-            self._extract_video_hrefs(page),
+            extract(page),
             bv_set,
             enqueue=enqueue,
             excluded_bvids=excluded_bvids,
@@ -1608,8 +1494,8 @@ class BilibiliSpider(BaseSpider):
     ) -> int:
         """从 Bilibili 服务端渲染的搜索 HTML 中提取 BV 候选。
 
-        合集类输入常指向不可用的代表 BV，但搜索 HTML 仍可能包含其他可播放 BV；
-        先收集这些候选，再回退到开销更高的浏览器扫描。
+        合集类输入常指向不可用的代表 BV，但搜索 HTML 仍可能包含其他可播放 BV。
+        只抽取结果卡片；静态结果为 0 时调用方不再启动浏览器。
         """
         total = 0
         try:
@@ -1627,7 +1513,7 @@ class BilibiliSpider(BaseSpider):
             "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
         }
         for page_num in range(1, page_count + 1):
-            if not self.is_running or not self._has_bvid_capacity(bv_set, excluded_bvids):
+            if self._crawl_stopped() or not self._has_bvid_capacity(bv_set, excluded_bvids):
                 break
             page_url = str(url or "")
             if page_num > 1:
@@ -1645,8 +1531,21 @@ class BilibiliSpider(BaseSpider):
             except requests.RequestException as exc:
                 self.log(f"⚠️ Bilibili 静态搜索页解析失败: {exc}")
                 break
+            response_url = getattr(response, "url", None)
+            if not isinstance(response_url, str) or not response_url:
+                response_url = page_url
+            if page_num > 1 and self._search_page_number(response_url) < page_num:
+                self.log("⚠️ 搜索页码没有前进，停止翻页")
+                break
+            page_html = str(getattr(response, "text", "") or "")
+            if self._search_markup_is_empty(page_html):
+                self.log("⚠️ Bilibili 搜索页为空，停止翻页")
+                break
+            result_hrefs = self._extract_search_result_hrefs_from_text(page_html)
+            if not result_hrefs:
+                break
             page_new_count = self._enqueue_new_bvids(
-                self._extract_video_hrefs_from_text(response.text),
+                result_hrefs,
                 bv_set,
                 enqueue=enqueue,
                 excluded_bvids=excluded_bvids,
@@ -1655,6 +1554,147 @@ class BilibiliSpider(BaseSpider):
             if page_new_count == 0 or not self._has_bvid_capacity(bv_set, excluded_bvids):
                 break
         return total
+
+    _SEARCH_RESULT_CARD_RE = re.compile(
+        r"""class=(?P<q>["'])(?P<class>[^"']*(?:bili-video-card|video-list-item|search-video-card)[^"']*)(?P=q)""",
+        re.IGNORECASE,
+    )
+    _SEARCH_EXCLUDED_ATTR_RE = re.compile(
+        r"""(?:class|id)=["'][^"']*(?:rank|recommend|trending|popular|hot-list|search-hot)[^"']*["']""",
+        re.IGNORECASE,
+    )
+    _SEARCH_RESULT_CONTAINER_RE = re.compile(
+        r"""(?:class|id)=["'][^"']*(?:video-list|search-content|search-page-video)[^"']*["']""",
+        re.IGNORECASE,
+    )
+    _BV_TOKEN_RE = re.compile(r"BV[0-9A-Za-z]{10}", re.IGNORECASE)
+
+    @staticmethod
+    def _search_page_number(url: str) -> int:
+        try:
+            parsed = urllib.parse.urlparse(str(url or ""))
+            query = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
+            raw = (query.get("page") or ["1"])[0]
+            return int(str(raw).strip() or "1")
+        except (TypeError, ValueError):
+            return 1
+
+    @classmethod
+    def _search_card_is_excluded(cls, html: str, start: int) -> bool:
+        prefix = html[max(0, start - 2000):start]
+        excluded = list(cls._SEARCH_EXCLUDED_ATTR_RE.finditer(prefix))
+        if not excluded:
+            return False
+        containers = list(cls._SEARCH_RESULT_CONTAINER_RE.finditer(prefix))
+        if not containers:
+            return True
+        return excluded[-1].start() > containers[-1].start()
+
+    @classmethod
+    def _html_element_end(cls, html: str, tag_start: int) -> int:
+        """返回起始标签对应元素的结束位置，不把后续兄弟节点算进本卡片。"""
+        if tag_start < 0 or tag_start >= len(html):
+            return len(html)
+        open_end = html.find(">", tag_start)
+        if open_end < 0:
+            return len(html)
+        open_tag = html[tag_start:open_end + 1]
+        if open_tag.rstrip().endswith("/>"):
+            return open_end + 1
+        name_match = re.match(r"<\s*([A-Za-z][\w:-]*)", open_tag)
+        if name_match is None:
+            return open_end + 1
+        token = re.compile(
+            rf"</?\s*{re.escape(name_match.group(1))}\b",
+            re.IGNORECASE,
+        )
+        depth = 0
+        for match in token.finditer(html, tag_start):
+            if html.startswith("</", match.start()):
+                depth -= 1
+                if depth <= 0:
+                    close = html.find(">", match.end())
+                    return len(html) if close < 0 else close + 1
+            else:
+                depth += 1
+        return len(html)
+
+    @classmethod
+    def _search_card_markup_end(cls, html: str, tag_start: int, class_end: int) -> int:
+        """卡片范围停在本元素结束处，并且不越过下一张卡片的起始标签。"""
+        window_end = cls._html_element_end(html, tag_start)
+        next_card = cls._SEARCH_RESULT_CARD_RE.search(html, class_end)
+        if next_card is None:
+            return window_end
+        next_tag = html.rfind("<", tag_start + 1, next_card.start())
+        if next_tag < 0:
+            next_tag = next_card.start()
+        return min(window_end, next_tag)
+
+    @classmethod
+    def _extract_search_result_hrefs_from_text(cls, text: str) -> list[str]:
+        """只从搜索结果卡片取 BV，忽略推荐和排行区域。"""
+        html = str(text or "")
+        values: list[str] = []
+        seen: set[str] = set()
+        for match in cls._SEARCH_RESULT_CARD_RE.finditer(html):
+            if cls._search_card_is_excluded(html, match.start()):
+                continue
+            tag_start = html.rfind("<", max(0, match.start() - 400), match.start())
+            if tag_start < 0:
+                tag_start = match.start()
+            window_end = cls._search_card_markup_end(html, tag_start, match.end())
+            bvid_match = cls._BV_TOKEN_RE.search(html[tag_start:window_end])
+            if bvid_match is None:
+                continue
+            bvid = cls._normalize_bvid(bvid_match.group(0))
+            if bvid in seen:
+                continue
+            seen.add(bvid)
+            values.append(f"https://www.bilibili.com/video/{bvid}")
+        return values
+
+    def _search_markup_is_empty(self, html: str) -> bool:
+        text = str(html or "")
+        if self._extract_search_result_hrefs_from_text(text):
+            return False
+        return any(marker in text for marker in self.BROWSER_EMPTY_TEXT_MARKERS)
+
+    def _extract_search_result_hrefs(self, page) -> list[str]:
+        """浏览器搜索页只读取结果卡片，不收推荐和排行链接。"""
+        try:
+            hrefs = page.evaluate(r'''() => {
+            const excludedRe = /rank|recommend|trending|popular|hot-list|search-hot|排行|推荐/i;
+            const cardSelector = '.bili-video-card, .video-list-item, .search-video-card';
+            const isExcluded = (node) => {
+                let current = node;
+                for (let depth = 0; current && depth < 8; depth += 1, current = current.parentElement) {
+                    const hint = `${current.id || ''} ${current.className || ''}`;
+                    if (excludedRe.test(hint)) return true;
+                }
+                return false;
+            };
+            const values = [];
+            const seen = new Set();
+            const add = (value) => {
+                const matched = String(value || '').match(/BV[0-9A-Za-z]{10}/i);
+                if (!matched) return;
+                const bvid = `BV${matched[0].slice(2)}`;
+                if (seen.has(bvid)) return;
+                seen.add(bvid);
+                values.push(`https://www.bilibili.com/video/${bvid}`);
+            };
+            for (const card of document.querySelectorAll(cardSelector)) {
+                if (isExcluded(card)) continue;
+                add(card.getAttribute('data-bvid'));
+                const link = card.querySelector('a[href*="/video/BV"]');
+                if (link) add(link.href || link.getAttribute('href'));
+            }
+            return values;
+        }''')
+        except PlaywrightError:
+            return []
+        return hrefs or []
 
     @classmethod
     def _extract_video_hrefs_from_text(cls, text: str) -> list[str]:
@@ -1838,7 +1878,9 @@ class BilibiliSpider(BaseSpider):
                 self._close_tracked_playwright_browser(browser)
                 raise LoginTimeoutError("等待 Bilibili 扫码登录超时")
         except (PlaywrightError, OSError) as exc:
-            raise SpiderAuthError(f"Bilibili 登录失败: {exc}") from exc
+            if not self.is_running or self.interrupt_requested:
+                raise LoginCancelledError("用户在登录过程中终止任务") from exc
+            raise
         finally:
             browser = self._tracked_playwright_browser()
             if browser is not None:

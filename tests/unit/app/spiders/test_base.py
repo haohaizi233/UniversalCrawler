@@ -342,6 +342,33 @@ class BaseSpiderTests(unittest.TestCase):
         self.assertEqual(observed, [False])
         self.assertFalse(spider.is_running)
 
+    def test_run_sets_succeeded_before_finish_signal(self):
+        observed: list[bool] = []
+        spider = _RunImplSpider(keyword="demo", config={})
+        spider.sig_finished.connect(lambda: observed.append(spider.run_succeeded))
+
+        spider.start()
+
+        self.assertTrue(spider.wait(1000))
+        self.assertEqual(observed, [True])
+        self.assertTrue(spider.run_succeeded)
+
+    def test_run_marks_failure_before_finish_signal(self):
+        class _FailingSpider(BaseSpider):
+            def _run_impl(self):
+                raise RuntimeError("boom")
+
+        observed: list[bool] = []
+        spider = _FailingSpider(keyword="demo", config={})
+        spider.sig_finished.connect(lambda: observed.append(spider.run_succeeded))
+
+        with self.assertLogs("app.spiders.base", level="ERROR"):
+            spider.start()
+            self.assertTrue(spider.wait(1000))
+
+        self.assertEqual(observed, [False])
+        self.assertFalse(spider.run_succeeded)
+
     def test_callback_signal_disconnect_clears_subscribers(self):
         logs: list[str] = []
         spider = _DummySpider(keyword="demo", config={})

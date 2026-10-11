@@ -146,15 +146,16 @@ class DouyinPublicAuthorityTests(unittest.TestCase):
             with self.subTest(host=host):
                 self.assertFalse(is_douyin_public_host(host))
 
-    def test_public_url_requires_http_platform_authority_without_userinfo(self) -> None:
+    def test_public_url_requires_https_platform_authority_without_userinfo(self) -> None:
         accepted = (
             "https://WWW.DOUYIN.COM.:443/video/1",
-            "http://v.douyin.com./abc",
+            "https://v.douyin.com./abc",
             "https://www.iesdouyin.com/share/video/1",
             "https://www.tiktok.com/@creator/video/1",
             "https://api16-normal-c-useast1a.tiktokv.com/resource",
         )
         rejected = (
+            "http://v.douyin.com./abc",
             "https://attacker.example/?next=https://www.douyin.com/video/1",
             "https://douyin.com.attacker.example/a",
             "https://douyın.com/a",
@@ -292,7 +293,7 @@ class RequesterSecurityTests(unittest.IsolatedAsyncioTestCase):
                     "https://v.douyin.com/abc",
                     {
                         "headers": {"User-Agent": "test-agent"},
-                        "max_redirects": 5,
+                        "max_redirects": 0,
                     },
                 )
             ],
@@ -387,6 +388,116 @@ class RequesterSecurityTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn(secret, rendered)
         self.assertNotIn("Response Headers", rendered)
 
+    async def test_http_first_hop_omits_credentials_and_rejects_later_http_or_off_platform(self) -> None:
+        class _RedirectTransport:
+            def __init__(self, location: str) -> None:
+                self.location = location
+                self.calls: list[tuple[str, str, dict[str, Any]]] = []
+
+            def request(self, method: str, url: str, **kwargs: Any) -> PinnedResponse:
+                self.calls.append((method, url, kwargs))
+                return PinnedResponse(302, url, {"Location": self.location}, b"")
+
+        original = "http://v.douyin.com/abc"
+        headers = {
+            "User-Agent": "test-agent",
+            "Cookie": "sid=request-cookie",
+            "Authorization": "Bearer request-secret",
+        }
+        for location in (
+            "http://www.douyin.com/video/1",
+            "https://attacker.example/steal",
+            "http://127.0.0.1/private",
+        ):
+            with self.subTest(location=location):
+                transport = _RedirectTransport(location)
+                requester, logger, _client = _requester(transport, headers=headers, max_retry=2)
+                self.assertEqual(await requester.request_url(original), original)
+                self.assertEqual(len(transport.calls), 1)
+                sent = transport.calls[0][2]["headers"]
+                self.assertNotIn("Cookie", sent)
+                self.assertNotIn("Authorization", sent)
+                self.assertEqual(sent["User-Agent"], "test-agent")
+                self.assertEqual(transport.calls[0][2]["max_redirects"], 0)
+                self.assertNotIn("request-cookie", repr(logger.entries))
+                self.assertNotIn("request-secret", repr(logger.entries))
+
+    async def test_https_redirect_hops_stay_on_platform_hosts(self) -> None:
+        class _ChainTransport:
+            def __init__(self) -> None:
+                self.calls: list[tuple[str, str, dict[str, Any]]] = []
+
+            def request(self, method: str, url: str, **kwargs: Any) -> PinnedResponse:
+                self.calls.append((method, url, kwargs))
+                if "v.douyin.com" in url:
+                    return PinnedResponse(
+                        302,
+                        url,
+                        {"Location": "https://www.douyin.com/video/1"},
+                        b"",
+                    )
+                return PinnedResponse(
+                    200,
+                    "https://www.douyin.com:443/video/1",
+                    {},
+                    b"ok",
+                )
+
+        transport = _ChainTransport()
+        requester, _logger, _client = _requester(
+            transport,
+            headers={"User-Agent": "test-agent", "Cookie": "sid=kept"},
+        )
+
+        result = await requester.request_url("https://v.douyin.com/abc")
+
+        self.assertEqual(result, "https://www.douyin.com:443/video/1")
+        self.assertEqual(len(transport.calls), 2)
+        self.assertTrue(transport.calls[1][1].startswith("https://www.douyin.com/video/1"))
+        self.assertEqual(transport.calls[0][2]["headers"]["Cookie"], "sid=kept")
+        self.assertEqual(transport.calls[1][2]["headers"]["Cookie"], "sid=kept")
+        self.assertTrue(all(call[2]["max_redirects"] == 0 for call in transport.calls))
+
+    async def test_stop_flag_closes_client_and_skips_remaining_retries(self) -> None:
+        class _StopFlag:
+            def __init__(self) -> None:
+                self.stopped = False
+
+            def stop_requested(self) -> bool:
+                return self.stopped
+
+        class _StopTransport:
+            def __init__(self, flag: _StopFlag) -> None:
+                self.flag = flag
+                self.calls = 0
+
+            def request(self, method: str, url: str, **kwargs: Any) -> PinnedResponse:
+                del method, url, kwargs
+                self.calls += 1
+                self.flag.stopped = True
+                raise TimeoutError("timeout-secret-must-not-be-logged")
+
+        flag = _StopFlag()
+        transport = _StopTransport(flag)
+        logger = _RecordingLogger()
+        client = _UnusedAsyncClient()
+        params = SimpleNamespace(
+            logger=logger,
+            max_retry=2,
+            timeout=7,
+            stop_requested=flag.stop_requested,
+        )
+        requester = Requester(params, client, {"User-Agent": "test-agent"}, transport=transport)
+
+        with patch("app.core.lib.douyin.tools.retry.wait", new_callable=AsyncMock) as retry_wait:
+            result = await requester.request_url("https://v.douyin.com/stop-check")
+
+        self.assertIsNone(result)
+        self.assertEqual(transport.calls, 1)
+        self.assertTrue(client.closed)
+        retry_wait.assert_not_awaited()
+        self.assertNotIn("timeout-secret-must-not-be-logged", repr(logger.entries))
+
     async def test_aclose_preserves_existing_client_lifecycle(self) -> None:
         requester, _logger, client = _requester(_RecordingTransport())
 
@@ -436,7 +547,7 @@ class RequesterLiveReflowTests(unittest.IsolatedAsyncioTestCase):
         method, url, kwargs = transport.calls[0]
         self.assertEqual(method, "GET")
         self.assertEqual(url, self.LIVE_URL)
-        self.assertEqual(kwargs["max_redirects"], 5)
+        self.assertEqual(kwargs["max_redirects"], 0)
         self.assertEqual(
             kwargs["headers"],
             {

@@ -16,7 +16,10 @@
   function record(value) { return value && typeof value === "object" && !Array.isArray(value) ? value : {}; }
   function first(...values) { return values.find(value => value !== undefined && value !== null); }
   function currentState() { return typeof dependencies.getState === "function" ? record(dependencies.getState()) : record(state.snapshot); }
-  function selectedId() { return typeof dependencies.getSelectedToolId === "function" ? String(dependencies.getSelectedToolId() || "") : state.selectedToolId; }
+  function selectedId() {
+    if (state.selectedToolId) return state.selectedToolId;
+    return typeof dependencies.getSelectedToolId === "function" ? String(dependencies.getSelectedToolId() || "") : "";
+  }
   function setSelectedId(value) { state.selectedToolId = String(value || ""); if (typeof dependencies.setSelectedToolId === "function") dependencies.setSelectedToolId(state.selectedToolId); }
   function translate(value) {
     const translator = dependencies.translate || dependencies.translateText || dependencies.t;

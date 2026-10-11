@@ -6,6 +6,7 @@ import asyncio
 import mimetypes
 import os
 import re
+import secrets
 import threading
 from collections.abc import Callable
 from typing import Any
@@ -121,8 +122,25 @@ class WebFileResponseService:
             pass
 
     def _require_session_token(self, request: Request) -> None:
-        if not self._has_valid_session_token(request):
-            raise HTTPException(status_code=403, detail="缺少或无效的会话令牌")
+        if self._has_valid_session_token(request):
+            return
+        if self._same_origin_media_element(request):
+            return
+        raise HTTPException(status_code=403, detail="缺少或无效的会话令牌")
+
+    def _same_origin_media_element(self, request: Request) -> bool:
+        """`<video>` 发不出自定义头。只接受本源媒体元素，并核对 HttpOnly 会话 Cookie。"""
+
+        site = str(request.headers.get("sec-fetch-site") or "").strip().lower()
+        dest = str(request.headers.get("sec-fetch-dest") or "").strip().lower()
+        if site != "same-origin" or dest not in {"video", "audio", "image"}:
+            return False
+        context = self._get_request_context(request)
+        cookie = str(request.cookies.get("ucrawl_session") or "")
+        session_id = str(context.session_id or "")
+        if not cookie or len(cookie) != len(session_id):
+            return False
+        return secrets.compare_digest(cookie, session_id)
 
     def _guess_media_type(self, path: str) -> str:
         ext = os.path.splitext(path)[1].lower()

@@ -551,3 +551,31 @@ def test_single_destroy_call_guardian_retries_owned_tool_runner_false_to_true() 
     assert tool_runner.calls == 2
     assert metadata.calls == 1
     assert probe.calls == 1
+
+
+def test_frontend_shutdown_guardian_stops_after_retry_limit() -> None:
+    host, _store, _metadata, _probe, _file_log = _host()
+    host.failed_record_store = _ReadyStore()
+    host._owns_tool_runner_service = True
+    host.tool_runner_service = SimpleNamespace(shutdown=lambda **_kwargs: False)
+
+    with (
+        patch.object(shutdown_runtime, "_REAL_SLEEP", lambda _seconds: None),
+        patch.object(shutdown_runtime, "_MAX_FRONTEND_SHUTDOWN_ATTEMPTS", 3),
+    ):
+        assert destroy_frontend_state_service(host) is False
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            alive = [
+                thread
+                for thread in threading.enumerate()
+                if thread.name.startswith("frontend-state-shutdown") and thread.is_alive()
+            ]
+            if not alive:
+                break
+            time.sleep(0.01)
+        else:
+            raise AssertionError("frontend shutdown guardian kept retrying")
+
+    assert getattr(host, "_shutdown_completed", False) is False
+    assert host._is_shutting_down is True

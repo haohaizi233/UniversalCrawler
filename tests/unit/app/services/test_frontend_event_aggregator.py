@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from app.services.frontend_event_aggregator import (
+    ALL_FRONTEND_SECTIONS,
     FrontendEventAggregator,
     FrontendEventPriority,
     sections_for_topic,
@@ -164,3 +165,45 @@ def test_log_events_are_coalesced_but_keep_versioned_sections():
     assert len(state.pending_events) == 1
     assert state.pending_events[0]["payload"]["message"] == "second"
     assert aggregator.sections_since(base_version) == frozenset({"log_items", "app_status"})
+
+
+def test_upsert_removes_id_from_deleted_history():
+    aggregator = FrontendEventAggregator()
+
+    aggregator.record("video_removed", {"video_id": "revived"})
+    aggregator.record("videos.remove_many", {"video_ids": ["still-gone", "revived"]})
+    aggregator.record("videos.upsert", {"video_id": "revived"})
+    aggregator.record("videos.upsert_many", {"video_ids": ["batch-revived"]})
+    aggregator.record("video_removed", {"video_id": "batch-revived"})
+    aggregator.record("videos.upsert_many", {"video_ids": ["batch-revived"]})
+
+    assert aggregator.deleted_ids_since(0) == ("still-gone",)
+
+
+def test_non_terminal_progress_is_not_a_structural_active_download_update():
+    aggregator = FrontendEventAggregator()
+
+    aggregator.record("videos.update", {"video_id": "v1", "progress": 15})
+    progress_version = aggregator.version
+
+    assert aggregator.active_downloads_update_kind_since(0) == "progress"
+
+    aggregator.record("task_started", {"video_id": "v2"})
+    assert aggregator.active_downloads_update_kind_since(0) == "structure"
+    assert aggregator.active_downloads_update_kind_since(progress_version) == "structure"
+
+    structure_version = aggregator.version
+    aggregator.record("task_progress", {"video_id": "v2", "progress": 40})
+    assert aggregator.active_downloads_update_kind_since(structure_version) == "progress"
+
+
+def test_terminal_progress_is_a_structural_active_download_update():
+    aggregator = FrontendEventAggregator()
+
+    aggregator.record("videos.update", {"video_id": "v1", "progress": 100, "status": "completed"})
+
+    assert aggregator.active_downloads_update_kind_since(0) == "structure"
+
+
+def test_full_section_set_includes_log_contract():
+    assert "log_contract" in ALL_FRONTEND_SECTIONS

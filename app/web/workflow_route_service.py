@@ -8,6 +8,7 @@ from typing import Any, Callable
 from fastapi import Request
 
 from app.web.api_result import error_result
+from app.web.workflows import start_crawl_with_directory_lease
 
 
 async def _run_controller_worker_call(func: Callable[..., Any], *args: Any) -> Any:
@@ -20,25 +21,21 @@ class WebWorkflowRouteService:
     def __init__(self, *, get_request_context: Callable[[Request], Any]) -> None:
         self._get_request_context = get_request_context
 
-    @staticmethod
-    def _normalize_authorized_save_dir(context: Any, body: dict) -> dict | None:
-        save_dir = body.get("save_dir")
-        if save_dir is None or not isinstance(save_dir, str):
-            return body
-        try:
-            normalized = context.require_directory(save_dir)
-        except PermissionError as exc:
-            return error_result(str(exc), http_status=403)
-        payload = dict(body)
-        payload["save_dir"] = normalized
-        return payload
-
     async def start_crawl(self, request: Request, body: dict) -> dict:
         context = self._get_request_context(request)
-        payload = self._normalize_authorized_save_dir(context, body)
-        if isinstance(payload, dict) and payload.get("status") == "error":
-            return payload
-        return await context.workflow.start_crawl(payload, log_error=False)
+        if not isinstance(body, dict):
+            return error_result("请求体必须是 JSON 对象")
+        save_dir = body.get("save_dir")
+        if save_dir is not None and not isinstance(save_dir, str):
+            return error_result("save_dir 必须是字符串或 null")
+        try:
+            return await start_crawl_with_directory_lease(
+                context,
+                body,
+                log_error=False,
+            )
+        except PermissionError as exc:
+            return error_result(str(exc), http_status=403)
 
     async def stop_crawl(self, request: Request) -> dict:
         context = self._get_request_context(request)
@@ -50,7 +47,16 @@ class WebWorkflowRouteService:
 
     async def direct_download(self, request: Request, body: dict) -> dict:
         context = self._get_request_context(request)
-        payload = self._normalize_authorized_save_dir(context, body)
-        if isinstance(payload, dict) and payload.get("status") == "error":
-            return payload
-        return await context.workflow.direct_download(payload, log_error=False)
+        if not isinstance(body, dict):
+            return error_result("请求体必须是 JSON 对象")
+        save_dir = body.get("save_dir")
+        if save_dir is not None and not isinstance(save_dir, str):
+            return error_result("save_dir 必须是字符串或 null")
+        try:
+            with context.open_operation_directory(save_dir if save_dir else None) as opened:
+                payload = dict(body)
+                if opened:
+                    payload["save_dir"] = opened
+                return await context.workflow.direct_download(payload, log_error=False)
+        except PermissionError as exc:
+            return error_result(str(exc), http_status=403)

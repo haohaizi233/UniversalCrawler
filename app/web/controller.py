@@ -6,6 +6,7 @@ import asyncio
 import inspect
 import threading
 import time
+import uuid
 from copy import deepcopy
 from functools import partial
 from typing import Any, Callable
@@ -26,7 +27,6 @@ from app.services.file_service import (
     MediaLibraryService,
     MediaRenameOutcomeError,
 )
-from app.services.frontend_event_aggregator import FrontendEventPriority, priority_for_topic, sections_for_topic
 from app.services.frontend_state_service import FrontendStateService
 from shared.icon_contract import icon_manifest
 from app.web.controller_config_service import (
@@ -36,250 +36,9 @@ from app.web.controller_config_service import (
 )
 from app.web.controller_shutdown import shutdown_web_controller
 from app.web.media_scan_runtime import WebMediaScanRuntimeMixin
+from app.web.websocket_bridge import WebSocketBridge
 
-DELTA_ONLY_LEGACY_TOPICS = frozenset(
-    {
-        "video_state_changed",
-        "task_progress",
-        "videos.update",
-        "log",
-        "logs.append",
-        "videos.reconcile",
-    }
-)
 
-class WebSocketBridge:
-    """线程安全地把控制器事件桥接到 WebSocket，并调度前端增量快照。"""
-
-    def __init__(
-        self,
-        loop: asyncio.AbstractEventLoop | None,
-        send_func: Callable,
-        *,
-        event_recorder: Callable[[str, dict[str, Any]], None] | None = None,
-        delta_provider: Callable[[int], dict[str, Any]] | None = None,
-        delta_interval_seconds: float = 0.12,
-    ):
-        self._loop = loop
-        self._send_func = send_func
-        self._event_recorder = event_recorder
-        self._delta_provider = delta_provider
-        self._delta_interval_seconds = max(0.02, float(delta_interval_seconds))
-        self._pending_tasks: set[asyncio.Task] = set()
-        self._delta_lock = threading.RLock()
-        self._delta_pending = False
-        self._delta_schedule_generation = 0
-        self._last_delta_version = 0
-
-    def _get_loop(self) -> asyncio.AbstractEventLoop | None:
-        """延迟获取 uvicorn 事件循环，使工作线程可以安全发送事件。"""
-        if self._loop is None or self._loop.is_closed():
-            try:
-                self._loop = asyncio.get_running_loop()
-            except RuntimeError:
-                return None
-        return self._loop
-
-    def set_loop(self, loop: asyncio.AbstractEventLoop):
-        """显式绑定正在运行的 WebSocket 事件循环。"""
-        self._loop = loop
-
-    def mark_frontend_version_sent(self, version: int) -> None:
-        try:
-            normalized = int(version or 0)
-        except (TypeError, ValueError):
-            normalized = 0
-        with self._delta_lock:
-            self._last_delta_version = max(self._last_delta_version, normalized)
-
-    def emit(self, event_type: str, data: Any = None):
-        """任意线程都可调用：先记录状态事件，再按需发送兼容旧前端的事件。"""
-        event_type = str(event_type or "")
-        payload = data if isinstance(data, dict) else {}
-        self._record_frontend_event(event_type, payload)
-        self._schedule_frontend_delta(event_type)
-        if self._should_send_legacy_event(event_type):
-            self._schedule_send(event_type, data)
-
-    def _should_send_legacy_event(self, event_type: str) -> bool:
-        if self._delta_provider is None:
-            return True
-        return str(event_type or "") not in DELTA_ONLY_LEGACY_TOPICS
-
-    def _record_frontend_event(self, event_type: str, payload: dict[str, Any]) -> None:
-        if event_type in {"frontend_state", "frontend_delta", "init_state", "platforms", "config"}:
-            return
-        if self._event_recorder is None:
-            return
-        try:
-            self._event_recorder(event_type, payload)
-        except Exception as exc:
-            debug_logger.log_exception("WebSocketBridge", "record_frontend_event", exc)
-
-    def _schedule_frontend_delta(self, event_type: str) -> None:
-        """合并短时间内的普通更新；关键事件立即刷新，保证删除/失败等状态及时到达。"""
-        if self._delta_provider is None or event_type in {"frontend_state", "frontend_delta"}:
-            return
-        if sections_for_topic(event_type) is None:
-            return
-        priority = priority_for_topic(event_type)
-        delay = 0.0 if priority == FrontendEventPriority.CRITICAL else self._delta_interval_seconds
-        with self._delta_lock:
-            if self._delta_pending and priority != FrontendEventPriority.CRITICAL:
-                return
-            self._delta_pending = True
-            self._delta_schedule_generation += 1
-            generation = self._delta_schedule_generation
-        loop = self._get_loop()
-
-        def _schedule() -> None:
-            if delay <= 0:
-                loop.call_soon(self._flush_frontend_delta, generation)
-            else:
-                loop.call_later(delay, self._flush_frontend_delta, generation)
-
-        if loop and loop.is_running():
-            loop.call_soon_threadsafe(_schedule)
-        else:
-            with self._delta_lock:
-                if generation == self._delta_schedule_generation:
-                    self._delta_pending = False
-            debug_logger.log(
-                "WebSocketBridge",
-                "frontend_delta_deferred",
-                level="DEBUG",
-                message="Web event loop is unavailable; deferred frontend delta until a later async flush.",
-                status_code="WEB_DELTA_DEFERRED",
-                details={"event_type": event_type, "generation": generation},
-            )
-
-    def _flush_frontend_delta(self, generation: int | None = None) -> None:
-        """在事件循环里触发 delta 构建；过期 generation 表示已有更新的刷新计划。"""
-        with self._delta_lock:
-            if generation is not None and generation != self._delta_schedule_generation:
-                return
-            self._delta_pending = False
-            base_version = self._last_delta_version
-        if self._delta_provider is None:
-            return
-        loop = self._get_loop()
-        if loop and loop.is_running() and callable(getattr(loop, "run_in_executor", None)):
-            try:
-                task = loop.create_task(self._build_and_send_frontend_delta(base_version, generation))
-            except RuntimeError:
-                pass
-            else:
-                self._track_task(task)
-                return
-        debug_logger.log(
-            "WebSocketBridge",
-            "frontend_delta_skipped",
-            level="DEBUG",
-            message="Skipped frontend delta flush because no running event loop is available.",
-            status_code="WEB_DELTA_NO_LOOP",
-            details={"generation": generation},
-        )
-
-    async def _build_and_send_frontend_delta(self, base_version: int, generation: int | None = None) -> None:
-        if self._delta_provider is None:
-            return
-        try:
-            loop = asyncio.get_running_loop()
-            delta = await loop.run_in_executor(None, self._delta_provider, base_version)
-        except Exception as exc:
-            debug_logger.log_exception("WebSocketBridge", "frontend_delta", exc)
-            return
-        self._emit_frontend_delta(delta, base_version, generation)
-
-    def _emit_frontend_delta(self, delta: dict[str, Any], base_version: int, generation: int | None = None) -> None:
-        if not isinstance(delta, dict):
-            return
-        with self._delta_lock:
-            if generation is not None and generation != self._delta_schedule_generation:
-                return
-        version = int(delta.get("version") or base_version or 0)
-        if version == base_version and not delta.get("changed_sections"):
-            return
-
-        def _mark_delivered() -> None:
-            with self._delta_lock:
-                self._last_delta_version = max(self._last_delta_version, version)
-
-        self._schedule_send("frontend_delta", delta, on_accepted=_mark_delivered)
-
-    def _schedule_send(
-        self,
-        event_type: str,
-        data: Any = None,
-        *,
-        on_accepted: Callable[[], None] | None = None,
-    ) -> bool:
-        """把发送动作调度回 Web 事件循环；非协程线程不能直接 await WebSocket。"""
-        target_loop = self._get_loop()
-        try:
-            current_loop = asyncio.get_running_loop()
-            if current_loop is target_loop:
-                def _schedule():
-                    result = self._send_func(event_type, data)
-                    self._handle_send_result(result, current_loop, on_accepted=on_accepted)
-
-                current_loop.call_soon(_schedule)
-                return True
-        except RuntimeError:
-            pass
-
-        if target_loop and target_loop.is_running():
-            def _schedule():
-                result = self._send_func(event_type, data)
-                self._handle_send_result(result, target_loop, on_accepted=on_accepted)
-
-            target_loop.call_soon_threadsafe(_schedule)
-            return True
-        else:
-            import logging
-            logging.warning(f"WebSocketBridge: event loop is not running; dropped event {event_type}")
-            return False
-
-    def _handle_send_result(
-        self,
-        result: Any,
-        loop: asyncio.AbstractEventLoop,
-        *,
-        on_accepted: Callable[[], None] | None = None,
-    ) -> None:
-        if asyncio.iscoroutine(result):
-            self._track_task(loop.create_task(result), on_accepted=on_accepted)
-            return
-        if result is not False and on_accepted is not None:
-            on_accepted()
-
-    def _track_task(self, task: asyncio.Task, *, on_accepted: Callable[[], None] | None = None) -> None:
-        add_done_callback = getattr(task, "add_done_callback", None)
-        if not callable(add_done_callback):
-            return
-        self._pending_tasks.add(task)
-
-        def _discard(done_task: asyncio.Task) -> None:
-            self._pending_tasks.discard(done_task)
-            try:
-                result = done_task.result()
-            except asyncio.CancelledError:
-                pass
-            except Exception as exc:
-                debug_logger.log_exception("WebSocketBridge", "send_task", exc)
-            else:
-                if result is not False and on_accepted is not None:
-                    on_accepted()
-
-        add_done_callback(_discard)
-
-    def call_later(self, delay_seconds: float, callback: Callable[[], None]) -> None:
-        """在可用的 Web 事件循环上延迟调度回调。"""
-        loop = self._get_loop()
-        if loop and loop.is_running():
-            loop.call_soon_threadsafe(lambda: loop.call_later(delay_seconds, callback))
-            return
-        callback()
 
 class WebController(WebMediaScanRuntimeMixin, ControllerSessionMixin, MediaLibraryMixin):
     """Web 端核心控制器，复用桌面下载/采集逻辑，并把状态输出为 WebSocket 快照。"""
@@ -292,7 +51,7 @@ class WebController(WebMediaScanRuntimeMixin, ControllerSessionMixin, MediaLibra
     DOWNLOAD_ERROR_STATUS_CODE = "WEB_DL_ERROR"
     DOWNLOAD_FINISHED_MESSAGE = "Web 端下载任务完成"
     DOWNLOAD_ERROR_MESSAGE = "Web 端下载任务失败"
-    DOWNLOAD_ERROR_PROGRESS = 0
+    DOWNLOAD_ERROR_PROGRESS = None
     PROGRESS_EVENT_MIN_INTERVAL_SECONDS = 0.25
 
     def __init__(self, loop: asyncio.AbstractEventLoop, send_func: Callable):
@@ -317,6 +76,7 @@ class WebController(WebMediaScanRuntimeMixin, ControllerSessionMixin, MediaLibra
         self._last_progress_emit_at: dict[str, float] = {}
         self._last_progress_emit_value: dict[str, int] = {}
         self.current_spider = None
+        self._active_spider_session_id: str | None = None
         self._lifecycle_lock = threading.RLock()
         self._lifecycle_condition = threading.Condition(self._lifecycle_lock)
         self._is_shutting_down = False
@@ -705,18 +465,25 @@ class WebController(WebMediaScanRuntimeMixin, ControllerSessionMixin, MediaLibra
                 },
             )
 
+        session_id = self._open_spider_intake_session()
+
+        def on_item_found(item, _session_id=session_id):
+            self._on_spider_item_found(item, session_id=_session_id)
+
+        def on_items_found(items, _session_id=session_id):
+            self._on_spider_items_found(items, session_id=_session_id)
+
         spider.sig_log.connect(on_log)
-        spider.sig_item_found.connect(self._on_spider_item_found)
+        spider.sig_item_found.connect(on_item_found)
         batch_signal = getattr(spider, "sig_items_found", None)
-        on_items_found = getattr(self, "_on_spider_items_found", None)
-        if batch_signal is not None and callable(on_items_found):
+        if batch_signal is not None:
             batch_signal.connect(on_items_found)
         spider.sig_select_tasks.connect(self._on_spider_select_tasks)
         spider.sig_finished.connect(self._on_spider_finished)
         self._spider_signal_handlers = {
             "on_log": on_log,
-            "on_item_found": self._on_spider_item_found,
-            "on_items_found": on_items_found,
+            "on_item_found": on_item_found,
+            "on_items_found": on_items_found if batch_signal is not None else None,
             "on_select_tasks": self._on_spider_select_tasks,
             "on_finished": self._on_spider_finished,
         }
@@ -742,10 +509,27 @@ class WebController(WebMediaScanRuntimeMixin, ControllerSessionMixin, MediaLibra
                     pass
         self._spider_signal_handlers = {}
 
-    def _on_spider_item_found(self, item: VideoItem):
-        self._on_spider_items_found([item])
+    def _open_spider_intake_session(self) -> str:
+        session_id = uuid.uuid4().hex
+        self._active_spider_session_id = session_id
+        return session_id
 
-    def _on_spider_items_found(self, items: list[VideoItem]):
+    def _close_spider_intake_session(self) -> None:
+        self._active_spider_session_id = None
+
+    def _spider_intake_is_current(self, session_id: str | None) -> bool:
+        if getattr(self, "_is_shutting_down", False):
+            return False
+        if session_id is None:
+            return True
+        return session_id == getattr(self, "_active_spider_session_id", None)
+
+    def _on_spider_item_found(self, item: VideoItem, session_id: str | None = None):
+        self._on_spider_items_found([item], session_id=session_id)
+
+    def _on_spider_items_found(self, items: list[VideoItem], session_id: str | None = None):
+        if not self._spider_intake_is_current(session_id):
+            return
         accepted_items: list[VideoItem] = []
         for item in list(items or []):
             if self._should_skip_for_video_only(item):
@@ -753,27 +537,80 @@ class WebController(WebMediaScanRuntimeMixin, ControllerSessionMixin, MediaLibra
                 continue
             self._prepare_pending_item(item)
             accepted_items.append(item)
-        if not accepted_items:
+        if not accepted_items or not self._spider_intake_is_current(session_id):
             return
         if len(accepted_items) == 1:
-            item = accepted_items[0]
-            self._store_video_item(item)
-            self.bridge.emit("item_found", self._video_item_to_dict(item))
-            self.dl_manager.add_task(item, self.current_save_dir)
-            self._log_spider_item_found(item)
-            return
-
-        self._store_video_items(accepted_items)
-        for item in accepted_items:
-            self.bridge.emit("item_found", self._video_item_to_dict(item))
-        add_tasks = getattr(self.dl_manager, "add_tasks", None)
-        if callable(add_tasks):
-            add_tasks(accepted_items, self.current_save_dir)
+            self._store_video_item(accepted_items[0])
         else:
-            for item in accepted_items:
-                self.dl_manager.add_task(item, self.current_save_dir)
+            self._store_video_items(accepted_items)
+        if not self._spider_intake_is_current(session_id):
+            self._retract_spider_items(accepted_items)
+            return
+        try:
+            self._enqueue_spider_items(accepted_items)
+        except Exception as exc:
+            self._retract_spider_items(accepted_items)
+            self._report_spider_enqueue_failure(accepted_items, exc)
+            return
+        if not self._spider_intake_is_current(session_id):
+            self._cancel_enqueued_spider_items(accepted_items)
+            self._retract_spider_items(accepted_items)
+            return
         for item in accepted_items:
+            self.bridge.emit("item_found", self._video_item_to_dict(item))
             self._log_spider_item_found(item)
+
+    def _enqueue_spider_items(self, items: list[VideoItem]) -> None:
+        save_dir = self.current_save_dir
+        manager = self.dl_manager
+        if len(items) == 1:
+            result = manager.add_task(items[0], save_dir)
+            if result is False:
+                raise RuntimeError("加入下载队列失败")
+            return
+        add_tasks = getattr(manager, "add_tasks", None)
+        if callable(add_tasks):
+            result = add_tasks(items, save_dir)
+            if result is False or (isinstance(result, int) and result <= 0):
+                raise RuntimeError("加入下载队列失败")
+            return
+        for item in items:
+            result = manager.add_task(item, save_dir)
+            if result is False:
+                raise RuntimeError("加入下载队列失败")
+
+    def _cancel_enqueued_spider_items(self, items: list[VideoItem]) -> None:
+        manager = getattr(self, "dl_manager", None)
+        video_ids = {str(item.id) for item in items if getattr(item, "id", None)}
+        if manager is None or not video_ids:
+            return
+        cancel_tasks = getattr(manager, "cancel_tasks", None)
+        if callable(cancel_tasks):
+            cancel_tasks(video_ids)
+            return
+        cancel_task = getattr(manager, "cancel_task", None)
+        if not callable(cancel_task):
+            return
+        for video_id in video_ids:
+            cancel_task(video_id)
+
+    def _retract_spider_items(self, items: list[VideoItem]) -> None:
+        for item in items:
+            video_id = getattr(item, "id", None)
+            if video_id and self._video_lookup(video_id) is item:
+                self._remove_video_item(video_id)
+
+    def _report_spider_enqueue_failure(self, items: list[VideoItem], exc: Exception) -> None:
+        self.bridge.emit(
+            "log",
+            {"message": f"❌ 加入下载队列失败: {exc}", "level": "ERROR"},
+        )
+        debug_logger.log_exception(
+            "WebController",
+            "enqueue_download",
+            exc,
+            details={"item_count": len(items)},
+        )
 
     def _log_spider_item_found(self, item: VideoItem) -> None:
         debug_logger.log(
@@ -854,15 +691,26 @@ class WebController(WebMediaScanRuntimeMixin, ControllerSessionMixin, MediaLibra
                 "spider_running": self.current_spider.isRunning() if self.current_spider else None,
             },
         )
-        self.bridge.emit("log", {"message": "✅ 爬虫任务结束"})
+        run_succeeded = getattr(spider, "run_succeeded", None) if spider is not None else None
+        if run_succeeded is False:
+            self.bridge.emit("log", {"message": "❌ 爬虫任务未成功结束"})
+            finish_message = "Web 端爬虫任务未成功结束"
+            finish_status = "WEB_CRAWL_FINISH_FAILED"
+            finish_level = "ERROR"
+        else:
+            self.bridge.emit("log", {"message": "✅ 爬虫任务结束"})
+            finish_message = "Web 端爬虫任务结束"
+            finish_status = "WEB_CRAWL_FINISH"
+            finish_level = "INFO"
         if spider is not None:
             self._disconnect_spider_signals(spider)
         self.bridge.emit("crawl_state", {"is_running": False})
         debug_logger.log(
             component="WebController",
             action="crawl_finished",
-            message="Web 端爬虫任务结束",
-            status_code="WEB_CRAWL_FINISH",
+            level=finish_level,
+            message=finish_message,
+            status_code=finish_status,
         )
         self.current_spider = None
         # 防御性清理：确保 _pending_selection_strategy 不残留
@@ -887,6 +735,7 @@ class WebController(WebMediaScanRuntimeMixin, ControllerSessionMixin, MediaLibra
         spider = self.current_spider
         if not spider:
             return
+        self._close_spider_intake_session()
         spider.stop()
         self.bridge.emit("log", {"message": "🛑 正在停止任务..."})
         debug_logger.log(

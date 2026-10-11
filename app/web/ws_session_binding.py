@@ -14,6 +14,7 @@ from app.web.session_runtime import (
     WebSessionRegistry,
     is_allowed_origin,
     is_local_host,
+    is_loopback_request_host,
 )
 
 @dataclass(slots=True)
@@ -59,6 +60,12 @@ class WebSocketSessionBinder:
         expected_origin = f"{ws.url.scheme.replace('ws', 'http', 1)}://{ws.url.netloc}"
         client = getattr(ws, "client", None)
         client_host = getattr(client, "host", None)
+        if not self._access_token and not is_loopback_request_host(
+            _websocket_hostname(ws),
+            client_host,
+        ):
+            await ws.close(code=1008, reason="passwordless Web access requires a loopback host")
+            return None
 
         # 浏览器会始终发送 Origin；仅保留本机非浏览器客户端的无 Origin 兼容路径。
         # 远程客户端即使拿到会话 Cookie，也不能绕过同源检查直接建立控制通道。
@@ -81,3 +88,15 @@ class WebSocketSessionBinder:
         binding = WebSocketSessionBinding(session_id=session_id, context=context)
 
         return binding
+
+
+def _websocket_hostname(ws: WebSocket) -> str | None:
+    hostname = getattr(getattr(ws, "url", None), "hostname", None)
+    if hostname:
+        return str(hostname)
+    netloc = getattr(getattr(ws, "url", None), "netloc", "") or ""
+    host = str(netloc).rsplit("@", 1)[-1]
+    if host.startswith("["):
+        end = host.find("]")
+        return host[1:end] if end > 1 else host
+    return host.split(":", 1)[0] or None

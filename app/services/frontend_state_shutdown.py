@@ -33,6 +33,7 @@ _REQUIRED_STEPS = frozenset(
 _GUARDIAN_LOCK = threading.RLock()
 _GUARDIANS: dict[int, "_FrontendShutdownState"] = {}
 _REAL_SLEEP = time.sleep
+_MAX_FRONTEND_SHUTDOWN_ATTEMPTS = 24
 
 
 class _FrontendShutdownState:
@@ -64,6 +65,12 @@ def destroy_frontend_state_service(host: Any) -> bool:
 def _destroy_pass(host: Any) -> tuple[bool, list[BaseException]]:
     failures: list[BaseException] = []
     completed_steps: set[str] = set()
+
+    try:
+        setattr(host, "_is_shutting_down", True)
+    except BaseException as exc:
+        failures.append(exc)
+        log_shutdown_exception_safely("FrontendStateService", "destroy.shutting_down", exc)
 
     def record_failure(action: str, exc: BaseException) -> None:
         failures.append(exc)
@@ -193,8 +200,10 @@ def _ensure_frontend_shutdown_guardian(host: Any, state: _FrontendShutdownState)
 def _retry_frontend_shutdown(host: Any, key: int, state: _FrontendShutdownState) -> None:
     delay = 0.01
     logged_failure = False
+    attempts = 0
     try:
-        while True:
+        while attempts < _MAX_FRONTEND_SHUTDOWN_ATTEMPTS:
+            attempts += 1
             _REAL_SLEEP(delay)
             with state.lock:
                 completed, failures = _destroy_pass(host)

@@ -374,6 +374,19 @@
     renderQueue();
   }
 
+  function patchActiveProgressCells() {
+    const items = Array.isArray(currentState().active_downloads) ? currentState().active_downloads : [];
+    const body = byId("activeBody");
+    if (!body || typeof body.querySelectorAll !== "function") return;
+    const byItemId = new Map(items.map(item => [String(item.id), item]));
+    body.querySelectorAll("tr[data-id]").forEach(row => {
+      const item = byItemId.get(String(row.getAttribute("data-id") || ""));
+      const cell = item && row.cells ? row.cells[2] : null;
+      if (!cell) return;
+      cell.innerHTML = taskRenderService().progressHtml(item.progress);
+    });
+  }
+
   function renderActive() {
     syncActiveDownloadOptions();
     const items = Array.isArray(currentState().active_downloads) ? currentState().active_downloads : [];
@@ -719,6 +732,7 @@
     configure,
     renderQueue,
     renderActive,
+    patchActiveProgressCells,
     renderCompleted,
     renderFailed,
     selectActive,

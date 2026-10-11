@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import os
 import subprocess
 from typing import Callable
 
@@ -83,46 +82,23 @@ class WebDirectoryService:
             return null_byte_error
 
         try:
-            path = self._require_allowed_directory(context, path)
-        except PermissionError as exc:
-            return error_result(str(exc), http_status=403, path=path)
-
-        try:
-            exists, subdirs = await asyncio.get_running_loop().run_in_executor(
+            exists, subdirs, parent, drives = await asyncio.get_running_loop().run_in_executor(
                 None,
-                self._collect_subdirectories,
+                context.snapshot_authorized_subdirectories,
                 path,
             )
             if not exists:
                 return error_result("目录不存在", http_status=404, path=path)
-            parent_candidate = os.path.dirname(path) if path else ""
-            parent = parent_candidate if parent_candidate and context.is_directory_allowed(parent_candidate) else ""
-            drives = [{"name": root, "path": root} for root in sorted(context.approved_roots_snapshot())]
             return {
                 "current": path,
                 "parent": parent,
                 "subdirs": subdirs,
                 "drives": drives,
             }
-        except PermissionError:
-            return error_result("无权限访问该目录", http_status=403, path=path)
+        except PermissionError as exc:
+            return error_result(str(exc), http_status=403, path=path)
         except OSError as exc:
             return error_result(str(exc), http_status=500, path=path)
-
-    @staticmethod
-    def _collect_subdirectories(path: str) -> tuple[bool, list[dict[str, str]]]:
-        if not os.path.exists(path):
-            return False, []
-        subdirs: list[dict[str, str]] = []
-        entries = os.listdir(path)
-        for name in sorted(entries, key=str.lower):
-            full = os.path.join(path, name)
-            try:
-                if os.path.isdir(full) and not name.startswith("."):
-                    subdirs.append({"name": name, "path": full})
-            except PermissionError:
-                continue
-        return True, subdirs
 
     async def change_dir(self, request: Request) -> dict:
         try:
@@ -142,17 +118,17 @@ class WebDirectoryService:
             if null_byte_error is not None:
                 return null_byte_error
             try:
-                directory = self._require_allowed_directory(context, directory)
+                with context.open_operation_directory(directory) as opened:
+                    directory = opened or directory
+                    log_web_event(
+                        "WebDirectoryService",
+                        "change_dir_start",
+                        "开始切换目录",
+                        context={"directory": directory},
+                    )
+                    update = await session_controller.async_change_dir(directory)
             except PermissionError as exc:
                 return error_result(str(exc), http_status=403)
-
-            log_web_event(
-                "WebDirectoryService",
-                "change_dir_start",
-                "开始切换目录",
-                context={"directory": directory},
-            )
-            update = await session_controller.async_change_dir(directory)
             if update is None:
                 return error_result("目录扫描失败", http_status=500, directory=directory)
             result, outcome = update

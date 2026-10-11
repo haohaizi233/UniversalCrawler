@@ -149,7 +149,7 @@ def test_media_response_cannot_follow_a_final_child_symlink_swap(
         probe.symlink_to(outside)
         probe.unlink()
     except OSError as exc:
-        pytest.skip(f"file symlink creation unavailable: {exc}")
+        pytest.fail(f"file symlink creation unavailable: {exc}; enable Developer Mode or run elevated - symlink attack coverage must not be silently skipped")
     context = _MediaContext(
         controller=SimpleNamespace(get_media_path=lambda _video_id: os.fspath(media)),
         approved_root_grants_snapshot=lambda: (_root_grant(approved),),
@@ -631,7 +631,7 @@ def test_debug_artifact_response_pins_the_open_file_generation(
         artifact.symlink_to(outside)
     except (NotImplementedError, OSError) as exc:
         response._approved_file_lease.close()
-        pytest.skip(f"file symlinks are unavailable: {exc}")
+        pytest.fail(f"file symlinks are unavailable: {exc}; enable Developer Mode or run elevated - symlink attack coverage must not be silently skipped")
 
     try:
         body = asyncio.run(_response_body(response))

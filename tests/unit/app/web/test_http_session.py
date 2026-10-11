@@ -207,7 +207,7 @@ class HttpSessionCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("set-cookie", response.headers)
         self.assertFalse(call_next_called)
 
-    def test_csrf_cookie_is_accepted_as_double_submit_session_token(self) -> None:
+    def test_csrf_cookie_is_not_accepted_as_session_token(self) -> None:
         context = self.registry.get_or_create("session-a")
         request = self._request(
             client_host="192.0.2.10",
@@ -218,7 +218,56 @@ class HttpSessionCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         )
         request.state.session_context = context
 
+        self.assertFalse(self.coordinator.has_valid_session_token(request, context))
+
+    def test_custom_header_is_the_only_accepted_session_token(self) -> None:
+        context = self.registry.get_or_create("session-a")
+        request = self._request(
+            client_host="192.0.2.10",
+            cookies={"ucrawl_session": "session-a"},
+            headers={"X-Ucrawl-Session-Token": context.csrf_token},
+        )
+        request.state.session_context = context
+
         self.assertTrue(self.coordinator.has_valid_session_token(request, context))
+
+    async def test_public_page_without_token_does_not_create_controller(self) -> None:
+        request = self._request(client_host="127.0.0.1")
+        request.url.path = "/"
+
+        async def call_next(_request):
+            return JSONResponse({"status": "ok"})
+
+        response = await self.coordinator.handle(request, call_next)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers.get("referrer-policy"), "no-referrer")
+        self.assertEqual(self.registry._contexts, {})
+
+    async def test_cross_site_loopback_origin_is_rejected_before_session(self) -> None:
+        request = self._request(
+            client_host="127.0.0.1",
+            headers={"origin": "http://127.0.0.1:9999"},
+        )
+
+        async def call_next(_request):
+            raise AssertionError("cross-site request must not reach the application")
+
+        response = await self.coordinator.handle(request, call_next)
+
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(self.registry._contexts, {})
+
+    async def test_cookieless_loopback_requests_reuse_the_default_session(self) -> None:
+        async def call_next(_request):
+            return JSONResponse({"status": "ok"})
+
+        first = await self.coordinator.handle(self._request(client_host="127.0.0.1"), call_next)
+        second = await self.coordinator.handle(self._request(client_host="127.0.0.1"), call_next)
+
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(second.status_code, 200)
+        self.assertEqual(set(self.registry._contexts), {"default"})
 
     def test_request_context_missing_from_middleware_fails_closed(self) -> None:
         request = self._request(client_host="127.0.0.1")

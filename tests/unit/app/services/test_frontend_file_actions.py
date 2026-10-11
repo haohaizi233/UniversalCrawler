@@ -48,5 +48,15 @@ def test_open_file_path_rejects_missing_file(tmp_path):
 def test_current_executable_path_uses_frozen_executable(monkeypatch):
     monkeypatch.setattr(file_actions.sys, "frozen", True, raising=False)
     monkeypatch.setattr(file_actions.sys, "executable", r"C:\App\UniversalCrawlerPro.exe")
+    monkeypatch.setattr(file_actions.sys, "argv", [r"D:\src\entry\gui_entry.py"])
 
     assert file_actions.current_executable_path() == r"C:\App\UniversalCrawlerPro.exe"
+
+
+def test_current_executable_path_ignores_script_argv_when_not_frozen(monkeypatch):
+    monkeypatch.setattr(file_actions.sys, "frozen", False, raising=False)
+    monkeypatch.setattr(file_actions.sys, "executable", r"C:\Python312\python.exe")
+    monkeypatch.setattr(file_actions.sys, "argv", [r"D:\src\entry\gui_entry.py"])
+
+    assert file_actions.current_executable_path() == r"C:\Python312\python.exe"
+    assert not file_actions.current_executable_path().endswith(".py")

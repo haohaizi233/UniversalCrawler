@@ -560,7 +560,14 @@ function renderFrontendSections(sections) {
   const shouldRenderActive =
     currentPage === "active" &&
     (sections.has("active_downloads") || sections.has("download_options") || sections.has("settings_snapshot"));
-  if (shouldRenderActive) renderActive();
+  const progressOnlyActive =
+    currentPage === "active" &&
+    sections.progressOnly === true &&
+    sections.has("active_downloads") &&
+    !sections.has("download_options") &&
+    !sections.has("settings_snapshot");
+  if (progressOnlyActive) listPagesService().patchActiveProgressCells();
+  else if (shouldRenderActive) renderActive();
   if (sections.has("completed_items") && currentPage === "completed") renderCompleted();
   if (sections.has("failed_items") && currentPage === "failed") renderFailed();
   if (sections.has("log_items") && currentPage === "logs") renderLogs();

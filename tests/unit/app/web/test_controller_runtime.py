@@ -78,6 +78,62 @@ class WebControllerRuntimeTests(unittest.TestCase):
         controller.bridge.emit.assert_not_called()
         controller._dl_manager.add_task.assert_not_called()
 
+    def test_spider_items_emit_only_after_enqueue_and_drop_stopped_session(self):
+        from app.web.controller import WebController
+
+        controller = WebController(None, lambda *_args, **_kwargs: None)
+        timeline: list[str] = []
+        controller.bridge.emit = Mock(side_effect=lambda event_type, data=None: timeline.append(event_type))
+        controller.current_save_dir = "downloads"
+
+        def add_task(_item, _save_dir):
+            self.assertNotIn("item_found", timeline)
+            timeline.append("enqueue")
+            return True
+
+        controller._dl_manager = SimpleNamespace(video_only=False, add_task=Mock(side_effect=add_task))
+        session_id = controller._open_spider_intake_session()
+        item = VideoItem(url="https://example.com/a.mp4", title="a", source="douyin")
+
+        with patch("app.web.controller.debug_logger", Mock()):
+            controller._on_spider_items_found([item], session_id=session_id)
+
+        self.assertEqual(timeline[:2], ["enqueue", "item_found"])
+        self.assertIn(item.id, controller.videos)
+
+        late = VideoItem(url="https://example.com/late.mp4", title="late", source="douyin")
+        spider = Mock()
+        spider.isRunning.return_value = False
+        controller.current_spider = spider
+        with patch("app.web.controller.debug_logger", Mock()):
+            controller._do_stop_crawl()
+            controller._on_spider_items_found([late], session_id=session_id)
+
+        self.assertNotIn(late.id, controller.videos)
+        self.assertEqual(timeline.count("enqueue"), 1)
+        self.assertNotIn("item_found", timeline[timeline.index("enqueue") + 2 :])
+
+    def test_spider_enqueue_failure_does_not_emit_item_found(self):
+        from app.web.controller import WebController
+
+        controller = WebController(None, lambda *_args, **_kwargs: None)
+        controller.bridge.emit = Mock()
+        controller.current_save_dir = "downloads"
+        controller._dl_manager = SimpleNamespace(
+            video_only=False,
+            add_task=Mock(side_effect=RuntimeError("queue closed")),
+        )
+        session_id = controller._open_spider_intake_session()
+        item = VideoItem(url="https://example.com/fail.mp4", title="fail", source="douyin")
+
+        with patch("app.web.controller.debug_logger", Mock()):
+            controller._on_spider_items_found([item], session_id=session_id)
+
+        self.assertNotIn(item.id, controller.videos)
+        emitted = [call.args[0] for call in controller.bridge.emit.call_args_list if call.args]
+        self.assertNotIn("item_found", emitted)
+        self.assertIn("log", emitted)
+
 
     def test_shutdown_does_not_create_download_manager_for_idle_session(self):
         from app.web.controller import WebController

@@ -188,6 +188,7 @@ class _FakeToolRunner:
                 run_id=run_id,
                 tool_id=str(record.get("tool_id") or ""),
                 output_paths=output_paths,
+                provenance=str(record.get("provenance") or ""),
                 structured_data=record.get("_structured_data") or {},
                 private_data=record.get("_private_data") or {},
             )
@@ -240,6 +241,7 @@ def _record(
         "finished_at": 1_700_000_000 if status == "succeeded" else None,
         "result": result if status == "succeeded" else None,
     }
+    record["provenance"] = "builtin"
     record["_structured_data"] = deepcopy(structured_data or result["data"])
     record["_private_data"] = deepcopy(private_data or {})
     record["_private_owner_id"] = private_owner_id
@@ -852,7 +854,7 @@ def test_tool_start_surfaces_runner_denials_and_capacity_as_errors(
 
 
 def test_tool_cancel_surfaces_owner_denial_as_error(tmp_path: Path) -> None:
-    runner = _FakeToolRunner()
+    runner = _FakeToolRunner(records=[_record(run_id="run-other", status="running")])
     runner.cancel = Mock(
         return_value={
             "status": "forbidden",
@@ -1687,3 +1689,127 @@ def test_frontend_real_runner_keeps_public_projection_safe_and_private_open_owne
         assert "parameters" not in terminal
     finally:
         assert runner.shutdown(wait=True, timeout=2.0) is True
+
+
+def test_snapshot_keeps_a_stable_tool_and_projects_each_tool(tmp_path: Path) -> None:
+    parser = _record(run_id="parser-run", tool_id="link_parser", status="succeeded")
+    verify = _record(run_id="verify-run", tool_id="file_verify", status="running")
+    runner = _FakeToolRunner(records=[parser, verify])
+    runner.manifests.append(
+        {
+            "id": "link_parser",
+            "title": "链接解析",
+            "summary": "解析链接",
+            "cancellable": True,
+            "input_schema": {},
+        }
+    )
+    profile = _desktop_profile(tmp_path)
+
+    with _service(tmp_path, runner, execution_profile=profile) as service:
+        first = service._toolbox_snapshot_parts()
+        runner.records.insert(
+            0,
+            _record(run_id="newer-verify", tool_id="file_verify", status="running"),
+        )
+        second = service._toolbox_snapshot_parts()
+
+    assert first["toolbox_selected_tool_id"] == "link_parser"
+    projections = {
+        item["tool_id"]: item
+        for item in first["toolbox_display_batch"]["projections"]
+    }
+    assert projections["link_parser"]["run_id"] == "parser-run"
+    assert projections["file_verify"]["run_id"] == "verify-run"
+    assert projections["link_parser"]["action_payloads"]["tool_cancel"] == {
+        "tool_id": "link_parser",
+        "run_id": "parser-run",
+    }
+    assert second["toolbox_selected_tool_id"] == "link_parser"
+    assert second["toolbox_display_projection"]["tool_id"] == "link_parser"
+    assert second["toolbox_display_projection"]["run_id"] == "parser-run"
+    refreshed = {
+        item["tool_id"]: item
+        for item in second["toolbox_display_batch"]["projections"]
+    }
+    assert refreshed["file_verify"]["run_id"] == "newer-verify"
+
+
+def test_cancel_and_open_require_the_same_tool_and_run(tmp_path: Path) -> None:
+    output = tmp_path / "result.json"
+    output.write_text("{}", encoding="utf-8")
+    runner = _FakeToolRunner(
+        records=[
+            _record(run_id="run-active", status="running"),
+            _record(run_id="run-finished", output_path=output),
+        ]
+    )
+    opener = Mock()
+    profile = _desktop_profile(tmp_path)
+
+    with _service(
+        tmp_path,
+        runner,
+        opener=opener,
+        execution_profile=profile,
+    ) as service:
+        cancelled = service.handle_action(
+            "tool_cancel",
+            {"tool_id": "other-tool", "run_id": "run-active"},
+        )
+        opened = service.handle_action(
+            "tool_open_result",
+            {"tool_id": "other-tool", "result_id": "run-finished"},
+        )
+
+    assert cancelled["status"] == "error"
+    assert opened["status"] == "error"
+    assert not any(call[0] == "cancel" for call in runner.calls)
+    opener.assert_not_called()
+
+
+def test_open_result_rechecks_the_stored_provenance(tmp_path: Path) -> None:
+    plugin = tmp_path / "plugin.py"
+    plugin.write_text("plugin\n", encoding="utf-8")
+    output = tmp_path / "result.json"
+    output.write_text("{}", encoding="utf-8")
+    record = _record(output_path=output)
+    record["provenance"] = f"external:{plugin.resolve()}"
+    denied = _desktop_profile(tmp_path, owner_id="desktop:denied")
+    allowed = local_execution_profile(
+        host_surface="test",
+        owner_id="desktop:allowed",
+        approved_roots=(tmp_path,),
+        tool_permissions=("read_file", "write_file", "destructive", "process", "network"),
+        allow_external_plugins=True,
+    )
+    denied_runner = _FakeToolRunner(records=[deepcopy(record)])
+    allowed_runner = _FakeToolRunner(records=[deepcopy(record)])
+    denied_opener = Mock()
+    allowed_opener = Mock()
+
+    with _service(
+        tmp_path,
+        denied_runner,
+        opener=denied_opener,
+        execution_profile=denied,
+    ) as service:
+        rejected = service.handle_action(
+            "tool_open_result",
+            {"tool_id": "file_verify", "result_id": "run-finished"},
+        )
+    with _service(
+        tmp_path,
+        allowed_runner,
+        opener=allowed_opener,
+        execution_profile=allowed,
+    ) as service:
+        accepted = service.handle_action(
+            "tool_open_result",
+            {"tool_id": "file_verify", "result_id": "run-finished"},
+        )
+
+    assert rejected["status"] == "error"
+    denied_opener.assert_not_called()
+    assert accepted["status"] == "ok"
+    allowed_opener.assert_called_once()

@@ -407,7 +407,11 @@ def test_toolbox_actions_use_new_contract_with_legacy_start_fallback() -> None:
         "parameters": {"source": "input.mp4"},
     }
     assert result["cancelPayload"] == {"tool_id": "media_probe", "run_id": "run-7"}
-    assert result["openPayload"] == {"tool_id": "media_probe", "result_id": "result-9"}
+    assert result["openPayload"] == {
+        "tool_id": "media_probe",
+        "result_id": "result-9",
+        "run_id": "run-7",
+    }
 
 
 def test_toolbox_runtime_consumes_delta_sections_without_polling() -> None:
@@ -1046,6 +1050,42 @@ def test_toolbox_projection_reducer_preserves_form_across_progress_only_delta() 
     assert result["progress"] == {"value": 28, "text": "2 / 7"}
     assert result["form"]["fields"] == [{"id": "source", "type": "text"}]
     assert result["form"]["values"] == {"source": "D:/media/demo.mp4"}
+
+
+def test_toolbox_projection_without_tool_id_is_not_applied_to_selected_tool() -> None:
+    result = _run_toolbox_contract(
+        """
+(() => {
+  const snapshot = {
+    toolbox_selected_tool_id: "file_verify",
+    toolbox_display_projection: {
+      state: "running",
+      form: { values: { source: "secret-path" } }
+    },
+    toolbox_execution: {
+      status: "running",
+      run_id: "run-secret",
+      message: "secret-status"
+    }
+  };
+  return {
+    selected: contract.projectionFor(snapshot, "file_verify"),
+    other: contract.projectionFor(snapshot, "media_probe"),
+    selectedExecution: contract.executionFor(snapshot, "file_verify"),
+    otherExecution: contract.executionFor(snapshot, "media_probe")
+  };
+})()
+"""
+    )
+
+    assert result["selected"].get("state") != "running"
+    assert "secret-path" not in str(result["selected"])
+    assert "secret-path" not in str(result["other"])
+    assert result["selectedExecution"]["runId"] == ""
+    assert result["selectedExecution"]["status"] != "running"
+    assert result["otherExecution"]["runId"] == ""
+    assert "secret-status" not in str(result["selectedExecution"])
+    assert "secret-status" not in str(result["otherExecution"])
 
 
 def test_toolbox_styles_use_theme_tokens_and_responsive_constraints() -> None:

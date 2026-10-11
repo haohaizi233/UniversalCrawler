@@ -90,18 +90,18 @@
   function reduceProjectionCache(previous, snapshot) {
     const source = record(snapshot); const cache = Object.fromEntries(Object.entries(record(previous)).map(([id, value]) => [id, merge({}, value)]));
     const apply = candidate => {
-      const projection = record(candidate); const id = String(first(projection.tool_id, projection.id, projection.selected_tool_id, source.toolbox_selected_tool_id, ""));
+      const projection = record(candidate); const id = String(first(projection.tool_id, projection.id, projection.selected_tool_id, ""));
       if (!id) return ""; cache[id] = merge(cache[id], projection); cache[id].tool_id = id; return id;
     };
     PROJECTION_KEYS.forEach(key => { if (source[key] && typeof source[key] === "object" && !Array.isArray(source[key])) apply(source[key]); });
     BATCH_KEYS.forEach(key => {
       const batch = source[key]; const sourceBatch = record(batch); const touched = (Array.isArray(batch) ? batch : batchRows(sourceBatch)).map(apply).filter(Boolean);
-      const target = String(first(sourceBatch.selected_tool_id, touched[0], source.toolbox_selected_tool_id, Object.keys(cache).length === 1 ? Object.keys(cache)[0] : ""));
+      const target = String(first(sourceBatch.selected_tool_id, touched[0], ""));
       if (target && Array.isArray(sourceBatch.history)) cache[target] = merge(cache[target], { tool_id: target, history: sourceBatch.history });
     });
     return cache;
   }
-  function projectionFor(snapshot, toolId) { const cache = reduceProjectionCache({}, snapshot); return cache[String(toolId)] || (Object.keys(cache).length === 1 ? cache[Object.keys(cache)[0]] : {}); }
+  function projectionFor(snapshot, toolId) { const cache = reduceProjectionCache({}, snapshot); return cache[String(toolId)] || {}; }
   function projectionFields(projection) {
     const source = record(projection); const form = record(source.form);
     for (const value of [form.fields, source.parameter_fields, source.parameters]) {
@@ -153,6 +153,7 @@
     if (["validate", "start"].includes(kind)) payload.parameters = { ...record(values) };
     if (kind === "cancel" && first(source.runId, source.run_id, source.execution_id)) payload.run_id = String(first(source.runId, source.run_id, source.execution_id));
     if (kind === "openResult" && first(source.resultId, source.result_id, record(source.result).id, record(source.result).result_id)) payload.result_id = String(first(source.resultId, source.result_id, record(source.result).id, record(source.result).result_id));
+    if (kind === "openResult" && first(source.runId, source.run_id, source.execution_id)) payload.run_id = String(first(source.runId, source.run_id, source.execution_id));
     if (kind === "admitCandidates") {
       payload.run_id = String(first(source.runId, source.run_id, ""));
       const candidateIds = Array.isArray(source.candidateIds)
@@ -214,7 +215,7 @@
   function normalizeStatus(value) { const key = String(value || "idle").toLowerCase(); return STATUS[key] || key; }
   function normalizeProgress(source) { const value = record(source); const raw = first(value.progress, value.percent, 0); const nested = record(raw); const amount = Number(first(nested.value, nested.percent, raw, 0)); return { progress: Number.isFinite(amount) ? Math.max(0, Math.min(100, amount)) : 0, progressText: String(first(nested.text, nested.label, value.progress_text, value.progressText, "")), progressIndeterminate: !!first(nested.indeterminate, value.progress_indeterminate, value.progressIndeterminate, false) }; }
   function executionFor(snapshot, toolId) {
-    const projection = projectionFor(snapshot, toolId); const direct = record(record(snapshot).toolbox_execution); const source = String(first(direct.tool_id, direct.id, toolId, "")) === String(toolId || "") ? merge(projection, direct) : projection; const progress = normalizeProgress(source); const validation = record(source.validation); const result = record(source.result);
+    const projection = projectionFor(snapshot, toolId); const direct = record(record(snapshot).toolbox_execution); const executionId = String(first(direct.tool_id, direct.id, "")); const source = executionId && executionId === String(toolId || "") ? merge(projection, direct) : projection; const progress = normalizeProgress(source); const validation = record(source.validation); const result = record(source.result);
     return { status: normalizeStatus(first(source.state, source.status, source.phase, "idle")), statusText: String(first(source.status_text, source.statusText, "")), runId: String(first(source.run_id, source.runId, source.execution_id, "")), result, resultPath: String(first(source.result_path, source.resultPath, result.path, result.file_path, "")), message: String(first(source.message, "")), error: String(first(source.error, source.error_message, "")), validationMessage: String(first(validation.message, source.validation_message, "")), validationErrors: record(first(validation.errors, source.validation_errors, source.errors, {})), canCancel: actionEnabled(source, "tool_cancel", false), canOpenResult: actionEnabled(source, "tool_open_result", !!Object.keys(result).length), ...progress };
   }
   function historyFor(snapshot, toolId) { const projection = projectionFor(snapshot, toolId); const rows = Array.isArray(projection.history) ? projection.history : (Array.isArray(record(snapshot).toolbox_recent_items) ? record(snapshot).toolbox_recent_items : []); return rows.map(row => { const source = record(row); return { ...source, historyId: String(first(source.id, source.history_id, source.result_id, "")), title: String(first(source.title, source.tool_title, "")), timestamp: String(first(source.finished_at, source.last_used, source.time_display, "")), status: normalizeStatus(first(source.state, source.status, "idle")), statusText: String(first(source.status_text, "")), canOpenResult: actionEnabled(source, "tool_open_result", !!first(source.result_id, source.path, false)) }; }); }

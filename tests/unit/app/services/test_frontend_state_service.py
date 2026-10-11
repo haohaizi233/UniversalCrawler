@@ -708,7 +708,7 @@ class FrontendStateServiceTests(unittest.TestCase):
                     {"section": "logging", "key": "retention_days", "value": 3},
                 )
                 self.assertEqual(result["status"], "ok")
-                self.assertTrue(configure_logger.call_args.kwargs["cleanup_old_logs"])
+                self.assertFalse(configure_logger.call_args.kwargs["cleanup_old_logs"])
                 self.assertEqual(configure_logger.call_args.kwargs["retention_days"], 3)
 
                 request_prune = Mock()
@@ -907,7 +907,62 @@ class FrontendStateServiceTests(unittest.TestCase):
             window._apply_playback_runtime_settings.assert_called_once_with()
             window._apply_platform_runtime_setting.assert_called_once_with("bilibili", "max_pages", 2)
 
-    def test_logging_retention_cleanup_runs_on_frontend_service_initialization(self):
+    def test_retention_days_update_cleans_logs_only_when_startup_cleanup_is_enabled(self):
+        with TemporaryDirectory() as temp_dir:
+            manager = ConfigManager(str(Path(temp_dir) / "config.json"))
+            service = FrontendStateService(config_manager=manager)
+
+            with patch("app.services.frontend_state_service.debug_logger.configure") as configure_logger:
+                refused = service.handle_action(
+                    "update_setting",
+                    {"section": "logging", "key": "retention_days", "value": 3},
+                )
+                self.assertEqual(refused["status"], "ok")
+                self.assertFalse(configure_logger.call_args.kwargs["cleanup_old_logs"])
+
+                manager.set("logging", "cleanup_old_logs_on_start", True)
+                self.assertTrue(manager.event_bus.wait_for_async_idle(timeout=1.0))
+                allowed = service.handle_action(
+                    "update_setting",
+                    {"section": "logging", "key": "retention_days", "value": 7},
+                )
+                self.assertEqual(allowed["status"], "ok")
+                self.assertTrue(configure_logger.call_args.kwargs["cleanup_old_logs"])
+                self.assertEqual(configure_logger.call_args.kwargs["retention_days"], 7)
+
+    def test_toolbox_selection_is_not_replaced_by_projection_or_recent_history(self):
+        service = FrontendStateService()
+        items = [{"id": "link_parser"}, {"id": "file_verify"}]
+        records = [{"tool_id": "file_verify", "id": "run-1"}]
+
+        self.assertEqual(service._stable_toolbox_tool_id(items, records), "file_verify")
+        newer = [{"tool_id": "link_parser", "id": "run-2"}, *records]
+        self.assertEqual(service._stable_toolbox_tool_id(items, newer), "file_verify")
+        service._remember_toolbox_tool("link_parser")
+        self.assertEqual(service._stable_toolbox_tool_id(items, records), "link_parser")
+        self.assertEqual(
+            FrontendStateService._stable_toolbox_selected_tool_id(
+                {
+                    "toolbox_selected_tool_id": "file_verify",
+                    "toolbox_display_projection": {"tool_id": "link_parser"},
+                    "toolbox_recent_items": [{"tool_id": "link_parser"}],
+                    "toolbox_items": items,
+                }
+            ),
+            "file_verify",
+        )
+        self.assertEqual(
+            FrontendStateService._stable_toolbox_selected_tool_id(
+                {
+                    "toolbox_display_projection": {"tool_id": "file_verify"},
+                    "toolbox_recent_items": records,
+                    "toolbox_items": items,
+                }
+            ),
+            "link_parser",
+        )
+
+    def test_logging_retention_cleanup_follows_cleanup_old_logs_on_start(self):
         with TemporaryDirectory() as temp_dir:
             manager = ConfigManager(str(Path(temp_dir) / "config.json"))
             manager.set("logging", "retention_days", 3)
@@ -917,6 +972,12 @@ class FrontendStateServiceTests(unittest.TestCase):
 
             configure_logger.assert_called()
             self.assertEqual(configure_logger.call_args.kwargs["retention_days"], 3)
+            self.assertFalse(configure_logger.call_args.kwargs["cleanup_old_logs"])
+
+            manager.set("logging", "cleanup_old_logs_on_start", True)
+            with patch("app.services.frontend_state_service.debug_logger.configure") as configure_logger:
+                FrontendStateService(config_manager=manager)
+
             self.assertTrue(configure_logger.call_args.kwargs["cleanup_old_logs"])
 
     def test_update_setting_rejects_invalid_extended_option(self):
@@ -2212,45 +2273,62 @@ class FrontendStateServiceTests(unittest.TestCase):
         self.assertEqual(result["status"], "ok")
         self.assertTrue(result["data"]["missing"])
 
-    def test_clear_queue_action_uses_controller_queue_handler(self):
+    def test_clear_queue_action_waits_for_blocking_ok_before_publishing(self):
         queued = VideoItem(url="https://example.com/q", title="queued", source="douyin")
         queued.status = VideoStatus.PENDING.label
         completed = VideoItem(url="https://example.com/done", title="done", source="douyin")
         completed.status = VideoStatus.COMPLETED.label
+        published: list[tuple[str, dict]] = []
         controller = SimpleNamespace(
             videos={queued.id: queued, completed.id: completed},
             _dl_manager=None,
-            on_clear_queue=Mock(),
+            on_clear_queue=Mock(side_effect=AssertionError("submit is not success")),
+            clear_queue_blocking=Mock(return_value={"status": "ok", "removed_ids": [queued.id]}),
         )
         service = FrontendStateService(controller)
+        service._emit_frontend_event = lambda topic, payload: published.append((topic, dict(payload)))  # type: ignore[method-assign]
 
         result = service.handle_action("clear_queue", {})
 
         self.assertEqual(result["status"], "ok")
         self.assertEqual(result["data"]["count"], 1)
         self.assertEqual(result["data"]["video_ids"], [queued.id])
-        controller.on_clear_queue.assert_called_once_with()
+        controller.clear_queue_blocking.assert_called_once()
+        self.assertEqual(controller.clear_queue_blocking.call_args.args[0].is_cancelled(), False)
+        controller.on_clear_queue.assert_not_called()
+        self.assertEqual(published, [("videos.clear_queue", {"video_ids": [queued.id], "count": 1})])
 
-    def test_clear_queue_action_fallback_removes_only_queue_items(self):
+    def test_clear_queue_action_does_not_report_success_when_cancelled_or_failed(self):
+        controller = SimpleNamespace(
+            videos={},
+            _dl_manager=None,
+            clear_queue_blocking=Mock(return_value={"status": "cancelled", "removed_ids": []}),
+        )
+        service = FrontendStateService(controller)
+        published: list[str] = []
+        service._emit_frontend_event = lambda topic, payload: published.append(topic)  # type: ignore[method-assign]
+
+        cancelled = service.handle_action("clear_queue", {})
+        self.assertEqual(cancelled["status"], "cancelled")
+        self.assertEqual(published, [])
+
+        controller.clear_queue_blocking.return_value = {"status": "error", "removed_ids": [], "message": "disk busy"}
+        failed = service.handle_action("clear_queue", {})
+        self.assertEqual(failed["status"], "error")
+        self.assertIn("disk busy", failed["message"])
+        self.assertEqual(published, [])
+
+    def test_clear_queue_action_without_blocking_api_does_not_remove_items(self):
         queued = VideoItem(url="https://example.com/q", title="queued", source="douyin")
         queued.status = VideoStatus.PENDING.label
-        active = VideoItem(url="https://example.com/a", title="active", source="douyin")
-        active.status = VideoStatus.DOWNLOADING.label
-        completed = VideoItem(url="https://example.com/done", title="done", source="douyin")
-        completed.status = VideoStatus.COMPLETED.label
-        controller = SimpleNamespace(
-            videos={queued.id: queued, active.id: active, completed.id: completed},
-            _dl_manager=None,
-        )
+        controller = SimpleNamespace(videos={queued.id: queued}, _dl_manager=None, on_clear_queue=Mock())
         service = FrontendStateService(controller)
 
         result = service.handle_action("clear_queue", {})
 
-        self.assertEqual(result["status"], "ok")
-        self.assertEqual(result["data"]["count"], 1)
-        self.assertNotIn(queued.id, controller.videos)
-        self.assertIn(active.id, controller.videos)
-        self.assertIn(completed.id, controller.videos)
+        self.assertEqual(result["status"], "error")
+        self.assertIn(queued.id, controller.videos)
+        controller.on_clear_queue.assert_not_called()
 
     def test_open_directory_action_uses_injected_service_boundary(self):
         with TemporaryDirectory() as temp_dir:
@@ -2948,6 +3026,116 @@ class FrontendStateServiceTests(unittest.TestCase):
         self.assertEqual(result["status"], "ok")
         self.assertEqual(result["message"], "日志缓存已刷新")
         self.assertEqual(service.app_state.get_log_buffer(), before)
+
+    def test_retry_failed_advances_queue_failed_and_status_before_ok(self):
+        item = VideoItem(url="https://example.com/failed", title="failed", source="douyin")
+        item.status = VideoStatus.FAILED.label
+        item.progress = 40
+        manager = SimpleNamespace(add_task=Mock(return_value=True))
+        controller = SimpleNamespace(videos={item.id: item}, _dl_manager=manager)
+        service = FrontendStateService(controller)
+        base_version = service.frontend_version
+
+        result = service.handle_action("retry_failed", {"video_id": item.id})
+        delta = service.get_delta(base_version)
+
+        self.assertEqual(result["status"], "ok")
+        self.assertGreater(service.frontend_version, base_version)
+        manager.add_task.assert_called_once()
+        for section in ("queue_items", "failed_items", "app_status"):
+            self.assertIn(section, delta["changed_sections"])
+        self.assertEqual(item.status, VideoStatus.PENDING.label)
+        self.assertEqual(item.progress, 0)
+
+    def test_retry_failed_returns_error_when_add_task_fails(self):
+        item = VideoItem(url="https://example.com/failed", title="failed", source="douyin")
+        item.status = VideoStatus.FAILED.label
+        item.progress = 80
+        manager = SimpleNamespace(add_task=Mock(side_effect=RuntimeError("queue closed")))
+        controller = SimpleNamespace(videos={item.id: item}, _dl_manager=manager)
+        service = FrontendStateService(controller)
+        base_version = service.frontend_version
+
+        result = service.handle_action("retry_failed", {"id": item.id})
+
+        self.assertEqual(result["status"], "error")
+        self.assertIn("queue closed", result["message"])
+        self.assertEqual(item.status, VideoStatus.FAILED.label)
+        self.assertEqual(item.progress, 80)
+        self.assertEqual(service.frontend_version, base_version)
+
+        manager.add_task.side_effect = None
+        manager.add_task.return_value = False
+        rejected = service.handle_action("retry_failed", {"id": item.id})
+        self.assertEqual(rejected["status"], "error")
+        self.assertEqual(service.frontend_version, base_version)
+
+    def test_handle_action_rejects_shutdown_before_destroy(self):
+        service = FrontendStateService()
+        service._is_shutting_down = True
+        result = service.handle_action("copy_diagnostics", {"video_id": "missing"})
+        self.assertEqual(result["status"], "error")
+        self.assertIn("shutting down", result["message"])
+        self.assertFalse(service._destroyed)
+
+        controller = SimpleNamespace(_shutdown_rejects_new_work=True, _dl_manager=None, clear_queue_blocking=Mock())
+        shutting_down = FrontendStateService(controller)
+        rejected = shutting_down.handle_action("clear_queue", {})
+        self.assertEqual(rejected["status"], "error")
+        controller.clear_queue_blocking.assert_not_called()
+
+        web_controller = SimpleNamespace(_is_shutting_down=True, _dl_manager=None)
+        web_service = FrontendStateService(web_controller)
+        self.assertEqual(web_service.handle_action("pause_download", {"id": "x"})["status"], "error")
+
+    def test_deleted_ids_skip_ids_that_are_still_in_the_current_section(self):
+        item = VideoItem(url="https://example.com/q", title="queued", source="douyin")
+        item.status = VideoStatus.PENDING.label
+        controller = SimpleNamespace(videos={item.id: item}, _dl_manager=None)
+        service = FrontendStateService(controller)
+
+        service.record_event("video_removed", {"video_id": item.id})
+        delta = service.get_delta(0)
+
+        self.assertNotIn(item.id, delta["deleted_ids"])
+
+    def test_progress_delta_does_not_carry_download_option_structure(self):
+        service = FrontendStateService()
+        base_version = service.frontend_version
+
+        service.record_event("videos.update", {"video_id": "v1", "progress": 42})
+        delta = service.get_delta(base_version)
+
+        self.assertEqual(delta["sections"]["active_downloads_update_kind"], "progress")
+        self.assertNotIn("download_options", delta["sections"])
+        self.assertNotIn("settings_snapshot", delta["sections"])
+        self.assertEqual(set(delta["changed_sections"]), {"active_downloads", "app_status"})
+
+        service.record_event("videos.update", {"video_id": "v1", "progress": 100})
+        terminal = service.get_delta(delta["version"])
+        self.assertEqual(terminal["sections"]["active_downloads_update_kind"], "structure")
+
+    def test_toolbox_snapshot_keeps_selected_tool_and_log_contract_is_a_full_section(self):
+        service = FrontendStateService()
+        snapshot = service.get_snapshot()
+
+        self.assertIn("log_contract", snapshot)
+        self.assertIn("toolbox_items", snapshot)
+        self.assertIn("toolbox_recent_items", snapshot)
+        self.assertIn("toolbox_display_projection", snapshot)
+        self.assertEqual(
+            snapshot["toolbox_selected_tool_id"],
+            str(snapshot["toolbox_display_projection"].get("tool_id") or ""),
+        )
+        self.assertTrue(snapshot["toolbox_selected_tool_id"])
+
+        partial = service.get_snapshot(sections=frozenset({"toolbox_items", "toolbox_recent_items", "toolbox_display_projection"}))
+        self.assertEqual(partial["toolbox_selected_tool_id"], snapshot["toolbox_selected_tool_id"])
+
+        delta = service.get_delta(-1)
+        self.assertIn("log_contract", delta["changed_sections"])
+        self.assertIn("log_contract", delta["sections"])
+        self.assertIn("toolbox_selected_tool_id", delta["sections"])
 
 if __name__ == "__main__":
     unittest.main()

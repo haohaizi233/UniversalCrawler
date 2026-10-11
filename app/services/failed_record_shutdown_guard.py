@@ -14,6 +14,7 @@ _GUARDIAN_LOCK = threading.RLock()
 _GUARDIANS: dict[int, list["_GuardianState"]] = {}
 _PENDING_RETRY_SECONDS = 0.05
 _MAX_EXCEPTION_RETRY_SECONDS = 1.0
+_MAX_DRAIN_ATTEMPTS = 24
 _MAX_DRAIN_DIAGNOSTIC_CATEGORIES = 16
 _TERMINAL_RETENTION_SECONDS = 5.0
 _FALLBACK_WAIT_LOCK = threading.Lock()
@@ -173,8 +174,10 @@ def failed_record_store_guardian_drained(store: Any) -> bool | None:
 def _drain_in_guardian(store: Any, store_key: int, state: _GuardianState) -> None:
     exception_delay = _PENDING_RETRY_SECONDS
     recorded_exception_categories: set[tuple[str, int]] = set()
+    attempts = 0
     try:
-        while True:
+        while attempts < _MAX_DRAIN_ATTEMPTS:
+            attempts += 1
             try:
                 if store.shutdown(timeout=1.0) is True:
                     with _GUARDIAN_LOCK:
@@ -208,7 +211,9 @@ def _drain_in_guardian(store: Any, store_key: int, state: _GuardianState) -> Non
 def _drain_synchronously(store: Any) -> bool:
     exception_delay = _PENDING_RETRY_SECONDS
     recorded_exception_categories: set[tuple[str, int]] = set()
-    while True:
+    attempts = 0
+    while attempts < _MAX_DRAIN_ATTEMPTS:
+        attempts += 1
         try:
             if store.shutdown(timeout=1.0) is True:
                 return True
@@ -231,6 +236,7 @@ def _drain_synchronously(store: Any) -> bool:
                 _MAX_EXCEPTION_RETRY_SECONDS,
                 max(_PENDING_RETRY_SECONDS, exception_delay * 2.0),
             )
+    return False
 
 
 def _wait_safely(seconds: float, action: str) -> None:

@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import sys
+import threading
 import time
 from time import monotonic as _monotonic
 from typing import Any, Callable, Coroutine
@@ -155,6 +157,112 @@ def merge_default_config(source: str, user_config: dict) -> dict:
     if source == "missav" and "proxy" in merged and merged["proxy"] is not None:
         merged["proxy"] = build_missav_proxy_url(merged["proxy"])
     return merged
+
+
+class _OnceDirectoryLease:
+    """Release one entered directory lease from either the request or watcher thread."""
+
+    def __init__(self, lease: Any) -> None:
+        self._lease = lease
+        self._lock = threading.Lock()
+        self._released = False
+
+    def __enter__(self) -> Any:
+        return self._lease.__enter__()
+
+    def release(self) -> None:
+        with self._lock:
+            if self._released:
+                return
+            self._released = True
+        self._lease.__exit__(None, None, None)
+
+
+def _spider_is_alive(spider: Any) -> bool:
+    if spider is None:
+        return False
+    probe = getattr(spider, "isRunning", None)
+    if not callable(probe):
+        probe = getattr(spider, "is_alive", None)
+    if not callable(probe):
+        return False
+    try:
+        return bool(probe())
+    except Exception:
+        return False
+
+
+def _retain_root_lease_until_spider_exits(controller: Any, lease: _OnceDirectoryLease) -> bool:
+    """Keep the root lease until the spider thread exits.
+
+    The root lease only adjusts reference counts, so its release can run on a
+    watcher thread after the request that started the crawl has returned.
+    """
+
+    spider = getattr(controller, "current_spider", None)
+    if not _spider_is_alive(spider):
+        return False
+
+    def _watch() -> None:
+        try:
+            wait = getattr(spider, "wait", None)
+            if callable(wait):
+                try:
+                    wait()
+                except Exception:
+                    logging.getLogger(__name__).exception(
+                        "crawl directory lease watcher failed while waiting for the spider"
+                    )
+            else:
+                while _spider_is_alive(spider):
+                    time.sleep(0.05)
+        finally:
+            try:
+                lease.release()
+            except BaseException:
+                logging.getLogger(__name__).exception(
+                    "crawl directory lease release failed"
+                )
+
+    watcher = threading.Thread(
+        target=_watch,
+        name="web-crawl-directory-lease",
+        daemon=True,
+    )
+    try:
+        watcher.start()
+    except RuntimeError:
+        return False
+    return True
+
+
+async def start_crawl_with_directory_lease(
+    context: Any,
+    payload: dict,
+    *,
+    log_error: bool,
+) -> dict:
+    """Authorize the save directory and hold that lease for the whole crawl."""
+
+    save_dir = payload.get("save_dir") if isinstance(payload, dict) else None
+    root_lease = _OnceDirectoryLease(context.lease_approved_root_grants_snapshot())
+    entered = False
+    retained = False
+    try:
+        root_lease.__enter__()
+        entered = True
+        with context.open_operation_directory(save_dir if save_dir else None) as opened:
+            request = dict(payload)
+            if opened:
+                request["save_dir"] = opened
+            result = await context.workflow.start_crawl(request, log_error=log_error)
+        if isinstance(result, dict) and result.get("status") == "ok":
+            retained = _retain_root_lease_until_spider_exits(context.controller, root_lease)
+        return result
+    finally:
+        if entered and not retained:
+            root_lease.release()
+
 
 class WebWorkflowService:
     """统一 WebUI REST / WS 工作流，减少路由层重复。"""
@@ -437,7 +545,7 @@ class WebWorkflowService:
             pending_item.status = VideoStatus.TIMED_OUT.label
         else:
             pending_item.status = VideoStatus.FAILED.label
-        pending_item.progress = 0
+        retained_progress = pending_item.progress
         if pending_item.meta is None:
             pending_item.meta = {}
         pending_item.meta["download_error"] = error_msg
@@ -447,7 +555,11 @@ class WebWorkflowService:
         )
         await self.broadcast(
             "video_state_changed",
-            build_video_state_event(pending_item.id, pending_item, requested_progress=0).to_payload(),
+            build_video_state_event(
+                pending_item.id,
+                pending_item,
+                requested_progress=retained_progress,
+            ).to_payload(),
         )
         await self._emit_log(f"❌ 下载失败: {error_msg}")
 

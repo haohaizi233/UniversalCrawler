@@ -11,7 +11,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from app.core.tools.builtin.link_parser import LINK_FORMAT_HINTS, normalize_link_url
-from app.core.tools.contracts import ToolContext
+from app.core.tools.contracts import ToolContext, ToolGrantEvaluator, ToolRequirements
 from app.debug_logger import debug_logger
 from app.services.frontend_action_result import FrontendActionResult
 from shared.execution_profile import (
@@ -59,6 +59,7 @@ class FrontendToolboxStateMixin:
                 "execution_profile and execution_profile_provider are mutually exclusive"
             )
         self._tool_execution_profile_lock = threading.RLock()
+        self._toolbox_selected_tool_id = ""
         self._tool_execution_profile_provider_is_default = (
             execution_profile is None and execution_profile_provider is None
         )
@@ -580,6 +581,12 @@ class FrontendToolboxStateMixin:
         normalized_tool_id = str(tool_id or (record or {}).get("tool_id") or "")
         if not normalized_tool_id and item_snapshot:
             normalized_tool_id = str(item_snapshot[0].get("id") or "")
+        if (
+            record is not None
+            and normalized_tool_id
+            and str(record.get("tool_id") or "") != normalized_tool_id
+        ):
+            record = None
         if record is None and normalized_tool_id:
             latest_records = self._tool_history_records(
                 execution_profile=profile,
@@ -672,6 +679,56 @@ class FrontendToolboxStateMixin:
             },
         }
 
+    def _remember_toolbox_tool(self, tool_id: str) -> None:
+        normalized = str(tool_id or "").strip()
+        if normalized:
+            self._toolbox_selected_tool_id = normalized
+
+    @staticmethod
+    def _toolbox_projection_ids(
+        items: Sequence[Mapping[str, Any]],
+        records: Sequence[Mapping[str, Any]],
+    ) -> list[str]:
+        ordered: list[str] = []
+        for item in items:
+            tool_id = str(item.get("id") or "")
+            if tool_id and tool_id not in ordered:
+                ordered.append(tool_id)
+        for record in records:
+            tool_id = str(record.get("tool_id") or "")
+            if tool_id and tool_id not in ordered:
+                ordered.append(tool_id)
+        return ordered
+
+    @staticmethod
+    def _latest_tool_record(
+        records: Sequence[Mapping[str, Any]],
+        tool_id: str,
+    ) -> Mapping[str, Any] | None:
+        for record in records:
+            if str(record.get("tool_id") or "") == tool_id:
+                return record
+        return None
+
+    def _stable_toolbox_tool_id(
+        self,
+        items: Sequence[Mapping[str, Any]],
+        records: Sequence[Mapping[str, Any]],
+    ) -> str:
+        available = self._toolbox_projection_ids(items, records)
+        selected = str(getattr(self, "_toolbox_selected_tool_id", "") or "")
+        if selected:
+            return selected
+        if records:
+            selected = str(records[0].get("tool_id") or "")
+        elif available:
+            selected = available[0]
+        else:
+            selected = ""
+        if selected:
+            self._toolbox_selected_tool_id = selected
+        return selected
+
     def _toolbox_snapshot_parts(self) -> dict[str, Any]:
         profile = self.tool_execution_profile
         items = self.toolbox_items(execution_profile=profile)
@@ -681,19 +738,43 @@ class FrontendToolboxStateMixin:
             items=items,
             records=records,
         )
-        selected_tool_id = str(recent[0].get("tool_id") or "") if recent else ""
-        if not selected_tool_id and items:
-            selected_tool_id = str(items[0].get("id") or "")
-        return {
-            "toolbox_items": items,
-            "toolbox_recent_items": recent,
-            "toolbox_display_projection": self._toolbox_projection(
-                selected_tool_id,
-                record=records[0] if records else None,
+        selected_tool_id = self._stable_toolbox_tool_id(items, records)
+        projections = [
+            self._toolbox_projection(
+                tool_id,
+                record=self._latest_tool_record(records, tool_id),
                 execution_profile=profile,
                 items=items,
                 history=recent,
+            )
+            for tool_id in self._toolbox_projection_ids(items, records)
+        ]
+        display = next(
+            (
+                projection
+                for projection in projections
+                if str(projection.get("tool_id") or "") == selected_tool_id
             ),
+            None,
+        )
+        if display is None:
+            display = self._toolbox_projection(
+                selected_tool_id,
+                record=self._latest_tool_record(records, selected_tool_id),
+                execution_profile=profile,
+                items=items,
+                history=recent,
+            )
+        return {
+            "toolbox_items": items,
+            "toolbox_recent_items": recent,
+            "toolbox_selected_tool_id": selected_tool_id,
+            "toolbox_display_projection": display,
+            "toolbox_display_batch": {
+                "selected_tool_id": selected_tool_id,
+                "projections": projections,
+                "history": recent,
+            },
         }
 
     @staticmethod
@@ -714,6 +795,7 @@ class FrontendToolboxStateMixin:
         tool_id = str(payload.get("tool_id") or payload.get("id") or "").strip()
         if not tool_id:
             return FrontendActionResult("error", "tool id is required")
+        self._remember_toolbox_tool(tool_id)
         try:
             parameters = self._tool_action_parameters(payload)
             validation = self.tool_runner_service.validate(
@@ -756,6 +838,7 @@ class FrontendToolboxStateMixin:
         tool_id = str(payload.get("tool_id") or payload.get("id") or "").strip()
         if not tool_id:
             return FrontendActionResult("error", "tool id is required")
+        self._remember_toolbox_tool(tool_id)
         try:
             parameters = self._tool_action_parameters(payload)
             run = self.tool_runner_service.run(
@@ -786,8 +869,27 @@ class FrontendToolboxStateMixin:
     ) -> FrontendActionResult:
         tool_id = str(payload.get("tool_id") or "").strip()
         run_id = str(payload.get("run_id") or "").strip()
-        if not run_id:
-            return FrontendActionResult("error", "run id is required", {"tool_id": tool_id})
+        if not tool_id or not run_id:
+            return FrontendActionResult(
+                "error",
+                "tool id and run id are required",
+                {"tool_id": tool_id, "run_id": run_id},
+            )
+        self._remember_toolbox_tool(tool_id)
+        current = self.tool_runner_service.get_run(
+            run_id,
+            execution_profile=execution_profile,
+        )
+        if (
+            not isinstance(current, Mapping)
+            or str(current.get("tool_id") or "") != tool_id
+            or str(current.get("run_id") or "") != run_id
+        ):
+            return FrontendActionResult(
+                "error",
+                "tool run is unavailable",
+                {"tool_id": tool_id, "run_id": run_id},
+            )
         run = self.tool_runner_service.cancel(
             run_id,
             execution_profile=execution_profile,
@@ -814,8 +916,13 @@ class FrontendToolboxStateMixin:
     ) -> FrontendActionResult:
         tool_id = str(payload.get("tool_id") or "").strip()
         run_id = str(payload.get("result_id") or payload.get("history_id") or "").strip()
-        if not run_id:
-            return FrontendActionResult("error", "result id is required", {"tool_id": tool_id})
+        if not tool_id or not run_id:
+            return FrontendActionResult(
+                "error",
+                "tool id and result id are required",
+                {"tool_id": tool_id, "run_id": run_id},
+            )
+        self._remember_toolbox_tool(tool_id)
         try:
             private_result = self.tool_runner_service.lookup_private_result(
                 run_id,
@@ -828,11 +935,25 @@ class FrontendToolboxStateMixin:
                 message="tool result is unavailable",
                 run_id=run_id,
             )
-        if private_result is None:
+        if (
+            private_result is None
+            or private_result.tool_id != tool_id
+            or private_result.run_id != run_id
+        ):
             return FrontendActionResult("error", "tool result is unavailable")
+        grant = ToolGrantEvaluator.evaluate(
+            requirements=ToolRequirements(),
+            declared_permissions=frozenset(),
+            provenance=str(private_result.provenance or ""),
+            execution_profile=execution_profile,
+        )
+        if not grant.allowed:
+            return FrontendActionResult(
+                "error",
+                grant.message or "tool result is unavailable",
+                {"run_id": run_id, "tool_id": tool_id, "code": grant.code},
+            )
         try:
-            if tool_id and private_result.tool_id != tool_id:
-                return FrontendActionResult("error", "tool result is unavailable")
             paths = tuple(Path(path) for path in private_result.output_paths)
         except Exception as exc:
             return self._tool_result_failure(
@@ -847,7 +968,7 @@ class FrontendToolboxStateMixin:
         context = ToolContext(
             parameters={},
             execution_profile=execution_profile,
-            provenance="builtin",
+            provenance=str(private_result.provenance or ""),
         )
         try:
             authorized_paths = tuple(context.authorize_path(path) for path in paths)

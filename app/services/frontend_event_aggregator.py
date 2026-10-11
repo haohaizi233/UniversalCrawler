@@ -33,7 +33,10 @@ STATIC_SECTIONS = frozenset(
         "download_options",
     }
 ) | TOOLBOX_SECTIONS
-ALL_FRONTEND_SECTIONS = VIDEO_SECTIONS | STATIC_SECTIONS | frozenset({"log_items"})
+ALL_FRONTEND_SECTIONS = VIDEO_SECTIONS | STATIC_SECTIONS | frozenset({"log_items", "log_contract"})
+_PROGRESS_ONLY_TOPICS = frozenset({"videos.update", "video_state_changed", "task_progress"})
+_PROGRESS_ONLY_SECTIONS = frozenset({"active_downloads", "app_status"})
+_UPSERT_TOPICS = frozenset({"videos.upsert", "videos.upsert_many"})
 
 NOISY_TOPICS = frozenset(
     {
@@ -180,6 +183,7 @@ class FrontendEventAggregator:
         self._max_pending_events = max(1, int(max_pending_events))
         self._section_history: deque[tuple[int, frozenset[str]]] = deque(maxlen=max(256, self._max_pending_events))
         self._deleted_history: deque[tuple[int, str]] = deque(maxlen=max(256, self._max_pending_events))
+        self._active_download_kinds: deque[tuple[int, str]] = deque(maxlen=max(256, self._max_pending_events))
         self._coalesced_count = 0
         self._dropped_count = 0
         self._recorded_count = 0
@@ -208,6 +212,8 @@ class FrontendEventAggregator:
             self._priority = max(self._priority, priority)
             self._remember_event(topic, payload, priority)
             self._remember_deleted_id(topic, payload, self._version)
+            self._forget_upserted_ids(topic, payload)
+            self._remember_active_download_kind(topic, payload, event_sections)
             return self.peek()
 
     def reset(self) -> None:
@@ -219,6 +225,7 @@ class FrontendEventAggregator:
             self._deleted_ids.clear()
             self._section_history.clear()
             self._deleted_history.clear()
+            self._active_download_kinds.clear()
             self._section_history.append((self._version, ALL_FRONTEND_SECTIONS))
 
     def peek(self) -> FrontendDirtyState:
@@ -304,6 +311,28 @@ class FrontendEventAggregator:
             }
             return tuple(sorted(deleted))
 
+    def active_downloads_update_kind_since(self, base_version: int) -> str:
+        """非终态进度只记 progress；出现结构变化时整段记为 structure。"""
+
+        with self._lock:
+            try:
+                base = int(base_version or 0)
+            except (TypeError, ValueError):
+                base = 0
+            if not self._active_download_kinds:
+                return "structure"
+            oldest_version = self._active_download_kinds[0][0]
+            if base < oldest_version - 1:
+                return "structure"
+            saw_progress = False
+            for version, kind in self._active_download_kinds:
+                if version <= base:
+                    continue
+                if kind == "structure":
+                    return "structure"
+                saw_progress = True
+            return "progress" if saw_progress else "structure"
+
     def _remember_event(self, topic: str, payload: Any, priority: FrontendEventPriority) -> None:
         """队列满时先丢低优先级事件；CRITICAL 事件至少会替换最旧事件。"""
         key = event_coalesce_key(topic, payload)
@@ -366,3 +395,62 @@ class FrontendEventAggregator:
     def _remember_deleted_value(self, video_id: str, version: int) -> None:
         self._deleted_ids.add(str(video_id))
         self._deleted_history.append((version, str(video_id)))
+
+    def _forget_upserted_ids(self, topic: str, payload: Any) -> None:
+        """重新写入的 id 不再属于删除历史，避免增量把仍在列表中的行报成已删除。"""
+
+        if topic not in _UPSERT_TOPICS or not isinstance(payload, dict):
+            return
+        for video_id in _payload_video_ids(payload):
+            self._forget_deleted_value(video_id)
+
+    def _forget_deleted_value(self, video_id: str) -> None:
+        normalized = str(video_id)
+        self._deleted_ids.discard(normalized)
+        if not any(existing == normalized for _version, existing in self._deleted_history):
+            return
+        retained = [
+            (version, existing)
+            for version, existing in self._deleted_history
+            if existing != normalized
+        ]
+        self._deleted_history = deque(retained, maxlen=self._deleted_history.maxlen)
+
+    def _remember_active_download_kind(self, topic: str, payload: Any, sections: frozenset[str]) -> None:
+        if "active_downloads" not in sections:
+            return
+        progress_only = (
+            str(topic or "") in _PROGRESS_ONLY_TOPICS
+            and sections <= _PROGRESS_ONLY_SECTIONS
+            and not _terminal_progress_payload(payload)
+        )
+        self._active_download_kinds.append((self._version, "progress" if progress_only else "structure"))
+
+
+def _payload_video_ids(payload: dict[str, Any]) -> list[str]:
+    ids: list[str] = []
+    for key in ("video_id", "id"):
+        value = payload.get(key)
+        if value:
+            ids.append(str(value))
+    raw_ids = payload.get("video_ids")
+    if isinstance(raw_ids, (list, tuple, set)):
+        ids.extend(str(value) for value in raw_ids if value)
+    elif raw_ids:
+        ids.append(str(raw_ids))
+    return ids
+
+
+def _terminal_progress_payload(payload: Any) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    status = str(payload.get("status") or "")
+    if any(marker in status for marker in ("完成", "失败", "超时", "本地")):
+        return True
+    if status.casefold() in {"completed", "failed", "timed_out", "local"}:
+        return True
+    try:
+        progress = int(payload.get("progress"))
+    except (TypeError, ValueError):
+        return False
+    return progress == 100

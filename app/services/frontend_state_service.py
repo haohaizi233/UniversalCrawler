@@ -19,8 +19,7 @@ from pathlib import Path
 from typing import Any
 
 from app.config import cfg
-from app.config.settings import CURRENT_FILENAME_TEMPLATE, get_setting_default
-from app.core.plugins.run_options import build_missav_proxy_url
+from app.config.settings import CURRENT_FILENAME_TEMPLATE
 from app.exceptions import ConfigValidationError, ConfigWriteError
 from app.debug_logger import debug_logger
 from app.core.plugin_registry import registry
@@ -31,6 +30,7 @@ from app.services.cache_service import CacheService
 from app.services import frontend_settings_adapter as settings_adapter
 from app.services.frontend_event_aggregator import (
     ALL_FRONTEND_SECTIONS,
+    TOOLBOX_SECTIONS,
     VIDEO_SECTIONS,
     FrontendEventAggregator,
     sections_for_topic,
@@ -53,6 +53,7 @@ from app.services.frontend_action_result import FrontendActionResult
 from app.services.frontend_link_candidate_admission import handle_frontend_link_candidate_admission
 from app.services.frontend_state_shutdown import destroy_frontend_state_service
 from app.services.frontend_toolbox_state import FrontendToolboxStateMixin
+from app.services.frontend_setting_actions import FrontendSettingActionsMixin
 from app.utils.filenames import sanitize_filename
 from app.utils.safe_slot import safe_slot
 from shared.settings_metadata import GROUP_DESCRIPTIONS, GROUP_HINTS, GROUP_ICONS
@@ -64,6 +65,18 @@ QUEUE_STATUSES = video_adapter.QUEUE_STATUSES
 UI_TITLE_STAGE_META_KEY = "ui_title_stage"
 UI_TITLE_TEMPLATE_META_KEY = "ui_title_template"
 DOWNLOAD_AUTO_RETRY_CACHE_KEY = "download.auto_retry"
+_OPTION_RESET_SECTIONS = frozenset({"download_options", "settings_snapshot", "settings_contract"})
+_VIDEO_LIST_SECTIONS = frozenset({"queue_items", "active_downloads", "completed_items", "failed_items"})
+
+
+class _FrontendShutdownToken:
+    """清空队列期间观察服务和控制器是否已经进入关闭。"""
+
+    def __init__(self, service: "FrontendStateService") -> None:
+        self._service = service
+
+    def is_cancelled(self) -> bool:
+        return self._service._frontend_actions_rejected()
 
 
 class _HeadlessGuiRuntimeAdapter:
@@ -83,7 +96,7 @@ class _HeadlessGuiRuntimeAdapter:
 
 
 
-class FrontendStateService(FrontendToolboxStateMixin):
+class FrontendStateService(FrontendToolboxStateMixin, FrontendSettingActionsMixin):
     """构建 GUI/WebUI 共用的七页快照，并负责把状态变更压缩成增量事件。"""
 
     METADATA_PROBES_PER_SNAPSHOT = 64
@@ -130,7 +143,9 @@ class FrontendStateService(FrontendToolboxStateMixin):
         self.media_metadata_service = media_metadata_service or MediaMetadataService()
         self._frontend_event_emitter = frontend_event_emitter
         self._destroyed = False
+        self._is_shutting_down = False
         self._destroy_lock = threading.RLock()
+        self._snapshot_flush_suppressed = threading.local()
         self._shutdown_completed = False
         self._shutdown_completed_steps: set[str] = set()
         self.failed_record_store = failed_record_store or FailedRecordStore()
@@ -213,7 +228,12 @@ class FrontendStateService(FrontendToolboxStateMixin):
             start_external_sync()
             self._config_external_sync_started = True
         self._wire_failed_record_store()
-        self._apply_logging_runtime_settings(cleanup_old_logs=True)
+        startup_logging = self._config_section_values(
+            "logging",
+            {"cleanup_old_logs_on_start": False},
+        )
+        cleanup_old_logs = startup_logging.get("cleanup_old_logs_on_start", False) is True
+        self._apply_logging_runtime_settings(cleanup_old_logs=cleanup_old_logs)
         self.flush_pending_app_state_events()
 
     def _load_download_auto_retry(self) -> bool:
@@ -359,6 +379,7 @@ class FrontendStateService(FrontendToolboxStateMixin):
     def destroy(self) -> bool:
         """Release resources; ``False`` means a process-exit guardian is draining."""
 
+        self._is_shutting_down = True
         with self._destroy_lock:
             return destroy_frontend_state_service(self)
 
@@ -410,21 +431,24 @@ class FrontendStateService(FrontendToolboxStateMixin):
 
         self._wait_for_app_state_async_delivery()
         with self._delta_lock:
-            if not self._pending_app_state_events and not self._pending_app_state_events_overflowed:
-                return
-            events = list(self._pending_app_state_events)
-            overflowed = self._pending_app_state_events_overflowed
-            self._pending_app_state_events.clear()
-            self._pending_app_state_events_overflowed = False
+            self._drain_pending_app_state_events_locked()
 
-            if overflowed:
-                self._event_aggregator.record(
-                    "app_state.resync_required",
-                    {"overflowed": True},
-                    sections=ALL_FRONTEND_SECTIONS,
-                )
-            for event_payload in events:
-                self._record_app_state_change(event_payload)
+    def _drain_pending_app_state_events_locked(self) -> None:
+        if not self._pending_app_state_events and not self._pending_app_state_events_overflowed:
+            return
+        events = list(self._pending_app_state_events)
+        overflowed = self._pending_app_state_events_overflowed
+        self._pending_app_state_events.clear()
+        self._pending_app_state_events_overflowed = False
+
+        if overflowed:
+            self._event_aggregator.record(
+                "app_state.resync_required",
+                {"overflowed": True},
+                sections=ALL_FRONTEND_SECTIONS,
+            )
+        for event_payload in events:
+            self._record_app_state_change(event_payload)
 
     def _wait_for_app_state_async_delivery(self) -> None:
         event_bus = getattr(self.app_state, "event_bus", None)
@@ -593,10 +617,17 @@ class FrontendStateService(FrontendToolboxStateMixin):
 
     def get_snapshot(self, *, mock: bool = False, sections: frozenset[str] | None = None) -> dict[str, Any]:
         """返回完整或局部快照；失败列表和日志列表需要共享同一份日志缓存。"""
-        self.flush_pending_app_state_events()
+        if not getattr(self._snapshot_flush_suppressed, "active", False):
+            self.flush_pending_app_state_events()
         if mock:
             snapshot = self.mock_snapshot()
             snapshot["version"] = self.frontend_version
+            snapshot.setdefault(
+                "toolbox_selected_tool_id",
+                self._stable_toolbox_selected_tool_id(snapshot),
+            )
+            if "active_downloads" in snapshot:
+                snapshot.setdefault("active_downloads_update_kind", "structure")
             return snapshot
 
         static_keys = frozenset({
@@ -620,6 +651,7 @@ class FrontendStateService(FrontendToolboxStateMixin):
             result.update(self._toolbox_snapshot_parts())
             result.update(video_parts)
             result["log_items"] = log_items_cache
+            result["active_downloads_update_kind"] = "structure"
             result["version"] = self.frontend_version
             return result
 
@@ -630,7 +662,9 @@ class FrontendStateService(FrontendToolboxStateMixin):
         if sections & static_keys:
             result.update({key: value for key, value in self._static_snapshot_parts().items() if key in sections})
         if sections & toolbox_keys:
-            result.update({key: value for key, value in self._toolbox_snapshot_parts().items() if key in sections})
+            toolbox_parts = self._toolbox_snapshot_parts()
+            result.update({key: value for key, value in toolbox_parts.items() if key in sections})
+            result["toolbox_selected_tool_id"] = toolbox_parts.get("toolbox_selected_tool_id", "")
         if sections & video_keys:
             shallow = sections <= (video_keys | frozenset({"log_items"}))
             result.update(
@@ -642,6 +676,8 @@ class FrontendStateService(FrontendToolboxStateMixin):
             )
         if "log_items" in sections:
             result["log_items"] = log_items_cache if log_items_cache is not None else self.log_items()
+        if "active_downloads" in sections:
+            result["active_downloads_update_kind"] = "structure"
         result["version"] = self.frontend_version
         return result
 
@@ -653,8 +689,9 @@ class FrontendStateService(FrontendToolboxStateMixin):
     ) -> dict[str, Any]:
         """返回版本化增量；历史不足或版本异常时强制客户端做完整重同步。"""
 
-        self.flush_pending_app_state_events()
+        self._wait_for_app_state_async_delivery()
         with self._delta_lock:
+            self._drain_pending_app_state_events_locked()
             try:
                 base_version = int(since_version or 0)
             except (TypeError, ValueError):
@@ -672,12 +709,37 @@ class FrontendStateService(FrontendToolboxStateMixin):
 
             snapshot_sections: dict[str, Any] = {}
             if requested_sections:
-                partial = self.get_snapshot(sections=frozenset(requested_sections))
+                self._snapshot_flush_suppressed.active = True
+                try:
+                    partial = self.get_snapshot(sections=frozenset(requested_sections))
+                finally:
+                    self._snapshot_flush_suppressed.active = False
+                allowed = set(requested_sections)
+                if allowed & TOOLBOX_SECTIONS:
+                    allowed.add("toolbox_selected_tool_id")
+                if "active_downloads" in allowed:
+                    allowed.add("active_downloads_update_kind")
                 snapshot_sections = {
                     key: value
                     for key, value in partial.items()
-                    if key in requested_sections
+                    if key in allowed
                 }
+            if "active_downloads" in requested_sections:
+                update_kind = (
+                    "structure"
+                    if full
+                    else self._event_aggregator.active_downloads_update_kind_since(base_version)
+                )
+                snapshot_sections["active_downloads_update_kind"] = update_kind
+                if update_kind == "progress":
+                    for option_section in _OPTION_RESET_SECTIONS:
+                        if option_section not in history_sections:
+                            snapshot_sections.pop(option_section, None)
+            if deleted_ids and not full:
+                present_ids = self._ids_still_present(snapshot_sections)
+                deleted_ids = tuple(
+                    video_id for video_id in deleted_ids if video_id not in present_ids
+                )
 
             return {
                 "version": current_version,
@@ -692,8 +754,13 @@ class FrontendStateService(FrontendToolboxStateMixin):
             }
 
     def handle_action(self, action: str, payload: Mapping[str, Any] | None = None) -> dict[str, Any]:
-        if self._destroyed:
-            return FrontendActionResult("error", "frontend state service destroyed").to_dict()
+        if self._frontend_actions_rejected():
+            message = (
+                "frontend state service destroyed"
+                if self._destroyed
+                else "frontend state service is shutting down"
+            )
+            return FrontendActionResult("error", message).to_dict()
         execution_profile: ExecutionProfile | None = None
         if action in self._TOOL_ACTIONS or action == "tool_admit_candidates":
             execution_profile = self._capture_tool_execution_profile()
@@ -734,6 +801,59 @@ class FrontendStateService(FrontendToolboxStateMixin):
         if execution_profile is not None:
             return handler(payload, execution_profile=execution_profile).to_dict()
         return handler(payload).to_dict()
+
+    def _frontend_actions_rejected(self) -> bool:
+        """销毁完成前就要拒绝；控制器进入关闭也一样，不必等 destroy() 返回。"""
+
+        if self._destroyed or self._is_shutting_down is True:
+            return True
+        controller = self.controller
+        if controller is None:
+            return False
+        if getattr(controller, "_is_shutting_down", False) is True:
+            return True
+        return getattr(controller, "_shutdown_rejects_new_work", False) is True
+
+    def _toolbox_snapshot_parts(self) -> dict[str, Any]:
+        parts = super()._toolbox_snapshot_parts()
+        parts["toolbox_selected_tool_id"] = self._stable_toolbox_selected_tool_id(parts)
+        return parts
+
+    @staticmethod
+    def _stable_toolbox_selected_tool_id(parts: Mapping[str, Any]) -> str:
+        selected = str(parts.get("toolbox_selected_tool_id") or "")
+        if selected:
+            return selected
+        items = parts.get("toolbox_items") or ()
+        if isinstance(items, Sequence) and not isinstance(items, (str, bytes)):
+            for item in items:
+                if isinstance(item, Mapping):
+                    tool_id = str(item.get("id") or item.get("tool_id") or "")
+                    if tool_id:
+                        return tool_id
+        return ""
+
+    def _ids_still_present(self, snapshot_sections: Mapping[str, Any]) -> set[str]:
+        present: set[str] = set()
+        for key in _VIDEO_LIST_SECTIONS:
+            rows = snapshot_sections.get(key)
+            if not isinstance(rows, list):
+                continue
+            for row in rows:
+                if not isinstance(row, Mapping):
+                    continue
+                item_id = row.get("id") or row.get("video_id")
+                if item_id:
+                    present.add(str(item_id))
+        try:
+            videos = self._videos(shallow=True)
+        except Exception:
+            videos = {}
+        for item in videos.values():
+            item_id = getattr(item, "id", None)
+            if item_id:
+                present.add(str(item_id))
+        return present
 
     @staticmethod
     def _strict_boolean(payload: Mapping[str, Any], key: str, *, default: bool) -> bool:
@@ -881,7 +1001,14 @@ class FrontendStateService(FrontendToolboxStateMixin):
         if section == "download":
             self._apply_download_runtime_settings()
         elif section == "logging":
-            self._apply_logging_runtime_settings(cleanup_old_logs=key == "retention_days")
+            cleanup_old_logs = False
+            if key == "retention_days":
+                logging_cfg = self._config_section_values(
+                    "logging",
+                    {"cleanup_old_logs_on_start": False},
+                )
+                cleanup_old_logs = logging_cfg.get("cleanup_old_logs_on_start", False) is True
+            self._apply_logging_runtime_settings(cleanup_old_logs=cleanup_old_logs)
         elif section == "common":
             self._dispatch_gui_runtime_setting("_apply_common_setting", key, value)
         elif section == "appearance":
@@ -2199,24 +2326,43 @@ class FrontendStateService(FrontendToolboxStateMixin):
         return FrontendActionResult("ok", "failed records cleared", {"count": deleted_count})
 
     def _action_clear_queue(self, payload: Mapping[str, Any]) -> FrontendActionResult:
-        del payload
-        queue_ids = sorted(self.queue_item_ids())
-        clear_queue = getattr(self.controller, "on_clear_queue", None)
-        if callable(clear_queue):
-            clear_queue()
-        else:
-            controller_videos = getattr(self.controller, "videos", None)
-            if isinstance(controller_videos, dict):
-                for video_id in queue_ids:
-                    controller_videos.pop(video_id, None)
-            for video_id in queue_ids:
-                self.remove_video(video_id)
-        if queue_ids:
-            self._emit_frontend_event(
-                "videos.clear_queue",
-                {"video_ids": queue_ids, "count": len(queue_ids)},
+        cancel_token = payload.get("cancel_token") if isinstance(payload, Mapping) else None
+        if cancel_token is None:
+            cancel_token = _FrontendShutdownToken(self)
+        clear_queue = getattr(self.controller, "clear_queue_blocking", None)
+        if not callable(clear_queue):
+            return FrontendActionResult("error", "clear queue is unavailable")
+        try:
+            outcome = clear_queue(cancel_token)
+        except Exception as exc:
+            debug_logger.log_exception(
+                "FrontendStateService",
+                "clear_queue",
+                exc,
             )
-        return FrontendActionResult("ok", "queue cleared", {"count": len(queue_ids), "video_ids": queue_ids})
+            return FrontendActionResult("error", f"clear queue failed: {exc}")
+        if not isinstance(outcome, Mapping):
+            return FrontendActionResult("error", "clear queue failed")
+        status = str(outcome.get("status") or "")
+        removed_ids = [str(video_id) for video_id in (outcome.get("removed_ids") or []) if video_id]
+        if status != "ok":
+            if status == "cancelled":
+                return FrontendActionResult(
+                    "cancelled",
+                    "queue clear cancelled",
+                    {"video_ids": removed_ids},
+                )
+            message = str(outcome.get("message") or "clear queue failed")
+            return FrontendActionResult("error", message, {"video_ids": removed_ids})
+        self._emit_frontend_event(
+            "videos.clear_queue",
+            {"video_ids": removed_ids, "count": len(removed_ids)},
+        )
+        return FrontendActionResult(
+            "ok",
+            "queue cleared",
+            {"count": len(removed_ids), "video_ids": removed_ids},
+        )
 
     def _action_pause_download(self, payload: Mapping[str, Any]) -> FrontendActionResult:
         video_id = str(payload.get("id") or payload.get("video_id") or "")
@@ -2308,309 +2454,6 @@ class FrontendStateService(FrontendToolboxStateMixin):
                 },
             )
         return FrontendActionResult("ok", "download options updated", options)
-
-    def _action_update_setting(self, payload: Mapping[str, Any]) -> FrontendActionResult:
-        section = str(payload.get("section") or payload.get("group") or "").strip()
-        key = str(payload.get("key") or payload.get("name") or "").strip()
-        value = payload.get("value")
-        if section == "basic":
-            section = "common"
-        if section == "appearance" and key == "theme":
-            section = "common"
-        if not section or not key:
-            return FrontendActionResult("error", "setting section and key are required")
-        try:
-            default = get_setting_default(section, key)
-        except ConfigValidationError:
-            default = None
-        if isinstance(default, bool) and not isinstance(value, bool):
-            return FrontendActionResult("error", f"{section}.{key} must be a boolean")
-        if section == "common":
-            return self._action_update_basic_setting({"key": key, "value": value})
-        if section == "download" and key in {"max_concurrent", "max_retries", "video_only", "image_respects_concurrency"}:
-            options = self.download_options_snapshot()
-            options[key] = value
-            return self._action_update_download_options(options)
-        section_models = getattr(self.config, "SECTION_MODELS", {})
-        if section not in section_models:
-            return FrontendActionResult("error", f"unknown setting section: {section}")
-        try:
-            if section == "missav" and key in {"proxy_app", "proxy_url"}:
-                proxy_text = str(value or "").strip()
-                proxy_url = (
-                    str(self.config.get("missav", "proxy_url", "") or "").strip()
-                    if key == "proxy_app" and proxy_text == "自定义"
-                    else build_missav_proxy_url(proxy_text)
-                )
-                proxy_app = proxy_text if key == "proxy_app" else "自定义"
-                updater = getattr(self.config, "update_missav_proxy", None)
-                if callable(updater):
-                    updater(proxy_app or "自定义", proxy_url)
-                else:
-                    self.config.set("missav", key, value)
-                    if key == "proxy_app":
-                        self.config.set("missav", "proxy_url", proxy_url)
-                    elif key == "proxy_url":
-                        self.config.set("missav", "proxy_app", "自定义")
-                current_value = self.config.get("missav", key)
-                if not self._config_events_drive_runtime:
-                    self._static_snapshot_cache = None
-                    self.record_event("settings.update", {"section": section, "key": key})
-                return FrontendActionResult(
-                    "ok",
-                    "setting updated",
-                    {"section": section, "key": key, "value": current_value, "proxy_url": proxy_url},
-                )
-            with self._capture_config_runtime_failures() as runtime_failures:
-                self.config.set(section, key, value)
-                current_value = self.config.get(section, key)
-                if not self._config_events_drive_runtime:
-                    self._apply_runtime_setting(section, key, current_value)
-        except (ConfigValidationError, ConfigWriteError) as exc:
-            return FrontendActionResult("error", str(exc), {"section": section, "key": key})
-        except Exception as exc:
-            debug_logger.log_exception(
-                "FrontendStateService",
-                "apply_runtime_setting",
-                exc,
-                details={"section": section, "key": key},
-            )
-            return FrontendActionResult(
-                "error",
-                f"setting persisted but runtime apply failed: {exc}",
-                {"section": section, "key": key},
-            )
-        if runtime_failures:
-            return FrontendActionResult(
-                "error",
-                self._runtime_failure_message("setting", runtime_failures),
-                {"section": section, "key": key, "value": current_value},
-            )
-        if not self._config_events_drive_runtime:
-            if self._platform_auth_config_affects_status(section, key):
-                self._invalidate_platform_auth_cache()
-            else:
-                self._static_snapshot_cache = None
-            self.record_event("settings.update", {"section": section, "key": key})
-        return FrontendActionResult(
-            "ok",
-            "setting updated",
-            {"section": section, "key": key, "value": current_value},
-        )
-
-    def _action_retry_failed(self, payload: Mapping[str, Any]) -> FrontendActionResult:
-        video_id = str(payload.get("id") or payload.get("video_id") or "")
-        item = self._video_for_update(video_id)
-        manager = self._dl_manager()
-        if not item or manager is None:
-            return FrontendActionResult("error", "task cannot be retried")
-        item.status = VideoStatus.PENDING.label
-        item.progress = 0
-        manager.add_task(item, self._current_save_dir())
-        return FrontendActionResult("ok", "retry queued", {"video_id": video_id})
-
-    def _action_copy_diagnostics(self, payload: Mapping[str, Any]) -> FrontendActionResult:
-        video_id = str(payload.get("id") or payload.get("video_id") or "")
-        item = self._videos().get(video_id)
-        trace_id = self._trace_id(item) if item else ""
-        if not trace_id and video_id:
-            record = self._failed_record_for_id(video_id)
-            trace_id = str((record or {}).get("trace_id") or "")
-        if not item and not trace_id:
-            return FrontendActionResult("error", "task not found")
-        if not trace_id:
-            return FrontendActionResult("error", "trace id not found", {"video_id": video_id})
-        return FrontendActionResult("ok", "trace id ready", {"text": trace_id, "trace_id": trace_id})
-
-    def _failed_record_for_id(self, video_id: str) -> dict[str, Any] | None:
-        normalized_id = str(video_id or "")
-        if not normalized_id:
-            return None
-        for row in self._failed_record_snapshot_items():
-            if str(row.get("id") or row.get("video_id") or "") == normalized_id:
-                return row
-        record_by_id = getattr(self.failed_record_store, "record_by_id", None)
-        if not callable(record_by_id):
-            return None
-        try:
-            row = record_by_id(normalized_id)
-        except Exception as exc:
-            debug_logger.log_exception(
-                "FrontendStateService",
-                "failed_record_store.record_by_id",
-                exc,
-                details={"video_id": normalized_id},
-            )
-            return None
-        return dict(row) if isinstance(row, Mapping) else None
-
-    def _action_update_basic_setting(self, payload: Mapping[str, Any]) -> FrontendActionResult:
-        key = str(payload.get("key") or payload.get("name") or "").strip()
-        value = payload.get("value")
-        aliases = {"download_directory": "save_directory", "save_directory": "save_directory"}
-        config_key = aliases.get(key, key)
-        allowed = {
-            "save_directory",
-            "last_source",
-            "filename_template",
-            "open_after_download",
-            "default_open_mode",
-            "show_browser_window",
-            "theme",
-        }
-        if config_key not in allowed:
-            return FrontendActionResult("error", f"unknown basic setting: {key}")
-        try:
-            default = get_setting_default("common", config_key)
-        except ConfigValidationError:
-            default = None
-        if isinstance(default, bool) and not isinstance(value, bool):
-            return FrontendActionResult("error", f"common.{config_key} must be a boolean")
-        if config_key == "save_directory" and value is None:
-            value = payload.get("directory")
-        runtime_failures: list[tuple[str, str, Exception]] = []
-        try:
-            with self._capture_config_runtime_failures() as runtime_failures:
-                manual = self._strict_boolean(payload, "manual", default=True)
-                manual_theme = config_key == "theme" and manual
-                set_batch = getattr(self.config, "set_batch", None)
-                if manual_theme and callable(set_batch):
-                    set_batch(
-                        {
-                            "appearance": {"follow_system": False},
-                            "common": {config_key: value},
-                        }
-                    )
-                else:
-                    if manual_theme:
-                        self.config.set("appearance", "follow_system", False)
-                    self.config.set("common", config_key, value)
-                current_value = self.config.get("common", config_key)
-                if not self._config_events_drive_runtime:
-                    self._apply_runtime_setting("common", config_key, current_value)
-        except (ConfigValidationError, ConfigWriteError) as exc:
-            return FrontendActionResult("error", str(exc), {"key": key or config_key})
-        except Exception as exc:
-            debug_logger.log_exception(
-                "FrontendStateService",
-                "apply_basic_runtime_setting",
-                exc,
-                details={"key": config_key},
-            )
-            return FrontendActionResult(
-                "error",
-                f"setting persisted but runtime apply failed: {exc}",
-                {"key": key or config_key},
-            )
-        if runtime_failures:
-            return FrontendActionResult(
-                "error",
-                self._runtime_failure_message("setting", runtime_failures),
-                {"section": "common", "key": key or config_key, "config_key": config_key, "value": current_value},
-            )
-        controller = self.controller
-        if config_key == "save_directory" and controller is not None and hasattr(controller, "current_save_dir"):
-            controller.current_save_dir = str(current_value)
-        if not self._config_events_drive_runtime:
-            self._static_snapshot_cache = None
-            self.record_event("settings.update", {"section": "common", "key": config_key})
-        data = {"section": "common", "key": key or config_key, "config_key": config_key, "value": current_value}
-        if config_key == "save_directory":
-            data["directory"] = current_value
-        return FrontendActionResult("ok", "basic setting updated", data)
-
-    def _action_change_directory(self, payload: Mapping[str, Any]) -> FrontendActionResult:
-        return self._action_update_basic_setting({
-            "key": "download_directory",
-            "value": payload.get("directory"),
-        })
-
-    def _action_open_directory(self, payload: Mapping[str, Any]) -> FrontendActionResult:
-        video_id = str(payload.get("id") or payload.get("video_id") or "")
-        item = self._videos().get(video_id)
-        file_path = getattr(item, "local_path", "") if item else ""
-        if not file_path:
-            return FrontendActionResult("error", "file path is unavailable")
-        directory_path = Path(file_path).expanduser().parent
-        if not directory_path.exists():
-            return FrontendActionResult("error", "directory does not exist", {"directory": str(directory_path)})
-        directory = str(directory_path)
-        try:
-            self._directory_opener(directory)
-        except Exception as exc:
-            return FrontendActionResult("error", str(exc), {"directory": directory})
-        return FrontendActionResult("ok", "directory opened", {"directory": directory})
-
-    def _action_open_file(self, payload: Mapping[str, Any]) -> FrontendActionResult:
-        video_id = str(payload.get("id") or payload.get("video_id") or "")
-        item = self._videos().get(video_id)
-        file_path = getattr(item, "local_path", "") if item else ""
-        if not file_path:
-            return FrontendActionResult("error", "file path is unavailable")
-        path = Path(file_path).expanduser()
-        if not path.exists():
-            return FrontendActionResult("error", "file does not exist", {"path": str(path)})
-        try:
-            self._open_file_path(path)
-        except Exception as exc:
-            return FrontendActionResult("error", str(exc), {"path": str(path)})
-        return FrontendActionResult("ok", "file opened", {"path": str(path)})
-
-
-    def _action_register_file_associations(self, payload: Mapping[str, Any]) -> FrontendActionResult:
-        try:
-            include_video = self._strict_boolean(payload, "include_video", default=True)
-            include_image = self._strict_boolean(payload, "include_image", default=True)
-        except ConfigValidationError as exc:
-            return FrontendActionResult("error", str(exc))
-        if not include_video and not include_image:
-            return FrontendActionResult("error", "no file type selected")
-        try:
-            service = self._make_association_service()
-            result = service.register_current_user(
-                self._executable_path_provider(),
-                include_video=include_video,
-                include_image=include_image,
-            )
-            if not getattr(result, "registered", False):
-                return FrontendActionResult("error", getattr(result, "message", "") or "file association registration failed")
-
-            default_result = service.set_current_user_defaults(include_video=include_video, include_image=include_image)
-            diagnostics = service.diagnose_current_user(include_video=include_video, include_image=include_image)
-            pending = tuple(getattr(diagnostics, "pending_extensions", ()) or ())
-            opened_settings = False
-            if getattr(diagnostics, "available", False) and pending:
-                opened_settings = bool(service.open_default_apps_settings())
-
-            failed = tuple(getattr(default_result, "failed_extensions", ()) or ())
-            defaulted = tuple(getattr(default_result, "defaulted_extensions", ()) or ())
-            if pending:
-                message = "default apps settings opened" if opened_settings else "manual default app confirmation required"
-            elif failed:
-                message = "some defaults failed"
-            elif defaulted:
-                message = "default file associations applied"
-            else:
-                message = getattr(default_result, "message", "") or "file association action completed"
-            return FrontendActionResult(
-                "ok",
-                message,
-                {
-                    "defaulted_extensions": list(defaulted),
-                    "failed_extensions": list(failed),
-                    "pending_extensions": list(pending),
-                    "opened_settings": opened_settings,
-                },
-            )
-        except Exception as exc:
-            return FrontendActionResult("error", str(exc))
-
-    def _make_association_service(self) -> Any:
-        if self._association_service_factory is not None:
-            return self._association_service_factory()
-        from app.services.windows_file_association_service import WindowsFileAssociationService
-
-        return WindowsFileAssociationService()
 
     @staticmethod
     def _open_directory_with_system(directory: str) -> None:

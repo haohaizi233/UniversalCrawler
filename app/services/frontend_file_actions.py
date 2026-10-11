@@ -50,9 +50,8 @@ def open_directory_with_system(directory: str | Path) -> None:
 
 
 def current_executable_path() -> str:
-    if getattr(sys, "frozen", False):
-        return sys.executable
-    return sys.argv[0]
+    """冻结与源码运行都使用解释器/可执行文件，不返回 sys.argv[0] 的 .py 脚本。"""
+    return sys.executable
 
 
 def _open_system_path(path: str) -> None:

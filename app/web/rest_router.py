@@ -27,6 +27,17 @@ from shared.release_identity import (
 )
 
 
+def _handler_accepts_keyword(handler: Callable[..., Any], keyword: str) -> bool:
+    try:
+        parameters = inspect.signature(handler).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(
+        parameter.name == keyword or parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters
+    )
+
+
 def _finalize_route_result(payload: Any, *, enforce_statuses: set[int] | None = None) -> Any:
     """除明确的安全边界外，保留旧接口以 200 返回错误正文的约定。"""
     if not isinstance(payload, dict) or not (payload.get("status") == "error" or "error" in payload):
@@ -152,7 +163,11 @@ def build_rest_router(
     @router.get("/api/session/bootstrap")
     async def bootstrap_session(request: Request):
         context = get_request_context(request)
-        return {"status": "ok", "session_id": context.session_id}
+        return {
+            "status": "ok",
+            "session_id": context.session_id,
+            "csrf_token": context.csrf_token,
+        }
 
     @router.get("/api/platforms")
     async def get_platforms(request: Request):
@@ -268,21 +283,40 @@ def build_rest_router(
         except (TypeError, ValueError):
             frontend_version = 0
         if callable(handler):
-            if inspect.iscoroutinefunction(handler):
-                result = (
-                    await handler(body.action, payload, approved_roots=approved_roots)
-                    if handler_accepts_roots
-                    else await handler(body.action, payload)
-                )
-            else:
-                result = await _run_controller_worker_call(
-                    handler,
-                    body.action,
-                    payload,
-                    **({"approved_roots": approved_roots} if handler_accepts_roots else {}),
-                )
-                if inspect.isawaitable(result):
-                    result = await result
+            handler_accepts_grants = _handler_accepts_keyword(handler, "approved_root_grants")
+
+            async def _invoke(approved_root_grants=None):
+                kwargs = {}
+                if handler_accepts_roots:
+                    kwargs["approved_roots"] = approved_roots
+                if handler_accepts_grants:
+                    kwargs["approved_root_grants"] = approved_root_grants
+                if inspect.iscoroutinefunction(handler):
+                    invoked = await handler(body.action, payload, **kwargs)
+                else:
+                    invoked = await _run_controller_worker_call(
+                        handler,
+                        body.action,
+                        payload,
+                        **kwargs,
+                    )
+                if inspect.isawaitable(invoked):
+                    invoked = await invoked
+                return invoked
+
+            try:
+                if handler_accepts_grants:
+                    with context.lease_approved_root_grants_snapshot() as grants:
+                        result = await _invoke(grants)
+                else:
+                    result = await _invoke()
+            except PermissionError as exc:
+                result = {
+                    "status": "error",
+                    "message": str(exc),
+                    "http_status": 403,
+                    "data": {"code": "directory_not_authorized"},
+                }
             if isinstance(result, dict):
                 result = dict(result)
                 if body.request_id:

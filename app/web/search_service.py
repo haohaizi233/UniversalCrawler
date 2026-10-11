@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -42,10 +43,6 @@ class WebSearchService:
         runtime = self._runtime_provider()
         context = self._get_request_context(request)
 
-        execution_profile = build_public_web_session_profile(
-            context.session_id,
-            approved_roots=context.approved_roots_snapshot(),
-        )
         try:
             reject_execution_profile_overrides(body)
         except ExecutionProfileEscalation as exc:
@@ -74,11 +71,6 @@ class WebSearchService:
         save_dir = body.get("save_dir")
         if save_dir is not None and not isinstance(save_dir, str):
             return error_result("save_dir 必须是字符串或 null")
-        save_dir = save_dir or context.controller.current_save_dir
-        try:
-            save_dir = context.require_directory(save_dir)
-        except PermissionError as exc:
-            return error_result(str(exc), http_status=403)
 
         user_config = body.get("config", {})
         if not isinstance(user_config, dict):
@@ -111,48 +103,72 @@ class WebSearchService:
             return download_result
         download = download_result
 
-        merged_config = runtime.merge_default_config(source, user_config)
+        candidate = save_dir or context.controller.current_save_dir
         try:
-            merge_convenience_params(
-                body,
-                merged_config,
-                source,
-                execution_profile=execution_profile,
-            )
-        except ExecutionProfileEscalation as exc:
-            return finalize_api_result(
-                error_result(
-                    str(exc),
-                    error_code="EXECUTION_PROFILE_ESCALATION",
+            with context.open_operation_directory(
+                candidate if isinstance(candidate, str) and candidate else None
+            ) as opened:
+                if not opened:
+                    return error_result("目录未被当前会话授权访问", http_status=403)
+                authorized_save_dir = opened
+                execution_profile = build_public_web_session_profile(
+                    context.session_id,
+                    approved_roots=context.approved_roots_snapshot(),
                 )
-            )
-        except ValueError as exc:
-            return error_result(str(exc))
+                merged_config = runtime.merge_default_config(source, user_config)
+                try:
+                    merge_convenience_params(
+                        body,
+                        merged_config,
+                        source,
+                        execution_profile=execution_profile,
+                    )
+                except ExecutionProfileEscalation as exc:
+                    return finalize_api_result(
+                        error_result(
+                            str(exc),
+                            error_code="EXECUTION_PROFILE_ESCALATION",
+                        )
+                    )
+                except ValueError as exc:
+                    return error_result(str(exc))
 
-        try:
-            loop = asyncio.get_running_loop()
-            return await loop.run_in_executor(
-                None,
-                lambda: runtime.run_cli_search(
-                    source=source,
-                    keyword=keyword,
-                    save_dir=save_dir,
-                    selection_strategy=strategy,
-                    config=merged_config,
-                    timeout=timeout,
-                    download=download,
-                    execution_profile=execution_profile,
-                ),
-            )
-        except Exception as exc:
-            log_web_exception(
-                "WebSearchService",
-                "search",
-                exc,
-                context={"source": source, "keyword": keyword, "save_dir": save_dir},
-                details={"download": download},
-            )
-            return error_result(str(exc), http_status=500)
+                try:
+                    loop = asyncio.get_running_loop()
+                    leased_context = contextvars.copy_context()
+
+                    def _execute_search() -> dict:
+                        return runtime.run_cli_search(
+                            source=source,
+                            keyword=keyword,
+                            save_dir=authorized_save_dir,
+                            selection_strategy=strategy,
+                            config=merged_config,
+                            timeout=timeout,
+                            download=download,
+                            execution_profile=execution_profile,
+                        )
+
+                    return await loop.run_in_executor(
+                        None,
+                        leased_context.run,
+                        _execute_search,
+                    )
+                except Exception as exc:
+                    log_web_exception(
+                        "WebSearchService",
+                        "search",
+                        exc,
+                        context={
+                            "source": source,
+                            "keyword": keyword,
+                            "save_dir": authorized_save_dir,
+                        },
+                        details={"download": download},
+                    )
+                    return error_result(str(exc), http_status=500)
+        except PermissionError as exc:
+            return error_result(str(exc), http_status=403)
 
     @staticmethod
     def _normalize_download_flag(download: Any) -> bool | dict:

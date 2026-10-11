@@ -511,3 +511,49 @@ def test_retry_wait_remains_throttled_when_both_wait_apis_raise() -> None:
         _wait_safely(0.03, "hostile_wait")
 
     assert time.monotonic() - started >= 0.02
+
+
+def test_guardian_stops_after_attempt_limit_when_store_never_drains() -> None:
+    class _NeverStore:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def shutdown(self, timeout: float = 1.0) -> bool:
+            del timeout
+            self.calls += 1
+            return False
+
+    store = _NeverStore()
+    with (
+        patch.object(shutdown_guard, "_MAX_DRAIN_ATTEMPTS", 3),
+        patch.object(shutdown_guard, "_wait_safely", lambda *_args, **_kwargs: None),
+    ):
+        assert ensure_failed_record_store_drained(store) is False
+        guardian = _guardian_for_key(id(store))
+        guardian.join(timeout=2.0)
+
+    assert not guardian.is_alive()
+    assert store.calls == 3
+    assert failed_record_store_guardian_drained(store) is None
+
+
+def test_synchronous_drain_returns_false_after_attempt_limit() -> None:
+    class _NeverStore:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def shutdown(self, timeout: float = 1.0) -> bool:
+            del timeout
+            self.calls += 1
+            return False
+
+    store = _NeverStore()
+    with (
+        patch.object(threading.Thread, "start", side_effect=RuntimeError("start failed")),
+        patch.object(shutdown_guard, "_MAX_DRAIN_ATTEMPTS", 3),
+        patch.object(shutdown_guard, "_wait_safely", lambda *_args, **_kwargs: None),
+        patch("app.services.failed_record_shutdown_guard.debug_logger.log_exception"),
+    ):
+        assert ensure_failed_record_store_drained(store) is False
+
+    assert store.calls == 3

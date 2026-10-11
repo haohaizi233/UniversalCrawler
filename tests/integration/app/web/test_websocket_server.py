@@ -74,12 +74,10 @@ class WebsocketServerTests(unittest.TestCase):
             patch("app.web.server.asyncio.create_task", lambda coro: coro.close()),
         ):
             client = TestClient(create_app())
-        # WebSocket 与 HTTP 共用同一会话令牌。先走公开 ping，让中间件
-        # 建立 session cookie；测试不得依赖 localhost 鉴权旁路。
-        # The public ping endpoint is intentionally stateless. Bootstrap the
-        # same HTTP session that a browser creates before opening /ws.
-        response = client.get("/")
+        # 页面本身不签发会话。先走浏览器使用的 bootstrap，再打开 /ws。
+        response = client.get("/api/session/bootstrap")
         self.assertEqual(response.status_code, 200)
+        self.assertIn("ucrawl_session_token", client.cookies)
         return client
 
     def test_websocket_sends_init_state_platforms_and_config(self):

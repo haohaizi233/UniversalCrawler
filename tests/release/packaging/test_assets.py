@@ -1132,6 +1132,8 @@ class LauncherTemplateTests(unittest.TestCase):
         self.assertIn("console=False", helper_block)
         self.assertIn("UCrawlRestartHandoff", installer_source)
         self.assertIn("--complete-install", installer_source)
+        self.assertIn("GetEnv('UCRAWL_RESTART_HANDOFF_TOKEN')", installer_source)
+        self.assertNotIn("--restart-handoff-token", installer_source)
 
     def test_spec_consumes_tracked_launchers_without_rewriting_them(self):
         source = SPEC_FILE.read_text(encoding="utf-8")

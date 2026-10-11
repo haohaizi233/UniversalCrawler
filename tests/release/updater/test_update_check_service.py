@@ -23,6 +23,7 @@ from app.services.update_check_service import (
     fetch_latest_release_payload,
     launch_prepared_update,
     normalize_version,
+    prepare_verified_update,
 )
 
 
@@ -79,6 +80,27 @@ def _qt_app():
 
 
 class UpdateCheckServiceTests(unittest.TestCase):
+    def test_secure_update_does_not_create_metadata_through_symlinked_cache_ancestor(self):
+        from tempfile import TemporaryDirectory
+
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            external = root / "external"
+            external.mkdir()
+            alias = root / "alias"
+            try:
+                alias.symlink_to(external, target_is_directory=True)
+            except OSError as exc:
+                self.skipTest(f"directory symlink creation unavailable: {exc}")
+            with patch(
+                "app.services.update_check_service.user_cache_root",
+                return_value=alias,
+            ):
+                with self.assertRaisesRegex(UpdateCheckError, "metadata directory is unsafe"):
+                    check_secure_update("3.6.17", public_key_pem="configured")
+
+            self.assertFalse((external / "updates").exists())
+
     def test_normalize_version_accepts_display_and_tag_values(self):
         self.assertEqual(normalize_version("v3.6.17"), "3.6.17")
         self.assertEqual(normalize_version("UniversalCrawlerPro 3.7.0"), "3.7.0")
@@ -133,6 +155,35 @@ class UpdateCheckServiceTests(unittest.TestCase):
 
         self.assertEqual(payload["tag_name"], "v3.6.18")
         self.assertEqual(opener.call_args.kwargs["allowed_hosts"], {"api.github.com"})
+        self.assertEqual(opener.call_args.kwargs["max_response_bytes"], 2_000_001)
+
+    def test_fetch_latest_release_payload_rejects_oversized_body(self):
+        response = _FakeBytesResponse(b"x" * 2_000_001)
+        with patch("app.services.update_check_service.open_trusted_url", return_value=response):
+            with self.assertRaisesRegex(UpdateCheckError, "too large"):
+                fetch_latest_release_payload()
+
+    def test_fetch_latest_release_payload_normalizes_excessive_json_nesting(self):
+        depth = sys.getrecursionlimit() * 4
+        body = '{"nested":' + ("[" * depth) + "0" + ("]" * depth) + "}"
+        response = _FakeResponse(
+            url="https://api.github.com/repos/haohaizi554/UniversalCrawler/releases/latest",
+            body=body,
+        )
+
+        with patch(
+            "app.services.update_check_service.open_trusted_url",
+            return_value=response,
+        ):
+            with self.assertRaisesRegex(UpdateCheckError, "not valid JSON"):
+                fetch_latest_release_payload()
+
+    def test_fetch_latest_release_page_payload_rejects_oversized_body(self):
+        response = _FakeBytesResponse(b"x" * 256_001)
+        response.geturl = lambda: "https://github.com/haohaizi554/UniversalCrawler/releases/latest"
+        with patch("app.services.update_check_service.open_trusted_url", return_value=response):
+            with self.assertRaisesRegex(UpdateCheckError, "too large"):
+                fetch_latest_release_page_payload()
 
     def test_fetch_latest_release_payload_rejects_non_https_source_before_open(self):
         with patch("app.services.update_check_service.open_trusted_url") as urlopen:
@@ -171,17 +222,22 @@ class UpdateCheckServiceTests(unittest.TestCase):
         from tests.release.updater.test_secure_updater import _signed_manifest
 
         with TemporaryDirectory() as temp_dir:
-            manifest_path, sig_path, public_pem = _signed_manifest(Path(temp_dir))
+            root = Path(temp_dir)
+            manifest_path, sig_path, public_pem = _signed_manifest(root)
 
-            result = check_secure_update(
-                "v3.6.17",
-                public_key_pem=public_pem,
-                manifest_path=manifest_path,
-                signature_path=sig_path,
-                os_name="windows",
-                arch="x64",
-                release_url="https://github.com/owner/repo/releases/tag/v3.7.0",
-            )
+            with patch(
+                "app.services.update_check_service.default_update_metadata_dir",
+                return_value=root,
+            ):
+                result = check_secure_update(
+                    "v3.6.17",
+                    public_key_pem=public_pem,
+                    manifest_path=manifest_path,
+                    signature_path=sig_path,
+                    os_name="windows",
+                    arch="x64",
+                    release_url="https://github.com/owner/repo/releases/tag/v3.7.0",
+                )
 
         self.assertEqual(result.status, UPDATE_STATUS_AVAILABLE)
         self.assertEqual(result.latest_version, "3.7.0")
@@ -275,6 +331,196 @@ class UpdateCheckServiceTests(unittest.TestCase):
         self.assertEqual(selected.latest_version, "3.7.0")
         self.assertEqual(selected.asset_name, "UniversalCrawlerPro_Setup_3.7.0.exe")
         self.assertIn("3.7.0", selected.manifest_path)
+
+    def test_verified_metadata_is_revalidated_at_the_authoritative_cache_target(self):
+        from tempfile import TemporaryDirectory
+
+        import app.services.update_check_service as update_service
+        from app.services.secure_updater import LocalUpdateState, ManifestLocations
+        from tests.release.updater.test_secure_updater import _signed_manifest
+
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            manifest, signature, public_pem = _signed_manifest(root / "source")
+            manifest_url = "https://github.com/owner/repo/releases/download/v3.7.0/latest.json"
+            signature_url = f"{manifest_url}.sig"
+            blobs = {
+                manifest_url: manifest.read_bytes(),
+                signature_url: signature.read_bytes(),
+            }
+
+            class FakeReleaseClient:
+                def fetch_manifest_location_candidates(self, **_kwargs):
+                    return (
+                        ManifestLocations(
+                            manifest_url=manifest_url,
+                            signature_url=signature_url,
+                            release_url="https://github.com/owner/repo/releases/tag/v3.7.0",
+                            tag_name="v3.7.0",
+                            release_name="Release 3.7.0",
+                        ),
+                    )
+
+            def fake_urlopen(request, timeout, **_kwargs):
+                del timeout
+                return _FakeBytesResponse(blobs[request.full_url])
+
+            real_replace = update_service.replace_between_approved_roots
+            authoritative_targets: list[Path] = []
+            swapped = False
+
+            def replace_source_then_publish(
+                source,
+                target,
+                *,
+                source_root,
+                target_root,
+            ):
+                nonlocal swapped
+                source = Path(source)
+                target = Path(target)
+                if not swapped and source.name == "latest.json":
+                    swapped = True
+                    source.rename(source.with_name("verified-original.json"))
+                    source.write_bytes(b'{"untrusted":true}')
+                    authoritative_targets.append(target)
+                real_replace(
+                    source,
+                    target,
+                    source_root=source_root,
+                    target_root=target_root,
+                )
+
+            with (
+                patch(
+                    "app.services.update_check_service.open_trusted_url",
+                    side_effect=fake_urlopen,
+                ),
+                patch(
+                    "app.services.update_check_service.user_cache_root",
+                    return_value=root / "cache",
+                ),
+                patch(
+                    "app.services.update_check_service.replace_between_approved_roots",
+                    side_effect=replace_source_then_publish,
+                ),
+            ):
+                with self.assertRaises(UpdateCheckError):
+                    check_secure_update(
+                        "v3.6.17",
+                        public_key_pem=public_pem,
+                        release_client=FakeReleaseClient(),
+                        os_name="windows",
+                        arch="x64",
+                        state=LocalUpdateState(),
+                    )
+
+            self.assertEqual(len(authoritative_targets), 1)
+            self.assertEqual(
+                authoritative_targets[0].read_bytes(),
+                b'{"untrusted":true}',
+            )
+
+    def test_active_metadata_cache_treats_excessive_json_nesting_as_a_miss(self):
+        from tempfile import TemporaryDirectory
+
+        from app.services.update_metadata_cache import (
+            ACTIVE_GENERATION_NAME,
+            load_active_generation,
+        )
+
+        with TemporaryDirectory() as temp_dir:
+            metadata_dir = Path(temp_dir)
+            depth = sys.getrecursionlimit() * 4
+            payload = '{"nested":' + ("[" * depth) + "0" + ("]" * depth) + "}"
+            (metadata_dir / ACTIVE_GENERATION_NAME).write_text(
+                payload,
+                encoding="utf-8",
+            )
+
+            self.assertIsNone(load_active_generation(metadata_dir))
+
+    def test_identity_metadata_cache_normalizes_excessive_json_nesting(self):
+        from tempfile import TemporaryDirectory
+
+        from app.services.update_metadata_cache import (
+            MetadataIdentityConflictError,
+            _load_identity_ledger,
+        )
+
+        with TemporaryDirectory() as temp_dir:
+            ledger = Path(temp_dir) / "identity-ledger.json"
+            depth = sys.getrecursionlimit() * 4
+            payload = '{"nested":' + ("[" * depth) + "0" + ("]" * depth) + "}"
+            ledger.write_text(payload, encoding="utf-8")
+
+            with self.assertRaisesRegex(
+                MetadataIdentityConflictError,
+                "ledger is invalid",
+            ):
+                _load_identity_ledger(ledger, "scope")
+
+    def test_stable_manual_check_hides_prerelease_and_rejects_explicit_selection(self):
+        from tempfile import TemporaryDirectory
+
+        from app.services.secure_updater import LocalUpdateState
+
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            stable_manifest = root / "stable.json"
+            stable_signature = root / "stable.sig"
+            prerelease_manifest = root / "prerelease.json"
+            prerelease_signature = root / "prerelease.sig"
+            stable_manifest.write_bytes(b"stable-manifest")
+            stable_signature.write_bytes(b"stable-signature")
+            prerelease_manifest.write_bytes(b"prerelease-manifest")
+            prerelease_signature.write_bytes(b"prerelease-signature")
+            stable = UpdateCandidate(
+                version="3.8.0",
+                tag_name="v3.8.0",
+                release_name="Stable",
+                html_url="https://github.com/owner/repo/releases/tag/v3.8.0",
+                manifest_path=str(stable_manifest),
+                signature_path=str(stable_signature),
+            )
+            prerelease = UpdateCandidate(
+                version="4.0.0-rc.1",
+                tag_name="v4.0.0-rc.1",
+                release_name="Release candidate",
+                html_url="https://github.com/owner/repo/releases/tag/v4.0.0-rc.1",
+                manifest_path=str(prerelease_manifest),
+                signature_path=str(prerelease_signature),
+            )
+
+            with (
+                patch(
+                    "app.services.update_check_service._fetch_verified_update_candidates",
+                    return_value=(prerelease, stable),
+                ),
+                patch(
+                    "app.services.update_check_service.default_update_metadata_dir",
+                    return_value=root,
+                ),
+            ):
+                result = check_secure_update(
+                    "3.7.0",
+                    public_key_pem="configured-test-key",
+                    channel="stable",
+                    manual=True,
+                    state=LocalUpdateState(),
+                )
+                with self.assertRaisesRegex(UpdateCheckError, "not available"):
+                    check_secure_update(
+                        "3.7.0",
+                        public_key_pem="configured-test-key",
+                        channel="stable",
+                        manual=True,
+                        state=LocalUpdateState(),
+                        selected_candidate_id=prerelease.candidate_id,
+                    )
+
+        self.assertEqual(result.selected_identity, stable.identity)
+        self.assertEqual(tuple(candidate.identity for candidate in result.candidates), (stable.identity,))
 
     def test_secure_update_orders_same_version_revisions_and_selects_by_candidate_id(self):
         from tempfile import TemporaryDirectory
@@ -376,7 +622,7 @@ class UpdateCheckServiceTests(unittest.TestCase):
                     tag_name="v3.7.0-r1",
                 )
 
-    def test_secure_update_reuses_cached_candidate_metadata_when_release_list_is_not_modified(self):
+    def test_secure_update_fails_closed_for_legacy_cache_when_release_list_is_not_modified(self):
         from tempfile import TemporaryDirectory
 
         from app.services.secure_updater import LocalUpdateState, ManifestLocations
@@ -397,20 +643,551 @@ class UpdateCheckServiceTests(unittest.TestCase):
                     return (ManifestLocations(not_modified=True),)
 
             with patch("app.services.update_check_service.user_cache_root", return_value=root / "cache"):
-                result = check_secure_update(
-                    "v3.6.17",
+                with self.assertRaisesRegex(UpdateCheckError, "no cached manifest"):
+                    check_secure_update(
+                        "v3.6.17",
+                        public_key_pem=public_pem,
+                        release_client=FakeReleaseClient(),
+                        os_name="windows",
+                        arch="x64",
+                        state=LocalUpdateState(),
+                    )
+
+    def test_not_modified_loads_only_the_atomically_active_cache_generation(self):
+        from tempfile import TemporaryDirectory
+
+        from app.services.secure_updater import LocalUpdateState, ManifestLocations
+        from tests.release.updater.test_secure_updater import _signed_manifest
+
+        key = ECC.generate(curve="Ed25519")
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            live_manifest, live_signature, public_pem = _signed_manifest(
+                root / "live",
+                key=key,
+                overrides={"version": "3.7.0", "tag": "v3.7.0", "notes": "live"},
+            )
+            withdrawn_manifest, withdrawn_signature, _ = _signed_manifest(
+                root / "withdrawn",
+                key=key,
+                overrides={"version": "3.8.0", "tag": "v3.8.0", "notes": "withdrawn"},
+            )
+            manifest_url = "https://github.com/owner/repo/releases/download/v3.7.0/latest.json"
+            signature_url = f"{manifest_url}.sig"
+            blobs = {
+                manifest_url: live_manifest.read_bytes(),
+                signature_url: live_signature.read_bytes(),
+            }
+
+            class LiveReleaseClient:
+                api_base = "https://api.github.com"
+                owner = "owner"
+                repo = "repo"
+                auto_check_interval_seconds = 0
+
+                def fetch_manifest_location_candidates(self, **_kwargs):
+                    return (
+                        ManifestLocations(
+                            manifest_url=manifest_url,
+                            signature_url=signature_url,
+                            etag='"generation-live"',
+                            last_modified="Thu, 30 Jul 2026 00:00:00 GMT",
+                            release_url="https://github.com/owner/repo/releases/tag/v3.7.0",
+                            tag_name="v3.7.0",
+                            release_name="v3.7.0",
+                        ),
+                    )
+
+            class NotModifiedReleaseClient:
+                api_base = "https://api.github.com"
+                owner = "owner"
+                repo = "repo"
+                auto_check_interval_seconds = 0
+
+                def fetch_manifest_location_candidates(self, **_kwargs):
+                    return (
+                        ManifestLocations(
+                            not_modified=True,
+                            etag='"generation-live"',
+                            last_modified="Thu, 30 Jul 2026 00:00:00 GMT",
+                        ),
+                    )
+
+            def fake_urlopen(request, timeout, **_kwargs):
+                return _FakeBytesResponse(blobs[request.full_url])
+
+            with (
+                patch("app.services.update_check_service.user_cache_root", return_value=root / "cache"),
+                patch("app.services.update_check_service.open_trusted_url", side_effect=fake_urlopen),
+            ):
+                first = check_secure_update(
+                    "3.6.17",
                     public_key_pem=public_pem,
-                    release_client=FakeReleaseClient(),
+                    release_client=LiveReleaseClient(),
+                    os_name="windows",
+                    arch="x64",
+                    state=LocalUpdateState(),
+                )
+                metadata_dir = root / "cache" / "updates" / "metadata"
+                (metadata_dir / "v3.8.0-withdrawn.latest.json").write_bytes(
+                    withdrawn_manifest.read_bytes()
+                )
+                (metadata_dir / "v3.8.0-withdrawn.latest.json.sig").write_bytes(
+                    withdrawn_signature.read_bytes()
+                )
+                cached = check_secure_update(
+                    "3.6.17",
+                    public_key_pem=public_pem,
+                    release_client=NotModifiedReleaseClient(),
                     os_name="windows",
                     arch="x64",
                     state=LocalUpdateState(),
                 )
 
-        self.assertEqual(result.status, UPDATE_STATUS_AVAILABLE)
-        self.assertEqual(result.latest_version, "3.7.0")
-        self.assertEqual(result.manifest_path, str(cached_manifest))
+        self.assertEqual(first.latest_version, "3.7.0")
+        self.assertEqual(cached.latest_version, "3.7.0")
+        self.assertEqual(cached.notes, "live")
 
-    def test_secure_update_reuses_verified_cache_when_release_discovery_fails(self):
+    def test_verified_cache_is_scoped_to_the_exact_release_discovery(self):
+        from tempfile import TemporaryDirectory
+
+        from app.services.secure_updater import DownloadError, LocalUpdateState, ManifestLocations
+        from tests.release.updater.test_secure_updater import _signed_manifest
+
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            manifest, signature, public_pem = _signed_manifest(root / "source")
+            manifest_url = "https://github.com/owner-a/repo-a/releases/download/v3.7.0/latest.json"
+            blobs = {
+                manifest_url: manifest.read_bytes(),
+                f"{manifest_url}.sig": signature.read_bytes(),
+            }
+
+            class ReleaseClient:
+                api_base = "https://api.github.com"
+                auto_check_interval_seconds = 0
+
+                def __init__(self, owner, repo, *, fail=False):
+                    self.owner = owner
+                    self.repo = repo
+                    self.fail = fail
+
+                def fetch_manifest_location_candidates(self, **_kwargs):
+                    if self.fail:
+                        raise DownloadError("discovery unavailable")
+                    return (
+                        ManifestLocations(
+                            manifest_url=manifest_url,
+                            signature_url=f"{manifest_url}.sig",
+                            etag='"repo-a"',
+                            tag_name="v3.7.0",
+                        ),
+                    )
+
+            with (
+                patch("app.services.update_check_service.user_cache_root", return_value=root / "cache"),
+                patch(
+                    "app.services.update_check_service.open_trusted_url",
+                    side_effect=lambda request, **_kwargs: _FakeBytesResponse(blobs[request.full_url]),
+                ),
+            ):
+                check_secure_update(
+                    "3.6.17",
+                    public_key_pem=public_pem,
+                    release_client=ReleaseClient("owner-a", "repo-a"),
+                    os_name="windows",
+                    arch="x64",
+                    state=LocalUpdateState(),
+                )
+                with self.assertRaisesRegex(UpdateCheckError, "discovery unavailable"):
+                    check_secure_update(
+                        "3.6.17",
+                        public_key_pem=public_pem,
+                        release_client=ReleaseClient("owner-b", "repo-b", fail=True),
+                        os_name="windows",
+                        arch="x64",
+                        state=LocalUpdateState(),
+                    )
+
+    def test_automatic_signed_discovery_is_throttled_by_scoped_active_generation(self):
+        from tempfile import TemporaryDirectory
+
+        from app.services.secure_updater import LocalUpdateState, ManifestLocations
+        from tests.release.updater.test_secure_updater import _signed_manifest
+
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            manifest, signature, public_pem = _signed_manifest(root / "source")
+            manifest_url = "https://github.com/owner/repo/releases/download/v3.7.0/latest.json"
+            blobs = {
+                manifest_url: manifest.read_bytes(),
+                f"{manifest_url}.sig": signature.read_bytes(),
+            }
+
+            class ReleaseClient:
+                api_base = "https://api.github.com"
+                owner = "owner"
+                repo = "repo"
+                auto_check_interval_seconds = 3600
+
+                def __init__(self):
+                    self.calls = 0
+
+                def fetch_manifest_location_candidates(self, **_kwargs):
+                    self.calls += 1
+                    return (
+                        ManifestLocations(
+                            manifest_url=manifest_url,
+                            signature_url=f"{manifest_url}.sig",
+                            etag='"stable"',
+                            tag_name="v3.7.0",
+                        ),
+                    )
+
+            client = ReleaseClient()
+            with (
+                patch("app.services.update_check_service.user_cache_root", return_value=root / "cache"),
+                patch(
+                    "app.services.update_check_service.open_trusted_url",
+                    side_effect=lambda request, **_kwargs: _FakeBytesResponse(blobs[request.full_url]),
+                ),
+            ):
+                first = check_secure_update(
+                    "3.6.17",
+                    public_key_pem=public_pem,
+                    release_client=client,
+                    os_name="windows",
+                    arch="x64",
+                    manual=False,
+                    state=LocalUpdateState(),
+                )
+                second = check_secure_update(
+                    "3.6.17",
+                    public_key_pem=public_pem,
+                    release_client=client,
+                    os_name="windows",
+                    arch="x64",
+                    manual=False,
+                    state=LocalUpdateState(),
+                )
+                check_secure_update(
+                    "3.6.17",
+                    public_key_pem=public_pem,
+                    release_client=client,
+                    os_name="windows",
+                    arch="x64",
+                    manual=True,
+                    state=LocalUpdateState(),
+                )
+
+        self.assertEqual(client.calls, 2)
+        self.assertEqual(first.selected_identity, second.selected_identity)
+
+    def test_release_identity_cannot_be_reused_for_different_signed_metadata(self):
+        from tempfile import TemporaryDirectory
+
+        from app.services.secure_updater import LocalUpdateState, ManifestLocations
+        from tests.release.updater.test_secure_updater import _signed_manifest
+
+        key = ECC.generate(curve="Ed25519")
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            first_manifest, first_signature, public_pem = _signed_manifest(
+                root / "first",
+                key=key,
+                overrides={"notes": "immutable A"},
+            )
+            second_manifest, second_signature, _ = _signed_manifest(
+                root / "second",
+                key=key,
+                overrides={"notes": "replacement B"},
+            )
+            manifest_url = "https://github.com/owner/repo/releases/download/v3.7.0/latest.json"
+            blobs = {
+                manifest_url: first_manifest.read_bytes(),
+                f"{manifest_url}.sig": first_signature.read_bytes(),
+            }
+
+            class ReleaseClient:
+                api_base = "https://api.github.com"
+                owner = "owner"
+                repo = "repo"
+                auto_check_interval_seconds = 0
+
+                def fetch_manifest_location_candidates(self, **_kwargs):
+                    return (
+                        ManifestLocations(
+                            manifest_url=manifest_url,
+                            signature_url=f"{manifest_url}.sig",
+                            etag='"identity"',
+                            tag_name="v3.7.0",
+                        ),
+                    )
+
+            client = ReleaseClient()
+            with (
+                patch("app.services.update_check_service.user_cache_root", return_value=root / "cache"),
+                patch(
+                    "app.services.update_check_service.open_trusted_url",
+                    side_effect=lambda request, **_kwargs: _FakeBytesResponse(blobs[request.full_url]),
+                ),
+            ):
+                first = check_secure_update(
+                    "3.6.17",
+                    public_key_pem=public_pem,
+                    release_client=client,
+                    os_name="windows",
+                    arch="x64",
+                    state=LocalUpdateState(),
+                )
+                blobs[manifest_url] = second_manifest.read_bytes()
+                blobs[f"{manifest_url}.sig"] = second_signature.read_bytes()
+                with self.assertRaisesRegex(UpdateCheckError, "conflicting signed manifests"):
+                    check_secure_update(
+                        "3.6.17",
+                        public_key_pem=public_pem,
+                        release_client=client,
+                        os_name="windows",
+                        arch="x64",
+                        max_candidates=1,
+                        state=LocalUpdateState(),
+                    )
+
+        self.assertEqual(first.notes, "immutable A")
+
+    def test_identity_ledger_serializes_competing_processes(self):
+        from tempfile import TemporaryDirectory
+
+        from tests.release.updater.test_secure_updater import _signed_manifest
+
+        script = r"""
+import sys
+import time
+from pathlib import Path
+from app.services.secure_updater import _atomic_write_text
+from app.services.update_metadata_cache import (
+    MetadataIdentityConflictError,
+    metadata_record,
+    write_active_generation,
+)
+metadata_dir, manifest, signature, ready, gate = map(Path, sys.argv[1:])
+record = metadata_record(manifest, signature, candidate_id="v3.7.0")
+ready.write_text("ready", encoding="utf-8")
+while not gate.exists():
+    time.sleep(0.01)
+try:
+    write_active_generation(
+        metadata_dir,
+        etag="",
+        last_modified="",
+        records=(record,),
+        atomic_write_text=_atomic_write_text,
+        scope='{"pageSize":10}',
+        identity_scope='{"owner":"owner","repo":"repo"}',
+    )
+except MetadataIdentityConflictError:
+    print("conflict")
+    raise SystemExit(23)
+print("ok")
+"""
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            metadata_dir = root / "metadata"
+            metadata_dir.mkdir()
+            first_manifest, first_signature, _ = _signed_manifest(
+                root / "first",
+                overrides={"notes": "A"},
+            )
+            second_manifest, second_signature, _ = _signed_manifest(
+                root / "second",
+                overrides={"notes": "B"},
+            )
+            gate = root / "gate"
+            processes = []
+            for index, (manifest, signature) in enumerate(
+                (
+                    (first_manifest, first_signature),
+                    (second_manifest, second_signature),
+                )
+            ):
+                ready = root / f"ready-{index}"
+                process = subprocess.Popen(
+                    [
+                        sys.executable,
+                        "-c",
+                        script,
+                        str(metadata_dir),
+                        str(manifest),
+                        str(signature),
+                        str(ready),
+                        str(gate),
+                    ],
+                    cwd=Path(__file__).resolve().parents[3],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                processes.append((process, ready))
+            for _ in range(200):
+                if all(ready.exists() for _process, ready in processes):
+                    break
+                __import__("time").sleep(0.01)
+            self.assertTrue(all(ready.exists() for _process, ready in processes))
+            gate.write_text("go", encoding="utf-8")
+            results = [
+                (*process.communicate(timeout=10), process.returncode)
+                for process, _ready in processes
+            ]
+
+        self.assertEqual(sorted(result[2] for result in results), [0, 23], results)
+        self.assertEqual(sorted(result[0].strip() for result in results), ["conflict", "ok"])
+
+    def test_fresh_invalid_signature_is_terminal_and_does_not_use_cached_metadata(self):
+        from tempfile import TemporaryDirectory
+
+        from app.services.secure_updater import LocalUpdateState, ManifestLocations
+        from tests.release.updater.test_secure_updater import _signed_manifest
+
+        key = ECC.generate(curve="Ed25519")
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            cached_manifest, cached_signature, public_pem = _signed_manifest(
+                root / "cached",
+                key=key,
+                overrides={"notes": "last known good"},
+            )
+            fresh_manifest, _fresh_signature, _ = _signed_manifest(
+                root / "fresh",
+                key=key,
+                overrides={"version": "3.8.0", "tag": "v3.8.0"},
+            )
+            manifest_url = "https://github.com/owner/repo/releases/download/current/latest.json"
+            blobs = {
+                manifest_url: cached_manifest.read_bytes(),
+                f"{manifest_url}.sig": cached_signature.read_bytes(),
+            }
+
+            class ReleaseClient:
+                api_base = "https://api.github.com"
+                owner = "owner"
+                repo = "repo"
+                auto_check_interval_seconds = 0
+
+                def fetch_manifest_location_candidates(self, **_kwargs):
+                    return (
+                        ManifestLocations(
+                            manifest_url=manifest_url,
+                            signature_url=f"{manifest_url}.sig",
+                            etag='"current"',
+                        ),
+                    )
+
+            client = ReleaseClient()
+            with (
+                patch("app.services.update_check_service.user_cache_root", return_value=root / "cache"),
+                patch(
+                    "app.services.update_check_service.open_trusted_url",
+                    side_effect=lambda request, **_kwargs: _FakeBytesResponse(blobs[request.full_url]),
+                ),
+            ):
+                first = check_secure_update(
+                    "3.6.17",
+                    public_key_pem=public_pem,
+                    release_client=client,
+                    os_name="windows",
+                    arch="x64",
+                    state=LocalUpdateState(),
+                )
+                blobs[manifest_url] = fresh_manifest.read_bytes()
+                blobs[f"{manifest_url}.sig"] = b"invalid signature"
+                with self.assertRaisesRegex(UpdateCheckError, "signature"):
+                    check_secure_update(
+                        "3.6.17",
+                        public_key_pem=public_pem,
+                        release_client=client,
+                        os_name="windows",
+                        arch="x64",
+                        state=LocalUpdateState(),
+                    )
+
+        self.assertEqual(first.notes, "last known good")
+
+    def test_slow_check_merges_last_seen_without_losing_concurrent_state_writes(self):
+        import threading
+        from concurrent.futures import ThreadPoolExecutor
+        from tempfile import TemporaryDirectory
+
+        from app.services.secure_updater import (
+            LocalUpdateState,
+            record_pending_install,
+            record_skipped_update,
+        )
+
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            state_path = root / "state.json"
+            manifest = root / "latest.json"
+            signature = root / "latest.json.sig"
+            manifest.write_bytes(b"manifest")
+            signature.write_bytes(b"signature")
+            candidate = UpdateCandidate(
+                version="3.7.0",
+                tag_name="v3.7.0",
+                release_name="v3.7.0",
+                html_url="",
+                manifest_path=str(manifest),
+                signature_path=str(signature),
+            )
+            discovery_started = threading.Event()
+            release_discovery = threading.Event()
+
+            def slow_fetch(**_kwargs):
+                discovery_started.set()
+                self.assertTrue(release_discovery.wait(3))
+                return (candidate,)
+
+            with (
+                patch(
+                    "app.services.update_check_service._fetch_verified_update_candidates",
+                    side_effect=slow_fetch,
+                ),
+                patch(
+                    "app.services.secure_updater.default_update_state_path",
+                    return_value=state_path,
+                ),
+                patch(
+                    "app.services.update_check_service.default_update_metadata_dir",
+                    return_value=root,
+                ),
+            ):
+                with ThreadPoolExecutor(max_workers=2) as executor:
+                    check = executor.submit(
+                        check_secure_update,
+                        "3.6.17",
+                        public_key_pem="configured-test-key",
+                        os_name="windows",
+                        arch="x64",
+                    )
+                    self.assertTrue(discovery_started.wait(3))
+                    record_skipped_update("3.6.18", path=state_path)
+                    record_pending_install(
+                        version="3.6.19",
+                        installer_path=root / "pending.exe",
+                        log_path=root / "pending.log",
+                        launch_token="concurrent",
+                        path=state_path,
+                    )
+                    release_discovery.set()
+                    check.result(timeout=3)
+
+            state = LocalUpdateState.load(state_path)
+
+        self.assertEqual(state.last_seen_version, "3.7.0")
+        self.assertEqual(state.skipped_version, "3.6.18")
+        self.assertIsNotNone(state.pending_install)
+        self.assertEqual(state.pending_install.version, "3.6.19")
+
+    def test_secure_update_fails_closed_for_legacy_cache_when_release_discovery_fails(self):
         from tempfile import TemporaryDirectory
 
         from app.services.secure_updater import DownloadError, LocalUpdateState
@@ -429,19 +1206,17 @@ class UpdateCheckServiceTests(unittest.TestCase):
                     raise DownloadError("GitHub rate limit reached")
 
             with patch("app.services.update_check_service.user_cache_root", return_value=root / "cache"):
-                result = check_secure_update(
-                    "v3.6.17",
-                    public_key_pem=public_pem,
-                    release_client=FailingReleaseClient(),
-                    os_name="windows",
-                    arch="x64",
-                    state=LocalUpdateState(),
-                )
+                with self.assertRaisesRegex(UpdateCheckError, "rate limit"):
+                    check_secure_update(
+                        "v3.6.17",
+                        public_key_pem=public_pem,
+                        release_client=FailingReleaseClient(),
+                        os_name="windows",
+                        arch="x64",
+                        state=LocalUpdateState(),
+                    )
 
-        self.assertEqual(result.status, UPDATE_STATUS_AVAILABLE)
-        self.assertEqual(result.latest_version, "3.7.0")
-
-    def test_secure_update_prefers_newest_signed_cache_generation_for_same_identity(self):
+    def test_secure_update_does_not_reconstruct_active_generation_from_legacy_files(self):
         from tempfile import TemporaryDirectory
 
         from app.services.secure_updater import LocalUpdateState, ManifestLocations
@@ -478,20 +1253,17 @@ class UpdateCheckServiceTests(unittest.TestCase):
                     return (ManifestLocations(not_modified=True),)
 
             with patch("app.services.update_check_service.user_cache_root", return_value=root / "cache"):
-                result = check_secure_update(
-                    "v3.6.17",
-                    public_key_pem=public_pem,
-                    release_client=FakeReleaseClient(),
-                    os_name="windows",
-                    arch="x64",
-                    state=LocalUpdateState(),
-                )
+                with self.assertRaisesRegex(UpdateCheckError, "no cached manifest"):
+                    check_secure_update(
+                        "v3.6.17",
+                        public_key_pem=public_pem,
+                        release_client=FakeReleaseClient(),
+                        os_name="windows",
+                        arch="x64",
+                        state=LocalUpdateState(),
+                    )
 
-        self.assertEqual(result.status, UPDATE_STATUS_AVAILABLE)
-        self.assertEqual(result.notes, "new signed generation")
-        self.assertEqual(len(result.candidates), 1)
-
-    def test_secure_update_rejects_ambiguous_cached_generations_with_same_timestamp(self):
+    def test_secure_update_ignores_conflicting_legacy_cache_without_active_index(self):
         from tempfile import TemporaryDirectory
 
         from app.services.secure_updater import LocalUpdateState, ManifestLocations
@@ -522,7 +1294,7 @@ class UpdateCheckServiceTests(unittest.TestCase):
                     return (ManifestLocations(not_modified=True),)
 
             with patch("app.services.update_check_service.user_cache_root", return_value=root / "cache"):
-                with self.assertRaisesRegex(UpdateCheckError, "conflicting signed manifests"):
+                with self.assertRaisesRegex(UpdateCheckError, "no cached manifest"):
                     check_secure_update(
                         "v3.6.17",
                         public_key_pem=public_pem,
@@ -535,7 +1307,8 @@ class UpdateCheckServiceTests(unittest.TestCase):
     def test_secure_update_preserves_last_good_cache_when_fresh_signature_download_fails(self):
         from tempfile import TemporaryDirectory
 
-        from app.services.secure_updater import LocalUpdateState, ManifestLocations
+        from app.services.secure_updater import LocalUpdateState, ManifestLocations, _atomic_write_text
+        from app.services.update_metadata_cache import metadata_record, write_active_generation
         from tests.release.updater.test_secure_updater import _signed_manifest
 
         with TemporaryDirectory() as temp_dir:
@@ -549,11 +1322,24 @@ class UpdateCheckServiceTests(unittest.TestCase):
             original_signature = sig_path.read_bytes()
             cached_manifest.write_bytes(original_manifest)
             cached_signature.write_bytes(original_signature)
+            write_active_generation(
+                cache_metadata,
+                etag='"last-good"',
+                last_modified="Thu, 30 Jul 2026 00:00:00 GMT",
+                records=(metadata_record(cached_manifest, cached_signature),),
+                atomic_write_text=_atomic_write_text,
+                scope='{"authority":{"apiBase":"https://api.github.com","owner":"owner","repo":"repo"},"endpoint":"releases","pageSize":10}',
+            )
 
             manifest_url = "https://github.com/owner/repo/releases/download/v3.7.0/latest.json"
             signature_url = f"{manifest_url}.sig"
 
             class FreshReleaseClient:
+                api_base = "https://api.github.com"
+                owner = "owner"
+                repo = "repo"
+                auto_check_interval_seconds = 0
+
                 def fetch_manifest_location_candidates(self, **_kwargs):
                     return (
                         ManifestLocations(
@@ -711,7 +1497,7 @@ class UpdateCheckServiceTests(unittest.TestCase):
                 patch("app.services.update_check_service.open_trusted_url", side_effect=fake_urlopen),
                 patch("app.services.update_check_service.fetch_latest_release_payload") as readonly_fetch,
             ):
-                with self.assertRaisesRegex(UpdateCheckError, "signature verification failed"):
+                with self.assertRaisesRegex(UpdateCheckError, "signature"):
                     check_secure_update(
                         "3.6.17",
                         public_key_pem=public_pem,
@@ -734,15 +1520,19 @@ class UpdateCheckServiceTests(unittest.TestCase):
             manifest_path, sig_path, public_pem = _signed_manifest(root)
             state = LocalUpdateState(last_seen_version="3.8.0")
 
-            result = check_secure_update(
-                "v3.6.17",
-                public_key_pem=public_pem,
-                manifest_path=manifest_path,
-                signature_path=sig_path,
-                os_name="windows",
-                arch="x64",
-                state=state,
-            )
+            with patch(
+                "app.services.update_check_service.default_update_metadata_dir",
+                return_value=root,
+            ):
+                result = check_secure_update(
+                    "v3.6.17",
+                    public_key_pem=public_pem,
+                    manifest_path=manifest_path,
+                    signature_path=sig_path,
+                    os_name="windows",
+                    arch="x64",
+                    state=state,
+                )
 
         self.assertEqual(result.status, UPDATE_STATUS_AVAILABLE)
         self.assertEqual(result.latest_version, "3.7.0")
@@ -759,10 +1549,21 @@ class UpdateCheckServiceTests(unittest.TestCase):
             manifest_path, sig_path, public_pem = _signed_manifest(root)
             state = LocalUpdateState(last_seen_version="3.8.0")
 
+            def record_seen(version, *, release_revision):
+                state.last_seen_version = version
+                state.last_seen_revision = release_revision
+                return state
+
             with (
-                patch("app.services.update_check_service.user_cache_root", return_value=root / "cache"),
+                patch(
+                    "app.services.update_check_service.default_update_metadata_dir",
+                    return_value=root,
+                ),
                 patch("app.services.update_check_service.load_local_update_state", return_value=state),
-                patch("app.services.update_check_service.save_local_update_state") as save_state,
+                patch(
+                    "app.services.update_check_service.record_last_seen_update",
+                    side_effect=record_seen,
+                ) as record_seen_update,
             ):
                 result = check_secure_update(
                     "v3.6.17",
@@ -775,7 +1576,7 @@ class UpdateCheckServiceTests(unittest.TestCase):
 
         self.assertEqual(result.status, UPDATE_STATUS_AVAILABLE)
         self.assertEqual(state.last_seen_version, "3.7.0")
-        save_state.assert_called_once_with(state)
+        record_seen_update.assert_called_once_with("3.7.0", release_revision=0)
 
     def test_secure_update_rejects_manifest_requiring_newer_client(self):
         from tempfile import TemporaryDirectory
@@ -801,19 +1602,22 @@ class UpdateCheckServiceTests(unittest.TestCase):
     def test_main_window_update_flow_uses_secure_manifest_path(self):
         source = Path("app/ui/main_window.py").read_text(encoding="utf-8")
         service_source = Path("app/services/update_check_service.py").read_text(encoding="utf-8")
-        combined = source + service_source
+        launcher_source = Path("app/services/updater_helper_launcher.py").read_text(
+            encoding="utf-8"
+        )
+        combined = source + service_source + launcher_source
 
         self.assertIn("check_secure_update", source)
         self.assertIn("_download_verified_update", source)
         self.assertIn("_cancel_update_download", source)
         self.assertIn("launch_prepared_update", source)
         self.assertIn('"updater_helper.exe"', service_source)
-        self.assertIn('"--wait-pid"', service_source)
-        self.assertIn('"--install-dir"', service_source)
-        self.assertIn('"--manifest"', service_source)
-        self.assertIn('"--signature"', service_source)
+        self.assertIn('"--wait-pid"', launcher_source)
+        self.assertIn('"--install-dir"', launcher_source)
+        self.assertIn('"--manifest"', launcher_source)
+        self.assertIn('"--signature"', launcher_source)
         self.assertNotIn('"--asset-json"', combined)
-        self.assertIn('"shell": False', service_source)
+        self.assertIn('"shell": False', launcher_source)
         self.assertIn("record_skipped_update", source)
         self.assertIn("跳过此修订", source)
         self.assertNotIn("下载和安装稍后接入", source)
@@ -821,6 +1625,13 @@ class UpdateCheckServiceTests(unittest.TestCase):
 
     def test_launch_prepared_update_uses_verified_server_side_paths(self):
         from tempfile import TemporaryDirectory
+
+        from app.services.update_check_service import REVISION_AUTH_TOKEN_ENV
+        from app.services.updater_launch_capability import (
+            LAUNCH_CAPABILITY_TOKEN_ENV,
+            RESTART_HANDOFF_TOKEN_ENV,
+        )
+        from shared.release_identity import ReleaseIdentity
 
         with TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -845,6 +1656,26 @@ class UpdateCheckServiceTests(unittest.TestCase):
             popen = Mock()
             with (
                 patch("app.services.update_check_service.record_pending_install") as record_pending,
+                patch(
+                    "app.services.update_check_service.default_update_staging_dir",
+                    return_value=root,
+                ),
+                patch(
+                    "app.services.update_check_service.default_update_metadata_dir",
+                    return_value=root,
+                ),
+                patch(
+                    "app.services.update_check_service.load_installed_release_identity",
+                    return_value=ReleaseIdentity("3.6.17", 1),
+                ),
+                patch.dict(
+                    os.environ,
+                    {
+                        LAUNCH_CAPABILITY_TOKEN_ENV: "stale-launch-token",
+                        REVISION_AUTH_TOKEN_ENV: "stale-revision-token",
+                        RESTART_HANDOFF_TOKEN_ENV: "stale-restart-token",
+                    },
+                ),
                 patch.object(sys, "frozen", True, create=True),
                 patch.object(sys, "executable", str(app_exe)),
             ):
@@ -870,12 +1701,406 @@ class UpdateCheckServiceTests(unittest.TestCase):
             popen.call_args.kwargs["creationflags"],
             getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
+        child_environment = popen.call_args.kwargs["env"]
+        self.assertNotEqual(
+            child_environment[LAUNCH_CAPABILITY_TOKEN_ENV],
+            "stale-launch-token",
+        )
+        self.assertNotIn(REVISION_AUTH_TOKEN_ENV, child_environment)
+        self.assertNotIn(RESTART_HANDOFF_TOKEN_ENV, child_environment)
         self.assertEqual(record_pending.call_args.kwargs["release_revision"], 2)
+
+    def test_launch_prepared_update_restores_previous_state_when_popen_fails(self):
+        from tempfile import TemporaryDirectory
+
+        from app.services.secure_updater import PendingInstall
+        from shared.release_identity import ReleaseIdentity
+
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            installer = root / "update.exe"
+            manifest = root / "latest.json"
+            signature = root / "latest.json.sig"
+            for path in (installer, manifest, signature):
+                path.write_bytes(b"verified")
+            app_exe = root / "CrawlerWebPortal.exe"
+            helper_exe = root / "updater_helper.exe"
+            app_exe.write_bytes(b"app")
+            helper_exe.write_bytes(b"helper")
+            prepared = PreparedUpdate(
+                installer_path=os.fspath(installer),
+                manifest_path=os.fspath(manifest),
+                signature_path=os.fspath(signature),
+                version="3.6.18",
+                log_path=os.fspath(root / "install.log"),
+            )
+            previous_pending = PendingInstall(version="3.6.17")
+            primary = RuntimeError("process creation failed")
+
+            def record_pending(**kwargs):
+                kwargs["previous_pending_out"].append(previous_pending)
+
+            with (
+                patch(
+                    "app.services.update_check_service.record_pending_install",
+                    side_effect=record_pending,
+                ),
+                patch(
+                    "app.services.update_check_service.rollback_pending_install"
+                ) as rollback_pending,
+                patch(
+                    "app.services.update_check_service.default_update_staging_dir",
+                    return_value=root,
+                ),
+                patch(
+                    "app.services.update_check_service.default_update_metadata_dir",
+                    return_value=root,
+                ),
+                patch(
+                    "app.services.update_check_service.load_installed_release_identity",
+                    return_value=ReleaseIdentity("3.6.17", 0),
+                ),
+                patch.object(sys, "frozen", True, create=True),
+                patch.object(sys, "executable", str(app_exe)),
+            ):
+                with self.assertRaises(RuntimeError) as raised:
+                    launch_prepared_update(
+                        prepared,
+                        restart_argv=[str(app_exe)],
+                        popen=Mock(side_effect=primary),
+                    )
+
+        self.assertIs(raised.exception, primary)
+        rollback_pending.assert_called_once()
+        self.assertIs(
+            rollback_pending.call_args.kwargs["restore_pending"],
+            previous_pending,
+        )
+
+    def test_launch_prepared_update_rejects_install_root_replacement(self):
+        from tempfile import TemporaryDirectory
+
+        import app.services.updater_installer_lease as installer_lease_module
+        from shared.release_identity import ReleaseIdentity
+
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            staging = root / "staging"
+            metadata = root / "metadata"
+            install_root = root / "install"
+            outside_root = root / "outside-install"
+            for directory in (staging, metadata, install_root, outside_root):
+                directory.mkdir()
+            installer = staging / "update.exe"
+            manifest = metadata / "latest.json"
+            signature = metadata / "latest.json.sig"
+            for path in (installer, manifest, signature):
+                path.write_bytes(b"verified")
+            app_exe = install_root / "CrawlerWebPortal.exe"
+            helper_exe = install_root / "updater_helper.exe"
+            app_exe.write_bytes(b"app")
+            helper_exe.write_bytes(b"approved helper")
+            (outside_root / helper_exe.name).write_bytes(b"outside helper")
+            probe = root / "directory-link-probe"
+            try:
+                probe.symlink_to(outside_root, target_is_directory=True)
+                probe.unlink()
+            except OSError as exc:
+                self.skipTest(f"directory symlink creation unavailable: {exc}")
+            moved_root = root / "install-before-swap"
+            prepared = PreparedUpdate(
+                installer_path=os.fspath(installer),
+                manifest_path=os.fspath(manifest),
+                signature_path=os.fspath(signature),
+                version="3.6.18",
+                log_path=os.fspath(staging / "install.log"),
+            )
+            real_require = installer_lease_module.require_regular_file
+
+            def require_then_swap(path: Path, *, approved_root: Path) -> Path:
+                result = real_require(path, approved_root=approved_root)
+                install_root.rename(moved_root)
+                install_root.symlink_to(outside_root, target_is_directory=True)
+                return result
+
+            popen = Mock(side_effect=AssertionError("outside helper must not launch"))
+            with (
+                patch.object(
+                    installer_lease_module,
+                    "require_regular_file",
+                    side_effect=require_then_swap,
+                ),
+                patch(
+                    "app.services.update_check_service.default_update_staging_dir",
+                    return_value=staging,
+                ),
+                patch(
+                    "app.services.update_check_service.default_update_metadata_dir",
+                    return_value=metadata,
+                ),
+                patch(
+                    "app.services.update_check_service.load_installed_release_identity",
+                    return_value=ReleaseIdentity("3.6.17", 0),
+                ),
+                patch.object(sys, "frozen", True, create=True),
+                patch.object(sys, "executable", str(app_exe)),
+            ):
+                with self.assertRaises(UpdateCheckError):
+                    launch_prepared_update(
+                        prepared,
+                        restart_argv=[],
+                        popen=popen,
+                    )
+
+            popen.assert_not_called()
+            self.assertEqual(
+                (outside_root / helper_exe.name).read_bytes(),
+                b"outside helper",
+            )
+
+    def test_launch_prepared_update_rejects_helper_file_replacement(self):
+        from tempfile import TemporaryDirectory
+
+        import shared.filesystem_directory_capability as capability_module
+        from shared.release_identity import ReleaseIdentity
+
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            staging = root / "staging"
+            metadata = root / "metadata"
+            install_root = root / "install"
+            for directory in (staging, metadata, install_root):
+                directory.mkdir()
+            installer = staging / "update.exe"
+            manifest = metadata / "latest.json"
+            signature = metadata / "latest.json.sig"
+            for path in (installer, manifest, signature):
+                path.write_bytes(b"verified")
+            app_exe = install_root / "CrawlerWebPortal.exe"
+            helper_exe = install_root / "updater_helper.exe"
+            replacement = install_root / "replacement-helper.exe"
+            original = install_root / "approved-helper.exe"
+            app_exe.write_bytes(b"app")
+            helper_exe.write_bytes(b"approved helper")
+            replacement.write_bytes(b"outside helper")
+            prepared = PreparedUpdate(
+                installer_path=os.fspath(installer),
+                manifest_path=os.fspath(manifest),
+                signature_path=os.fspath(signature),
+                version="3.6.18",
+                log_path=os.fspath(staging / "install.log"),
+            )
+            real_stat_child = capability_module.FilesystemDirectoryCapability.stat_child
+            swapped = False
+
+            def stat_then_replace(capability, name: str):
+                nonlocal swapped
+                result = real_stat_child(capability, name)
+                if not swapped and name == helper_exe.name:
+                    swapped = True
+                    helper_exe.replace(original)
+                    replacement.replace(helper_exe)
+                return result
+
+            launch_capability = metadata / ".launch-test.json"
+            launch_capability.write_bytes(b"capability")
+
+            def reject_outside_helper(argv, **_kwargs):
+                self.assertEqual(Path(argv[0]).read_bytes(), b"outside helper")
+                raise AssertionError("replaced helper must not launch")
+
+            with (
+                patch.object(
+                    capability_module.FilesystemDirectoryCapability,
+                    "stat_child",
+                    new=stat_then_replace,
+                ),
+                patch(
+                    "app.services.update_check_service.default_update_staging_dir",
+                    return_value=staging,
+                ),
+                patch(
+                    "app.services.update_check_service.default_update_metadata_dir",
+                    return_value=metadata,
+                ),
+                patch(
+                    "app.services.update_check_service.load_installed_release_identity",
+                    return_value=ReleaseIdentity("3.6.17", 0),
+                ),
+                patch(
+                    "app.services.updater_helper_launcher.issue_launch_capability",
+                    return_value=(launch_capability, "launch-token"),
+                ),
+                patch("app.services.update_check_service.record_pending_install"),
+                patch.object(sys, "frozen", True, create=True),
+                patch.object(sys, "executable", str(app_exe)),
+            ):
+                with self.assertRaises(UpdateCheckError):
+                    launch_prepared_update(
+                        prepared,
+                        restart_argv=[],
+                        popen=reject_outside_helper,
+                    )
+
+            self.assertEqual(helper_exe.read_bytes(), b"outside helper")
+
+    def test_launch_success_survives_helper_directory_lease_cleanup_failure(self):
+        from tempfile import TemporaryDirectory
+
+        import shared.filesystem_directory_capability as capability_module
+        from shared.release_identity import ReleaseIdentity
+
+        class HostileCleanup(BaseException):
+            pass
+
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            staging = root / "staging"
+            metadata = root / "metadata"
+            install_root = root / "install"
+            for directory in (staging, metadata, install_root):
+                directory.mkdir()
+            installer = staging / "update.exe"
+            manifest = metadata / "latest.json"
+            signature = metadata / "latest.json.sig"
+            for path in (installer, manifest, signature):
+                path.write_bytes(b"verified")
+            app_exe = install_root / "CrawlerWebPortal.exe"
+            helper_exe = install_root / "updater_helper.exe"
+            app_exe.write_bytes(b"app")
+            helper_exe.write_bytes(b"approved helper")
+            prepared = PreparedUpdate(
+                installer_path=os.fspath(installer),
+                manifest_path=os.fspath(manifest),
+                signature_path=os.fspath(signature),
+                version="3.6.18",
+                log_path=os.fspath(staging / "install.log"),
+            )
+            launch_capability = metadata / ".launch-test.json"
+            launch_capability.write_bytes(b"capability")
+            process = object()
+            rollback_pending = Mock()
+            cleanup_events = Mock()
+            real_close = capability_module.FilesystemDirectoryCapability.close
+            cleanup_armed = False
+
+            def close_then_fail(capability) -> None:
+                nonlocal cleanup_armed
+                real_close(capability)
+                if cleanup_armed:
+                    cleanup_armed = False
+                    raise HostileCleanup("directory lease cleanup failed")
+
+            def start_process(*_args, **_kwargs):
+                nonlocal cleanup_armed
+                cleanup_armed = True
+                return process
+
+            with (
+                patch.object(
+                    capability_module.FilesystemDirectoryCapability,
+                    "close",
+                    new=close_then_fail,
+                ),
+                patch(
+                    "app.services.update_check_service.default_update_staging_dir",
+                    return_value=staging,
+                ),
+                patch(
+                    "app.services.update_check_service.default_update_metadata_dir",
+                    return_value=metadata,
+                ),
+                patch(
+                    "app.services.update_check_service.load_installed_release_identity",
+                    return_value=ReleaseIdentity("3.6.17", 0),
+                ),
+                patch(
+                    "app.services.updater_helper_launcher.issue_launch_capability",
+                    return_value=(launch_capability, "launch-token"),
+                ),
+                patch("app.services.update_check_service.record_pending_install"),
+                patch(
+                    "app.services.update_check_service.rollback_pending_install",
+                    rollback_pending,
+                ),
+                patch(
+                    "app.services.update_check_service.log_update_event",
+                    cleanup_events,
+                ),
+                patch.object(sys, "frozen", True, create=True),
+                patch.object(sys, "executable", str(app_exe)),
+            ):
+                result = launch_prepared_update(
+                    prepared,
+                    restart_argv=[],
+                    popen=start_process,
+                )
+
+            self.assertIs(result, process)
+            self.assertTrue(launch_capability.exists())
+            rollback_pending.assert_not_called()
+            cleanup_events.assert_called_once()
+
+    def test_prepare_does_not_unlink_replaced_package_after_verification_failure(self):
+        from tempfile import TemporaryDirectory
+
+        from app.services.secure_updater import VerificationError
+        from tests.release.updater.test_secure_updater import _signed_manifest
+
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            manifest_path, signature_path, public_pem = _signed_manifest(root)
+            installer = root / "installer.exe"
+            installer.write_bytes(b"hash-verified-only")
+            primary = VerificationError("OS package signature failed")
+
+            class FakeDownloader:
+                def __init__(self, **_kwargs):
+                    return None
+
+                def download(self, *_args, **_kwargs):
+                    return installer
+
+            class FailingPackageVerifier:
+                def __init__(self, **_kwargs):
+                    return None
+
+                def verify(self, path, *_args, **_kwargs):
+                    Path(path).write_bytes(b"later installer generation")
+                    raise primary
+
+            result = UpdateCheckResult(
+                status=UPDATE_STATUS_AVAILABLE,
+                local_version="3.6.17",
+                latest_version="3.7.0",
+                tag_name="v3.7.0",
+                release_name="v3.7.0",
+                html_url="https://github.com/owner/repo/releases/tag/v3.7.0",
+                manifest_path=os.fspath(manifest_path),
+                signature_path=os.fspath(signature_path),
+            )
+
+            with patch(
+                "app.services.update_check_service.default_update_staging_dir",
+                return_value=root,
+            ):
+                with self.assertRaises(VerificationError) as raised:
+                    prepare_verified_update(
+                        result,
+                        public_key_pem=public_pem,
+                        require_os_signature=True,
+                        downloader_cls=FakeDownloader,
+                        package_verifier_cls=FailingPackageVerifier,
+                    )
+
+            self.assertIs(raised.exception, primary)
+            self.assertEqual(installer.read_bytes(), b"later installer generation")
 
     def test_launch_revision_change_keeps_one_time_token_out_of_helper_argv(self):
         from tempfile import TemporaryDirectory
 
         from app.services.update_check_service import REVISION_AUTH_TOKEN_ENV
+        from shared.release_identity import ReleaseIdentity
 
         with TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -903,6 +2128,18 @@ class UpdateCheckServiceTests(unittest.TestCase):
             popen = Mock()
             with (
                 patch("app.services.update_check_service.record_pending_install"),
+                patch(
+                    "app.services.update_check_service.default_update_staging_dir",
+                    return_value=root,
+                ),
+                patch(
+                    "app.services.update_check_service.default_update_metadata_dir",
+                    return_value=root,
+                ),
+                patch(
+                    "app.services.update_check_service.load_installed_release_identity",
+                    return_value=ReleaseIdentity("3.6.17", 0),
+                ),
                 patch.object(sys, "frozen", True, create=True),
                 patch.object(sys, "executable", str(app_exe)),
             ):
@@ -1033,21 +2270,34 @@ class UpdateCheckServiceTests(unittest.TestCase):
                 def verify(self, *_args, **_kwargs):
                     return None
 
-            with self.assertRaisesRegex(VerificationError, "explicit local authorization"):
-                prepare_verified_update(
+            with (
+                patch(
+                    "app.services.update_check_service.default_update_staging_dir",
+                    return_value=root,
+                ),
+                patch(
+                    "app.services.update_check_service.default_update_metadata_dir",
+                    return_value=root,
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    VerificationError,
+                    "explicit local authorization",
+                ):
+                    prepare_verified_update(
+                        result,
+                        public_key_pem=public_pem,
+                        downloader_cls=FakeDownloader,
+                        package_verifier_cls=FakePackageVerifier,
+                    )
+
+                prepared = prepare_verified_update(
                     result,
                     public_key_pem=public_pem,
                     downloader_cls=FakeDownloader,
                     package_verifier_cls=FakePackageVerifier,
+                    allow_downgrade=True,
                 )
-
-            prepared = prepare_verified_update(
-                result,
-                public_key_pem=public_pem,
-                downloader_cls=FakeDownloader,
-                package_verifier_cls=FakePackageVerifier,
-                allow_downgrade=True,
-            )
 
             authorization_path = Path(prepared.revision_authorization_path)
             self.assertTrue(authorization_path.is_file())
@@ -1179,6 +2429,69 @@ class UpdateCheckServiceTests(unittest.TestCase):
         self.assertEqual(kwargs["status"], "error")
         self.assertEqual(kwargs["local_version"], "v3.6.17")
         self.assertEqual(kwargs["latest_version"], "v3.8.0")
+
+    def test_main_window_dialog_defaults_to_the_service_selected_candidate(self):
+        from app.ui.dialogs.update_check import UpdateCheckDialog as RealUpdateCheckDialog
+        from app.ui.main_window import MainWindow
+
+        qt_app = _qt_app()
+        captured: dict[str, object] = {}
+
+        class CapturingDialog(RealUpdateCheckDialog):
+            SKIP_CODE = RealUpdateCheckDialog.SKIP_CODE
+
+            def __init__(self, _parent, **kwargs) -> None:
+                super().__init__(None, **kwargs)
+                captured["selected_candidate_id"] = self.selected_update_candidate_id()
+
+            def exec(self) -> int:
+                self.deleteLater()
+                return 0
+
+        host = type(
+            "Host",
+            (),
+            {
+                "_tr": lambda self, text: text,
+                "_current_ui_language": lambda self: "en-US",
+            },
+        )()
+        result = UpdateCheckResult(
+            status=UPDATE_STATUS_AVAILABLE,
+            local_version="3.6.17",
+            latest_version="3.7.0",
+            latest_revision=1,
+            tag_name="v3.7.0-r1",
+            release_name="Release 3.7.0 revision 1",
+            html_url="https://example.test/releases/v3.7.0-r1",
+            candidates=(
+                UpdateCandidate(
+                    version="3.7.0",
+                    release_revision=2,
+                    tag_name="v3.7.0-r2",
+                    release_name="Release 3.7.0 revision 2",
+                    html_url="https://example.test/releases/v3.7.0-r2",
+                ),
+                UpdateCandidate(
+                    version="3.7.0",
+                    release_revision=1,
+                    tag_name="v3.7.0-r1",
+                    release_name="Release 3.7.0 revision 1",
+                    html_url="https://example.test/releases/v3.7.0-r1",
+                ),
+            ),
+        )
+
+        with patch("app.ui.main_window.UpdateCheckDialog", CapturingDialog):
+            MainWindow._show_update_available_message(
+                host,
+                result.local_identity.tag,
+                result.selected_identity.tag,
+                result,
+            )
+
+        self.assertEqual(captured["selected_candidate_id"], "v3.7.0-r1")
+        self.assertIsNotNone(qt_app)
 
     def test_generic_update_error_preserves_known_local_version(self):
         from app.ui.main_window import MainWindow
@@ -1541,3 +2854,39 @@ class StatusBarUpdateCheckInteractionTests(unittest.TestCase):
         self.assertEqual(dialog.selected_update_candidate_id(), "v3.8.0-r1")
         self.assertIn("Revision 1", combo.currentText())
         self.assertIn("notes 3.8.0 r1", details_text)
+
+    def test_update_check_dialog_default_follows_service_selected_identity(self):
+        from app.services.update_check_service import UpdateCandidate
+        from app.ui.dialogs.update_check import UpdateCheckDialog
+
+        selected_url = "https://github.com/haohaizi554/UniversalCrawler/releases/tag/v3.7.0"
+        dialog = UpdateCheckDialog(
+            None,
+            title="Update available",
+            message="Select an update",
+            status=UPDATE_STATUS_AVAILABLE,
+            local_version="v3.6.17",
+            latest_version="v3.7.0-r1",
+            release_url=selected_url,
+            language="en-US",
+            candidates=(
+                UpdateCandidate(
+                    version="3.7.0",
+                    release_revision=2,
+                    tag_name="v3.7.0-r2",
+                    release_name="Release 3.7.0 revision 2",
+                    html_url=selected_url,
+                ),
+                UpdateCandidate(
+                    version="3.7.0",
+                    release_revision=1,
+                    tag_name="v3.7.0-r1",
+                    release_name="Release 3.7.0 revision 1",
+                    html_url=selected_url,
+                ),
+            ),
+        )
+        self.addCleanup(dialog.deleteLater)
+
+        self.assertEqual(dialog.selected_update_candidate_id(), "v3.7.0-r1")
+        self.assertEqual(dialog.selected_update_version(), "3.7.0")

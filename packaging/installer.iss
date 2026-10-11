@@ -221,9 +221,11 @@ end;
 function ShouldCompleteHotUpdate(): Boolean;
 var
   HandoffPath: String;
+  HandoffToken: String;
 begin
   HandoffPath := ExpandConstant('{param:UCrawlRestartHandoff|}');
-  Result := (HandoffPath <> '') and FileExists(HandoffPath);
+  HandoffToken := GetEnv('UCRAWL_RESTART_HANDOFF_TOKEN');
+  Result := (HandoffPath <> '') and (HandoffToken <> '') and FileExists(HandoffPath);
 end;
 
 [Run]

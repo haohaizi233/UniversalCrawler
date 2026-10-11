@@ -12,20 +12,16 @@ import json
 import os
 import platform
 import re
-import shutil
 import subprocess
 import sys
-import tempfile
-import time
 import urllib.error
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
-from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from email.message import Message
 from pathlib import Path
-from threading import Event
 from typing import Any, Callable, Mapping
 
 # ``Crypto`` 来自仍在维护的 PyCryptodome，而不是已停止维护的 PyCrypto。
@@ -35,12 +31,52 @@ from defusedxml import ElementTree as DefusedET
 from defusedxml.common import DefusedXmlException
 
 from app.debug_logger import debug_logger
+from app.services.github_release_pages import (
+    GitHubReleasePageError,
+    collect_release_candidates,
+)
+from app.services.updater_atomic_io import atomic_write_text
+from app.services.updater_cleanup import run_typed_cleanup_actions
+from app.services.updater_downloader import (
+    DEFAULT_DOWNLOAD_TIMEOUT_SECONDS as _DEFAULT_DOWNLOAD_TIMEOUT_SECONDS,
+    DEFAULT_MAX_DOWNLOAD_BYTES as _DEFAULT_MAX_DOWNLOAD_BYTES,
+    DEFAULT_MAX_UPDATER_REDIRECT_BYTES as _DEFAULT_MAX_UPDATER_REDIRECT_BYTES,
+    DownloadError as _DownloadError,
+    Downloader as _Downloader,
+)
+from app.services.updater_manifest_json import (
+    StrictManifestJsonError,
+    load_strict_manifest_json,
+)
+from app.services.updater_installer_runner import (
+    InstallerRunnerCore,
+    build_installer_argv,
+)
+from app.services.updater_package_verification import PlatformPackageVerifier
+from app.services.updater_path_safety import (
+    open_regular_binary,
+    read_bounded_regular_bytes,
+)
+from app.services.updater_release_cache import load_release_cache, save_release_cache
+from app.services.updater_state_model import LocalUpdateState, PendingInstall
+from app.services.updater_state_transactions import mutate_update_state
+from app.services.updater_transport import open_pinned_updater_url
 from app.utils.runtime_paths import user_cache_root, user_logs_root
-from shared.release_identity import ReleaseIdentity, SemVer, compare_semver  # noqa: F401 - 兼容导出
+from shared.network.pinned_transport import PinnedTransport, canonicalize_host
+from shared.runtime_options import DomainPolicyViolation
+from shared.release_identity import (  # noqa: F401 - 兼容导出
+    MAX_RELEASE_REVISION,
+    ReleaseIdentity,
+    SemVer,
+    compare_semver,
+)
 
 APP_ID = "ucrawl.universalcrawlerpro"
 DEFAULT_CHANNEL = "stable"
 MANIFEST_SCHEMA_VERSION = 1
+DEFAULT_DOWNLOAD_TIMEOUT_SECONDS = _DEFAULT_DOWNLOAD_TIMEOUT_SECONDS
+DEFAULT_MAX_DOWNLOAD_BYTES = _DEFAULT_MAX_DOWNLOAD_BYTES
+DEFAULT_MAX_UPDATER_REDIRECT_BYTES = _DEFAULT_MAX_UPDATER_REDIRECT_BYTES
 DEFAULT_MANIFEST_NAME = "latest.json"
 DEFAULT_SIGNATURE_NAME = "latest.json.sig"
 DEFAULT_ALLOWED_HOSTS = frozenset(
@@ -50,10 +86,13 @@ DEFAULT_ALLOWED_HOSTS = frozenset(
         "release-assets.githubusercontent.com",
     }
 )
-DEFAULT_MAX_DOWNLOAD_BYTES = 2 * 1024 * 1024 * 1024
 DEFAULT_MAX_RELEASE_FEED_BYTES = 2_000_000
-DEFAULT_DOWNLOAD_TIMEOUT_SECONDS = 30.0
+DEFAULT_MAX_RELEASE_API_BYTES = 2_000_000
 DEFAULT_INSTALL_ATTEMPT_LIMIT = 2
+MAX_MANIFEST_FUTURE_SKEW = timedelta(minutes=5)
+MAX_MANIFEST_VALIDITY = timedelta(days=30)
+MAX_SIGNED_MANIFEST_BYTES = 2_000_000
+ED25519_SIGNATURE_BYTES = 64
 UrlOpener = Callable[..., Any]
 
 
@@ -89,14 +128,24 @@ def open_trusted_url(
     timeout: float,
     allowed_hosts: set[str] | frozenset[str],
     development_mode: bool = False,
+    max_response_bytes: int = DEFAULT_MAX_RELEASE_API_BYTES,
 ) -> Any:
     """打开受信 URL，并把同一策略应用到每一次 HTTP 重定向。"""
 
     validate_asset_url(request.full_url, allowed_hosts, development_mode=development_mode)
-    opener = urllib.request.build_opener(
-        TrustedRedirectHandler(allowed_hosts, development_mode=development_mode)
+    if development_mode:
+        opener = urllib.request.build_opener(
+            TrustedRedirectHandler(allowed_hosts, development_mode=True)
+        )
+        return opener.open(request, timeout=timeout)
+    return open_pinned_updater_url(
+        request,
+        timeout=timeout,
+        max_response_bytes=max_response_bytes,
+        allowed_hosts=allowed_hosts,
+        validate_url=validate_asset_url,
+        transport_factory=PinnedTransport,
     )
-    return opener.open(request, timeout=timeout)
 
 
 def _response_final_url(response: Any, fallback: str) -> str:
@@ -104,30 +153,19 @@ def _response_final_url(response: Any, fallback: str) -> str:
     return str(getter() if callable(getter) else fallback)
 
 
+def _response_close_action(response: Any) -> Callable[[], object]:
+    def close() -> object:
+        candidate = getattr(response, "close", None)
+        if callable(candidate):
+            return candidate()
+        return None
+
+    return close
+
+
 def _atomic_write_text(path: Path, content: str) -> None:
     """在目标目录写入并 fsync 临时文件，再原子替换，避免暴露半写 JSON。"""
-    target = Path(path)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    temp_path: Path | None = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            encoding="utf-8",
-            newline="\n",
-            dir=target.parent,
-            prefix=f".{target.name}.",
-            suffix=".tmp",
-            delete=False,
-        ) as handle:
-            temp_path = Path(handle.name)
-            handle.write(content)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temp_path, target)
-        temp_path = None
-    finally:
-        if temp_path is not None:
-            temp_path.unlink(missing_ok=True)
+    atomic_write_text(path, content)
 DEFAULT_UPDATE_STATE_NAME = "state.json"
 DEFAULT_AUTO_CHECK_INTERVAL_SECONDS = 6 * 60 * 60
 
@@ -136,12 +174,7 @@ class ManifestError(RuntimeError):
     """签名 manifest 缺失、无效或违反安全约束。"""
 
 
-class DownloadError(RuntimeError):
-    """更新下载、GitHub API 或 staging 失败。"""
-
-    def __init__(self, message: str, *, keep_partial: bool = False) -> None:
-        super().__init__(message)
-        self.keep_partial = bool(keep_partial)
+DownloadError = _DownloadError
 
 
 class MetadataNotFoundError(DownloadError):
@@ -156,6 +189,57 @@ class InstallError(RuntimeError):
     """已验证安装包无法按当前平台策略启动。"""
 
 
+def _manifest_field(
+    data: Mapping[str, Any],
+    name: str,
+    *,
+    legacy_name: str = "",
+    required: bool = True,
+    default: Any = None,
+) -> Any:
+    names = (name, legacy_name) if legacy_name else (name,)
+    present = [candidate for candidate in names if candidate in data]
+    if len(present) > 1:
+        raise ManifestError(f"manifest {name} has duplicate aliases")
+    if not present:
+        if required:
+            raise ManifestError(f"manifest {name} is required")
+        return default
+    return data[present[0]]
+
+
+def _manifest_string(
+    data: Mapping[str, Any],
+    name: str,
+    *,
+    legacy_name: str = "",
+    required: bool = True,
+    default: str = "",
+) -> str:
+    value = _manifest_field(
+        data,
+        name,
+        legacy_name=legacy_name,
+        required=required,
+        default=default,
+    )
+    if type(value) is not str:
+        raise ManifestError(f"manifest {name} must be a string")
+    return value
+
+
+def _asset_string(
+    data: Mapping[str, Any],
+    name: str,
+    *,
+    legacy_name: str = "",
+) -> str:
+    value = _manifest_field(data, name, legacy_name=legacy_name)
+    if type(value) is not str:
+        raise ManifestError(f"manifest asset {name} must be a string")
+    return value
+
+
 @dataclass(frozen=True)
 class UpdateAsset:
     name: str
@@ -168,14 +252,23 @@ class UpdateAsset:
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "UpdateAsset":
+        if not isinstance(data, Mapping):
+            raise ManifestError("manifest asset entry must be an object")
+        size = _manifest_field(data, "size")
+        if type(size) is not int:
+            raise ManifestError("manifest asset size must be an integer")
         return cls(
-            name=str(data.get("name") or ""),
-            url=str(data.get("url") or ""),
-            sha256=str(data.get("sha256") or "").lower(),
-            size=int(data.get("size") or 0),
-            installer_type=str(data.get("installerType") or data.get("installer_type") or ""),
-            os=str(data.get("os") or "").lower(),
-            arch=normalize_arch(data.get("arch") or ""),
+            name=_asset_string(data, "name"),
+            url=_asset_string(data, "url"),
+            sha256=_asset_string(data, "sha256").lower(),
+            size=size,
+            installer_type=_asset_string(
+                data,
+                "installerType",
+                legacy_name="installer_type",
+            ),
+            os=_asset_string(data, "os").lower(),
+            arch=normalize_arch(_asset_string(data, "arch")),
         )
 
 
@@ -202,29 +295,75 @@ class UpdateManifest:
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "UpdateManifest":
-        assets_raw = data.get("assets")
+        if not isinstance(data, Mapping):
+            raise ManifestError("manifest root must be an object")
+        assets_raw = _manifest_field(data, "assets")
         if not isinstance(assets_raw, Mapping):
             raise ManifestError("manifest assets must be a map")
-        assets = {str(key): UpdateAsset.from_dict(value) for key, value in assets_raw.items() if isinstance(value, Mapping)}
-        trusted_hosts = tuple(str(host).lower() for host in data.get("trustedHosts") or () if host)
-        revision = data.get("releaseRevision", 0)
-        if isinstance(revision, bool) or not isinstance(revision, int) or revision < 0:
-            raise ManifestError("manifest release revision must be a non-negative integer")
+        assets: dict[str, UpdateAsset] = {}
+        for key, value in assets_raw.items():
+            if type(key) is not str:
+                raise ManifestError("manifest asset keys must be strings")
+            if not isinstance(value, Mapping):
+                raise ManifestError("manifest asset entry must be an object")
+            assets[key] = UpdateAsset.from_dict(value)
+        trusted_hosts_raw = _manifest_field(
+            data,
+            "trustedHosts",
+            required=False,
+            default=[],
+        )
+        if type(trusted_hosts_raw) is not list or any(
+            type(host) is not str or not host for host in trusted_hosts_raw
+        ):
+            raise ManifestError("manifest trustedHosts must be an array of strings")
+        trusted_hosts = _canonicalize_manifest_hosts(trusted_hosts_raw)
+        revision = _manifest_field(
+            data,
+            "releaseRevision",
+            required=False,
+            default=0,
+        )
+        if type(revision) is not int or not 0 <= revision <= MAX_RELEASE_REVISION:
+            raise ManifestError("manifest release revision is outside the supported range")
+        schema = _manifest_field(data, "schema")
+        if type(schema) is not int:
+            raise ManifestError("manifest schema must be an integer")
+        mandatory = _manifest_field(data, "mandatory")
+        if type(mandatory) is not bool:
+            raise ManifestError("manifest mandatory must be a boolean")
         return cls(
-            schema=int(data.get("schema") or 0),
-            app_id=str(data.get("appId") or data.get("app_id") or ""),
-            channel=str(data.get("channel") or ""),
-            version=str(data.get("version") or ""),
-            tag=str(data.get("tag") or ""),
-            published_at=str(data.get("publishedAt") or data.get("published_at") or ""),
-            expires_at=str(data.get("expiresAt") or data.get("expires_at") or ""),
-            min_client_version=str(data.get("minClientVersion") or data.get("min_client_version") or ""),
-            mandatory=bool(data.get("mandatory")),
-            notes=str(data.get("notes") or ""),
+            schema=schema,
+            app_id=_manifest_string(data, "appId", legacy_name="app_id"),
+            channel=_manifest_string(data, "channel"),
+            version=_manifest_string(data, "version"),
+            tag=_manifest_string(data, "tag"),
+            published_at=_manifest_string(
+                data,
+                "publishedAt",
+                legacy_name="published_at",
+            ),
+            expires_at=_manifest_string(
+                data,
+                "expiresAt",
+                legacy_name="expires_at",
+            ),
+            min_client_version=_manifest_string(
+                data,
+                "minClientVersion",
+                legacy_name="min_client_version",
+            ),
+            mandatory=mandatory,
+            notes=_manifest_string(data, "notes", required=False),
             assets=assets,
             trusted_hosts=trusted_hosts,
             release_revision=revision,
-            source_commit=str(data.get("sourceCommit") or data.get("source_commit") or "").strip().lower(),
+            source_commit=_manifest_string(
+                data,
+                "sourceCommit",
+                legacy_name="source_commit",
+                required=False,
+            ).strip().lower(),
         )
 
 
@@ -247,16 +386,35 @@ class UpdateManifestVerifier:
         self._now = now or (lambda: datetime.now(timezone.utc))
 
     def load_verified(self, manifest_path: Path, signature_path: Path) -> UpdateManifest:
-        manifest_bytes = Path(manifest_path).read_bytes()
-        signature = Path(signature_path).read_bytes()
+        manifest_file = Path(os.path.abspath(os.fspath(manifest_path)))
+        signature_file = Path(os.path.abspath(os.fspath(signature_path)))
+        if os.path.normcase(os.fspath(manifest_file.parent)) != os.path.normcase(
+            os.fspath(signature_file.parent)
+        ):
+            raise ManifestError("manifest and signature must share one approved directory")
+        try:
+            manifest_bytes = read_bounded_regular_bytes(
+                manifest_file,
+                approved_root=manifest_file.parent,
+                maximum=MAX_SIGNED_MANIFEST_BYTES,
+            )
+            signature = read_bounded_regular_bytes(
+                signature_file,
+                approved_root=manifest_file.parent,
+                maximum=ED25519_SIGNATURE_BYTES,
+            )
+        except OSError as exc:
+            raise ManifestError("manifest metadata path is unsafe or unreadable") from exc
+        if len(manifest_bytes) > MAX_SIGNED_MANIFEST_BYTES:
+            raise ManifestError("manifest exceeds the maximum size")
+        if len(signature) != ED25519_SIGNATURE_BYTES:
+            raise ManifestError("manifest signature has an invalid size")
         # 必须对原始 bytes 验签后再解析 JSON，解析或重编码结果不能替代签名原文。
         self.verify_signature(manifest_bytes, signature)
         try:
-            payload = json.loads(manifest_bytes.decode("utf-8"))
-        except json.JSONDecodeError as exc:
-            raise ManifestError("manifest is not valid JSON") from exc
-        if not isinstance(payload, Mapping):
-            raise ManifestError("manifest root must be an object")
+            payload = load_strict_manifest_json(manifest_bytes)
+        except StrictManifestJsonError as exc:
+            raise ManifestError("manifest is not valid strict JSON") from exc
         manifest = UpdateManifest.from_dict(payload)
         self.validate(manifest)
         return manifest
@@ -287,130 +445,24 @@ class UpdateManifestVerifier:
             raise ManifestError("manifest tag does not match version and release revision")
         if manifest.source_commit and not re.fullmatch(r"[0-9a-f]{40}", manifest.source_commit):
             raise ManifestError("manifest sourceCommit must be a full 40-character Git SHA")
+        published_at = _parse_rfc3339(manifest.published_at)
         expires_at = _parse_rfc3339(manifest.expires_at)
-        if expires_at <= self._now():
+        now = self._now()
+        if not isinstance(now, datetime) or now.tzinfo is None or now.utcoffset() is None:
+            raise ManifestError("manifest verification clock must be timezone-aware")
+        now = now.astimezone(timezone.utc)
+        if published_at >= expires_at:
+            raise ManifestError("manifest publishedAt must be before expiresAt")
+        if expires_at - published_at > MAX_MANIFEST_VALIDITY:
+            raise ManifestError("manifest validity window exceeds the maximum")
+        if published_at > now + MAX_MANIFEST_FUTURE_SKEW:
+            raise ManifestError("manifest publishedAt is materially in the future")
+        if expires_at <= now:
             raise ManifestError("manifest is expired")
         if not manifest.assets:
             raise ManifestError("manifest has no assets")
         for asset in manifest.assets.values():
             _validate_asset_shape(asset)
-
-
-@dataclass
-class PendingInstall:
-    version: str
-    attempts: int = 0
-    installer_path: str = ""
-    log_path: str = ""
-    release_revision: int = 0
-
-    @property
-    def identity(self) -> ReleaseIdentity:
-        return ReleaseIdentity(self.version, self.release_revision)
-
-
-def _state_semver(value: Any) -> str:
-    raw = str(value or "").strip()
-    if not raw:
-        return ""
-    try:
-        return _normalize_semver_text(raw)
-    except ValueError:
-        return ""
-
-
-def _state_int(value: Any, *, default: int, minimum: int = 0) -> int:
-    if isinstance(value, bool):
-        return default
-    try:
-        parsed = int(value)
-    except (TypeError, ValueError):
-        return default
-    return parsed if parsed >= minimum else default
-
-
-@dataclass
-class LocalUpdateState:
-    # 仅记录最近一次成功校验到的发布头，供界面和诊断使用；不能作为安装版本下限。
-    last_seen_version: str = ""
-    last_seen_revision: int = 0
-    skipped_version: str = ""
-    skipped_revision: int = 0
-    pending_install: PendingInstall | None = None
-    last_install_error: str = ""
-    install_attempt_limit: int = DEFAULT_INSTALL_ATTEMPT_LIMIT
-
-    def record_startup_health(
-        self,
-        *,
-        current_version: str,
-        current_revision: int = 0,
-        staging_dir: Path | None = None,
-    ) -> None:
-        pending = self.pending_install
-        if pending is None:
-            return
-        current_identity = ReleaseIdentity(current_version, current_revision)
-        if current_identity == pending.identity:
-            self.pending_install = None
-            self.last_install_error = ""
-            if staging_dir is not None:
-                shutil.rmtree(staging_dir, ignore_errors=True)
-            _log_update_event(
-                "update.install.succeeded",
-                "pending update completed",
-                version=current_version,
-                revision=current_revision,
-            )
-            return
-        pending.attempts += 1
-        self.last_install_error = f"installed version did not change to {pending.identity.tag}"
-        _log_update_event("update.install.failed", self.last_install_error, level="ERROR")
-        if pending.attempts >= self.install_attempt_limit:
-            self.pending_install = None
-            if staging_dir is not None:
-                shutil.rmtree(staging_dir, ignore_errors=True)
-
-    @classmethod
-    def load(cls, path: Path) -> "LocalUpdateState":
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return cls()
-        if not isinstance(payload, Mapping):
-            return cls()
-        pending_payload = payload.get("pending_install")
-        pending = None
-        if isinstance(pending_payload, Mapping):
-            pending_version = _state_semver(pending_payload.get("version"))
-            if pending_version:
-                pending = PendingInstall(
-                    version=pending_version,
-                    attempts=_state_int(pending_payload.get("attempts"), default=0),
-                    installer_path=str(pending_payload.get("installer_path") or ""),
-                    log_path=str(pending_payload.get("log_path") or ""),
-                    release_revision=_state_int(
-                        pending_payload.get("release_revision"),
-                        default=0,
-                    ),
-                )
-        return cls(
-            last_seen_version=_state_semver(payload.get("last_seen_version")),
-            last_seen_revision=_state_int(payload.get("last_seen_revision"), default=0),
-            skipped_version=_state_semver(payload.get("skipped_version")),
-            skipped_revision=_state_int(payload.get("skipped_revision"), default=0),
-            pending_install=pending,
-            last_install_error=str(payload.get("last_install_error") or ""),
-            install_attempt_limit=_state_int(
-                payload.get("install_attempt_limit"),
-                default=DEFAULT_INSTALL_ATTEMPT_LIMIT,
-                minimum=1,
-            ),
-        )
-
-    def save(self, path: Path) -> None:
-        payload = asdict(self)
-        _atomic_write_text(Path(path), json.dumps(payload, ensure_ascii=False, indent=2))
 
 
 def default_update_state_path() -> Path:
@@ -439,18 +491,31 @@ def record_pending_install(
     installer_path: str | Path,
     log_path: str | Path,
     path: Path | None = None,
+    launch_token: str = "",
+    previous_pending_out: list[PendingInstall | None] | None = None,
 ) -> LocalUpdateState:
     """只持久化一个待安装版本，使启动健康检查能限制失败重试次数。"""
     state_path = path or default_update_state_path()
-    state = LocalUpdateState.load(state_path)
-    state.pending_install = PendingInstall(
-        version=str(version or ""),
-        attempts=0,
-        installer_path=str(installer_path),
-        log_path=str(log_path),
-        release_revision=ReleaseIdentity(version, release_revision).revision,
+    identity = ReleaseIdentity(version, release_revision)
+
+    def mutate(state: LocalUpdateState) -> None:
+        if previous_pending_out is not None:
+            previous_pending_out.append(state.pending_install)
+        state.pending_install = PendingInstall(
+            version=identity.version,
+            attempts=0,
+            installer_path=str(installer_path),
+            log_path=str(log_path),
+            release_revision=identity.revision,
+            launch_token=str(launch_token or ""),
+        )
+
+    state = mutate_update_state(
+        state_path,
+        load=LocalUpdateState.load,
+        save=lambda current, target: current.save(target),
+        mutate=mutate,
     )
-    state.save(state_path)
     _log_update_event(
         "update.install.pending",
         "pending update recorded",
@@ -468,11 +533,18 @@ def record_skipped_update(
 ) -> LocalUpdateState:
     """记录用户跳过的发布身份；手动检查仍可再次选择。"""
     state_path = path or default_update_state_path()
-    state = LocalUpdateState.load(state_path)
     identity = ReleaseIdentity(version, release_revision)
-    state.skipped_version = identity.version
-    state.skipped_revision = identity.revision
-    state.save(state_path)
+
+    def mutate(state: LocalUpdateState) -> None:
+        state.skipped_version = identity.version
+        state.skipped_revision = identity.revision
+
+    state = mutate_update_state(
+        state_path,
+        load=LocalUpdateState.load,
+        save=lambda current, target: current.save(target),
+        mutate=mutate,
+    )
     _log_update_event(
         "update.check.skipped",
         "update version skipped",
@@ -480,6 +552,27 @@ def record_skipped_update(
         revision=state.skipped_revision,
     )
     return state
+
+
+def record_last_seen_update(
+    version: str,
+    *,
+    release_revision: int = 0,
+    path: Path | None = None,
+) -> LocalUpdateState:
+    state_path = path or default_update_state_path()
+    identity = ReleaseIdentity(version, release_revision)
+
+    def mutate(state: LocalUpdateState) -> None:
+        state.last_seen_version = identity.version
+        state.last_seen_revision = identity.revision
+
+    return mutate_update_state(
+        state_path,
+        load=LocalUpdateState.load,
+        save=lambda current, target: current.save(target),
+        mutate=mutate,
+    )
 
 
 def record_startup_update_health(
@@ -491,14 +584,67 @@ def record_startup_update_health(
 ) -> LocalUpdateState:
     """启动后以实际运行版本确认安装结果；未切换版本会累计尝试并最终停止重试。"""
     state_path = path or default_update_state_path()
-    state = LocalUpdateState.load(state_path)
-    state.record_startup_health(
-        current_version=current_version,
-        current_revision=current_revision,
-        staging_dir=staging_dir,
+    telemetry: list[tuple[str, str, str, dict[str, Any]]] = []
+
+    def mutate(state: LocalUpdateState) -> None:
+        pending = state.pending_install
+        state.record_startup_health(
+            current_version=current_version,
+            current_revision=current_revision,
+            staging_dir=staging_dir,
+        )
+        if pending is None:
+            return
+        if state.pending_install is None and not state.last_install_error:
+            telemetry.append(
+                (
+                    "update.install.succeeded",
+                    "pending update completed",
+                    "INFO",
+                    {"version": current_version, "revision": current_revision},
+                )
+            )
+        else:
+            telemetry.append(
+                (
+                    "update.install.failed",
+                    state.last_install_error,
+                    "ERROR",
+                    {},
+                )
+            )
+
+    state = mutate_update_state(
+        state_path,
+        load=LocalUpdateState.load,
+        save=lambda current, target: current.save(target),
+        mutate=mutate,
     )
-    state.save(state_path)
+    for event, message, level, details in telemetry:
+        _log_update_event(event, message, level=level, **details)
     return state
+
+
+def rollback_pending_install(
+    launch_token: str,
+    *,
+    path: Path | None = None,
+    restore_pending: PendingInstall | None = None,
+) -> LocalUpdateState:
+    state_path = path or default_update_state_path()
+    token = str(launch_token or "")
+
+    def mutate(state: LocalUpdateState) -> None:
+        pending = state.pending_install
+        if pending is not None and token and pending.launch_token == token:
+            state.pending_install = restore_pending
+
+    return mutate_update_state(
+        state_path,
+        load=LocalUpdateState.load,
+        save=lambda current, target: current.save(target),
+        mutate=mutate,
+    )
 
 
 @dataclass(frozen=True)
@@ -617,15 +763,36 @@ class GitHubReleaseClient:
         url = f"{self.api_base}/repos/{self.owner}/{self.repo}/releases/latest"
         request = urllib.request.Request(url, headers=headers)
         _log_update_event("update.check.started", "checking GitHub release", manual=manual)
+        response: Any | None = None
+        response_error: BaseException | None = None
         try:
-            with effective_opener(request, timeout=self.timeout) as response:
+            try:
+                response = effective_opener(request, timeout=self.timeout)
                 validate_asset_url(_response_final_url(response, url), {"api.github.com"})
-                payload = response.read().decode("utf-8")
+                payload_bytes = response.read(DEFAULT_MAX_RELEASE_API_BYTES + 1)
+                if len(payload_bytes) > DEFAULT_MAX_RELEASE_API_BYTES:
+                    raise DownloadError("GitHub release response is too large")
+                payload = payload_bytes.decode("utf-8")
                 data = json.loads(payload)
                 etag = str(getattr(response, "headers", {}).get("ETag") or "")
                 last_modified = str(getattr(response, "headers", {}).get("Last-Modified") or "")
+            except BaseException as exc:
+                response_error = exc
+                raise
+            finally:
+                if response is not None:
+                    run_typed_cleanup_actions(
+                        response_error,
+                        ((_response_close_action(response), "GitHub release response cleanup failed"),),
+                        error_factory=DownloadError,
+                        failure_message="GitHub release response cleanup failed",
+                    )
         except urllib.error.HTTPError as exc:
             if exc.code == 304:
+                if not (cache.get("etag") or cache.get("last_modified")):
+                    raise DownloadError(
+                        "GitHub release returned 304 without an active validator"
+                    ) from exc
                 return ManifestLocations(not_modified=True, etag=str(cache.get("etag") or ""), last_modified=str(cache.get("last_modified") or ""))
             if exc.code in {403, 429}:
                 _log_update_event(
@@ -639,19 +806,28 @@ class GitHubReleaseClient:
             if exc.code >= 500:
                 raise DownloadError("GitHub release service is temporarily unavailable") from exc
             raise DownloadError(f"GitHub release request failed with HTTP {exc.code}") from exc
-        except (OSError, TimeoutError, urllib.error.URLError, json.JSONDecodeError, ManifestError) as exc:
+        except (
+            OSError,
+            TimeoutError,
+            UnicodeError,
+            urllib.error.URLError,
+            json.JSONDecodeError,
+            RecursionError,
+            ManifestError,
+        ) as exc:
             raise DownloadError(f"GitHub release request failed: {exc}") from exc
         if not isinstance(data, Mapping):
             raise DownloadError("GitHub release response had an unexpected shape")
         locations = self._locations_from_release(data, etag=etag, last_modified=last_modified)
-        self._save_cache(
-            {
-                "etag": locations.etag,
-                "last_modified": locations.last_modified,
-                "last_check_at": datetime.now(timezone.utc).isoformat(),
-                "release_url": locations.release_url,
-            }
-        )
+        if locations.etag or locations.last_modified:
+            self._save_cache(
+                {
+                    "etag": locations.etag,
+                    "last_modified": locations.last_modified,
+                    "last_check_at": datetime.now(timezone.utc).isoformat(),
+                    "release_url": locations.release_url,
+                }
+            )
         return locations
 
     def fetch_manifest_location_candidates(
@@ -664,80 +840,64 @@ class GitHubReleaseClient:
         """按新到旧返回近期 Release 中的签名 manifest 地址。"""
 
         effective_opener = opener or self._trusted_opener()
-        cache = self._load_cache()
-        if not manual and self._is_auto_check_throttled(cache):
-            _log_update_event("update.check.throttled", "automatic update check throttled")
-            return (
-                ManifestLocations(
-                    etag=str(cache.get("etag") or ""),
-                    last_modified=str(cache.get("last_modified") or ""),
-                    not_modified=True,
-                    release_url=str(cache.get("release_url") or ""),
-                ),
-            )
         headers = {
             "Accept": "application/vnd.github+json",
             "User-Agent": self.user_agent,
             "X-GitHub-Api-Version": "2022-11-28",
         }
-        if cache.get("etag"):
-            headers["If-None-Match"] = str(cache["etag"])
-        if cache.get("last_modified"):
-            headers["If-Modified-Since"] = str(cache["last_modified"])
         page_size = max(1, min(100, int(per_page)))
         url = f"{self.api_base}/repos/{self.owner}/{self.repo}/releases?per_page={page_size}"
-        request = urllib.request.Request(url, headers=headers)
         _log_update_event("update.check.started", "checking GitHub release candidates", manual=manual)
+        def candidate_factory(
+            release: Mapping[str, Any],
+            etag: str,
+            last_modified: str,
+        ) -> ManifestLocations | None:
+            try:
+                return self._locations_from_release(
+                    release,
+                    etag=etag,
+                    last_modified=last_modified,
+                )
+            except DownloadError:
+                return None
+
         try:
-            with effective_opener(request, timeout=self.timeout) as response:
-                validate_asset_url(_response_final_url(response, url), {"api.github.com"})
-                payload = response.read().decode("utf-8")
-                data = json.loads(payload)
-                etag = str(getattr(response, "headers", {}).get("ETag") or "")
-                last_modified = str(getattr(response, "headers", {}).get("Last-Modified") or "")
+            locations = collect_release_candidates(
+                opener=effective_opener,
+                first_url=url,
+                headers=headers,
+                timeout=self.timeout,
+                owner=self.owner,
+                repo=self.repo,
+                page_size=page_size,
+                validate_url=validate_asset_url,
+                candidate_factory=candidate_factory,
+            )
         except urllib.error.HTTPError as exc:
             if exc.code == 304:
-                return (
-                    ManifestLocations(
-                        not_modified=True,
-                        etag=str(cache.get("etag") or ""),
-                        last_modified=str(cache.get("last_modified") or ""),
-                    ),
-                )
+                raise DownloadError(
+                    "GitHub releases returned 304 without a page-specific validator"
+                ) from exc
             if exc.code in {403, 429}:
                 _log_update_event(
                     "update.check.api_rate_limited",
                     "GitHub API rate limited; falling back to the public release feed",
                     level="WARN",
                 )
-                return self._fetch_manifest_locations_from_atom(opener=effective_opener, per_page=page_size)
+                return self._fetch_manifest_locations_from_atom(
+                    opener=effective_opener,
+                    per_page=page_size,
+                )
             if exc.code == 404:
                 raise DownloadError("GitHub releases were not found") from exc
             if exc.code >= 500:
                 raise DownloadError("GitHub release service is temporarily unavailable") from exc
             raise DownloadError(f"GitHub release request failed with HTTP {exc.code}") from exc
-        except (OSError, TimeoutError, urllib.error.URLError, json.JSONDecodeError, ManifestError) as exc:
+        except (OSError, TimeoutError, urllib.error.URLError, GitHubReleasePageError) as exc:
             raise DownloadError(f"GitHub release request failed: {exc}") from exc
-        if not isinstance(data, list):
-            raise DownloadError("GitHub releases response had an unexpected shape")
-        locations: list[ManifestLocations] = []
-        for release in data:
-            if not isinstance(release, Mapping):
-                continue
-            try:
-                locations.append(self._locations_from_release(release, etag=etag, last_modified=last_modified))
-            except DownloadError:
-                continue
         if not locations:
             raise MetadataNotFoundError("GitHub releases do not contain signed update manifests")
-        self._save_cache(
-            {
-                "etag": etag,
-                "last_modified": last_modified,
-                "last_check_at": datetime.now(timezone.utc).isoformat(),
-                "release_url": locations[0].release_url,
-            }
-        )
         return tuple(locations)
 
     @staticmethod
@@ -763,10 +923,24 @@ class GitHubReleaseClient:
 
         feed_url = f"https://github.com/{self.owner}/{self.repo}/releases.atom"
         request = urllib.request.Request(feed_url, headers={"User-Agent": self.user_agent})
+        response: Any | None = None
+        response_error: BaseException | None = None
         try:
-            with opener(request, timeout=self.timeout) as response:
+            try:
+                response = opener(request, timeout=self.timeout)
                 validate_asset_url(_response_final_url(response, feed_url), {"github.com"})
                 payload = response.read(DEFAULT_MAX_RELEASE_FEED_BYTES + 1)
+            except BaseException as exc:
+                response_error = exc
+                raise
+            finally:
+                if response is not None:
+                    run_typed_cleanup_actions(
+                        response_error,
+                        ((_response_close_action(response), "GitHub release feed response cleanup failed"),),
+                        error_factory=DownloadError,
+                        failure_message="GitHub release feed response cleanup failed",
+                    )
         except urllib.error.HTTPError as exc:
             raise DownloadError(f"GitHub release feed failed with HTTP {exc.code}") from exc
         except (OSError, TimeoutError, urllib.error.URLError, ManifestError) as exc:
@@ -811,48 +985,71 @@ class GitHubReleaseClient:
                 break
         if not locations:
             raise DownloadError("GitHub release feed did not contain release tags")
-        self._save_cache(
-            {
-                "last_check_at": datetime.now(timezone.utc).isoformat(),
-                "release_url": locations[0].release_url,
-            }
-        )
         return tuple(locations)
 
     def _locations_from_release(self, data: Mapping[str, Any], *, etag: str, last_modified: str) -> ManifestLocations:
         manifest_url = ""
         sig_url = ""
-        for asset in data.get("assets") or ():
+        assets = data.get("assets")
+        if type(assets) is not list:
+            raise DownloadError("GitHub release assets had an unexpected shape")
+        for asset in assets:
             if not isinstance(asset, Mapping):
-                continue
-            name = str(asset.get("name") or "")
-            browser_url = str(asset.get("browser_download_url") or "")
+                raise DownloadError("GitHub release assets had an unexpected shape")
+            name = asset.get("name")
+            browser_url = asset.get("browser_download_url")
+            if type(name) is not str or type(browser_url) is not str:
+                raise DownloadError("GitHub release assets had an unexpected shape")
             if name == DEFAULT_MANIFEST_NAME:
                 manifest_url = browser_url
             elif name == DEFAULT_SIGNATURE_NAME:
                 sig_url = browser_url
         if not manifest_url or not sig_url:
             raise MetadataNotFoundError("GitHub release does not contain latest.json and latest.json.sig")
+        try:
+            validate_asset_url(manifest_url, DEFAULT_ALLOWED_HOSTS)
+            validate_asset_url(sig_url, DEFAULT_ALLOWED_HOSTS)
+        except ManifestError as exc:
+            raise DownloadError("GitHub release metadata URL is not trusted") from exc
+        release_fields = {
+            key: data.get(key) or ""
+            for key in ("html_url", "tag_name", "name")
+        }
+        if any(type(value) is not str for value in release_fields.values()):
+            raise DownloadError("GitHub release identity had an unexpected shape")
         return ManifestLocations(
             manifest_url=manifest_url,
             signature_url=sig_url,
             etag=etag,
             last_modified=last_modified,
-            release_url=str(data.get("html_url") or ""),
-            tag_name=str(data.get("tag_name") or ""),
-            release_name=str(data.get("name") or ""),
+            release_url=release_fields["html_url"],
+            tag_name=release_fields["tag_name"],
+            release_name=release_fields["name"],
         )
 
     def _load_cache(self) -> dict[str, Any]:
-        try:
-            return json.loads(self.cache_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return {}
+        return load_release_cache(
+            self.cache_path,
+            expected_scope={
+            "schema": 1,
+            "endpoint": "latest",
+            "api_base": self.api_base,
+            "owner": self.owner,
+            "repo": self.repo,
+            },
+        )
 
     def _save_cache(self, payload: Mapping[str, Any]) -> None:
-        _atomic_write_text(
+        save_release_cache(
             self.cache_path,
-            json.dumps(dict(payload), ensure_ascii=False, indent=2),
+            scope={
+                "schema": 1,
+                "endpoint": "latest",
+                "api_base": self.api_base,
+                "owner": self.owner,
+                "repo": self.repo,
+            },
+            payload=payload,
         )
 
     def _is_auto_check_throttled(self, cache: Mapping[str, Any]) -> bool:
@@ -862,10 +1059,14 @@ class GitHubReleaseClient:
         if not last_check_at:
             return False
         try:
-            checked_at = datetime.fromisoformat(last_check_at.replace("Z", "+00:00")).astimezone(timezone.utc)
-        except ValueError:
+            checked_at = datetime.fromisoformat(last_check_at.replace("Z", "+00:00"))
+            if checked_at.tzinfo is None or checked_at.utcoffset() is None:
+                return False
+            checked_at = checked_at.astimezone(timezone.utc)
+        except (OverflowError, ValueError):
             return False
-        return (datetime.now(timezone.utc) - checked_at).total_seconds() < self.auto_check_interval_seconds
+        age = (datetime.now(timezone.utc) - checked_at).total_seconds()
+        return 0 <= age < self.auto_check_interval_seconds
 
 
 class AssetSelector:
@@ -882,8 +1083,15 @@ class AssetSelector:
     ) -> None:
         self.os_name = normalize_os(os_name or sys.platform)
         self.arch = normalize_arch(arch or platform.machine())
-        self.installer_types = tuple(installer_types or default_installer_types(self.os_name))
-        self.allowed_hosts = frozenset(host.lower() for host in (allowed_hosts or DEFAULT_ALLOWED_HOSTS))
+        configured_types = (
+            installer_types
+            if installer_types is not None
+            else default_installer_types(self.os_name)
+        )
+        self.installer_types = tuple(str(value).lower() for value in configured_types)
+        self.allowed_hosts = _canonicalize_allowed_hosts(
+            allowed_hosts or DEFAULT_ALLOWED_HOSTS,
+        )
         self.development_mode = development_mode
 
     def select(self, manifest: UpdateManifest) -> UpdateAsset:
@@ -893,167 +1101,35 @@ class AssetSelector:
             for asset in manifest.assets.values()
             if normalize_os(asset.os) == self.os_name
             and normalize_arch(asset.arch) in {self.arch, "universal"}
-            and asset.installer_type in self.installer_types
+            and asset.installer_type.lower() in self.installer_types
         ]
         if not candidates:
             raise ManifestError(f"no update asset for {self.os_name}-{self.arch}")
-        for asset in candidates:
-            validate_asset_url(asset.url, hosts, development_mode=self.development_mode)
-        return candidates[0]
+        for installer_type in self.installer_types:
+            matches = [
+                asset
+                for asset in candidates
+                if asset.installer_type.lower() == installer_type
+            ]
+            if len(matches) > 1:
+                raise ManifestError(
+                    f"multiple update assets match {self.os_name}-{self.arch}/{installer_type}"
+                )
+            if matches:
+                validate_asset_url(
+                    matches[0].url,
+                    hosts,
+                    development_mode=self.development_mode,
+                )
+                return matches[0]
+        raise ManifestError(f"no update asset for {self.os_name}-{self.arch}")
 
 
-class Downloader:
-    """按已验签 manifest 的 URL、size 和 SHA-256 下载到 staging 缓存。"""
-
-    def __init__(
-        self,
-        *,
-        cache_dir: Path | None = None,
-        max_size_bytes: int = DEFAULT_MAX_DOWNLOAD_BYTES,
-        timeout_seconds: float = DEFAULT_DOWNLOAD_TIMEOUT_SECONDS,
-        retries: int = 2,
-        allowed_hosts: set[str] | frozenset[str] | None = None,
-        development_mode: bool = False,
-    ) -> None:
-        self.cache_dir = cache_dir or default_update_staging_dir()
-        self.max_size_bytes = int(max_size_bytes)
-        self.timeout_seconds = float(timeout_seconds)
-        self.retries = max(0, int(retries))
-        self.allowed_hosts = frozenset(host.lower() for host in (allowed_hosts or DEFAULT_ALLOWED_HOSTS))
-        self.development_mode = bool(development_mode)
-
-    def download(
-        self,
-        asset: UpdateAsset,
-        *,
-        opener: UrlOpener | None = None,
-        cancel_event: Event | None = None,
-        progress_callback: Callable[[dict[str, Any]], None] | None = None,
-    ) -> Path:
-        validate_asset_url(asset.url, self.allowed_hosts, development_mode=self.development_mode)
-        if asset.size <= 0:
-            raise DownloadError("asset size must be positive")
-        if asset.size > self.max_size_bytes:
-            raise DownloadError("asset size exceeds configured maximum")
-        target = self.cache_dir / sanitize_filename(asset.name)
-        partial = target.with_name(target.name + ".partial")
-        self.cache_dir.mkdir(parents=True, exist_ok=True)
-        effective_opener = opener or self._trusted_opener()
-        attempt = 0
-        while True:
-            try:
-                return self._download_once(asset, target, partial, effective_opener, cancel_event, progress_callback)
-            except ManifestError as exc:
-                partial.unlink(missing_ok=True)
-                raise DownloadError(f"download redirect was rejected: {exc}") from exc
-            except DownloadError as exc:
-                if not exc.keep_partial:
-                    partial.unlink(missing_ok=True)
-                if cancel_event is not None and cancel_event.is_set():
-                    raise
-                if attempt >= self.retries:
-                    raise
-                attempt += 1
-
-    def _trusted_opener(self) -> UrlOpener:
-        def opener(request: urllib.request.Request, *, timeout: float) -> Any:
-            return open_trusted_url(
-                request,
-                timeout=timeout,
-                allowed_hosts=self.allowed_hosts,
-                development_mode=self.development_mode,
-            )
-
-        return opener
-
-    def _download_once(
-        self,
-        asset: UpdateAsset,
-        target: Path,
-        partial: Path,
-        opener: UrlOpener,
-        cancel_event: Event | None,
-        progress_callback: Callable[[dict[str, Any]], None] | None,
-    ) -> Path:
-        hasher = hashlib.sha256()
-        if target.exists():
-            try:
-                _verify_file_hash(target, asset)
-                return target
-            except VerificationError:
-                target.unlink(missing_ok=True)
-
-        resume_from = partial.stat().st_size if partial.exists() else 0
-        if resume_from >= asset.size:
-            if resume_from == asset.size:
-                try:
-                    _verify_file_hash(partial, asset)
-                    os.replace(partial, target)
-                    return target
-                except VerificationError:
-                    partial.unlink(missing_ok=True)
-            else:
-                partial.unlink(missing_ok=True)
-            resume_from = 0
-
-        downloaded = resume_from
-        started = time.monotonic()
-        headers = {"User-Agent": "UniversalCrawlerPro/updater"}
-        if resume_from > 0:
-            _hash_existing_partial(partial, hasher)
-            headers["Range"] = f"bytes={resume_from}-"
-        request = urllib.request.Request(asset.url, headers=headers)
-        _log_update_event("update.download.started", "download started", asset=asset.name, size=asset.size)
-        try:
-            with opener(request, timeout=self.timeout_seconds) as response, partial.open("ab" if resume_from else "wb") as handle:
-                content_length = _header_int(getattr(response, "headers", {}), "Content-Length")
-                if resume_from:
-                    range_start = _content_range_start(getattr(response, "headers", {}))
-                    if range_start != resume_from:
-                        raise DownloadError("server did not honor resume range")
-                    if content_length is not None and content_length != asset.size - resume_from:
-                        raise DownloadError("Content-Length does not match remaining manifest size")
-                elif content_length is not None and content_length != asset.size:
-                    raise DownloadError("Content-Length does not match manifest size")
-                while True:
-                    if cancel_event is not None and cancel_event.is_set():
-                        raise DownloadError("download was cancelled", keep_partial=True)
-                    chunk = response.read(1024 * 256)
-                    if not chunk:
-                        break
-                    downloaded += len(chunk)
-                    if downloaded > self.max_size_bytes or downloaded > asset.size:
-                        raise DownloadError("download exceeded expected size")
-                    hasher.update(chunk)
-                    handle.write(chunk)
-                    if progress_callback:
-                        elapsed = max(0.001, time.monotonic() - started)
-                        progress: dict[str, Any] = {
-                            "bytesDownloaded": downloaded,
-                            "totalBytes": asset.size,
-                            "percent": round(downloaded / asset.size * 100, 2),
-                            "speed": downloaded / elapsed,
-                            "state": "Downloading",
-                        }
-                        _log_update_event("update.download.progress", "download progress", **progress)
-                        progress_callback(progress)
-        except DownloadError:
-            raise
-        except (OSError, TimeoutError, urllib.error.URLError) as exc:
-            raise DownloadError(f"download failed: {exc}", keep_partial=partial.exists()) from exc
-        if downloaded != asset.size:
-            raise DownloadError("downloaded size does not match manifest", keep_partial=True)
-        digest = hasher.hexdigest()
-        if digest.lower() != asset.sha256.lower():
-            _log_update_event("update.verify.failed", "download hash mismatch", level="SECURITY", asset=asset.name)
-            raise DownloadError("download sha256 does not match manifest")
-        # 只有大小和 SHA-256 都与已验签 manifest 一致，partial 才能晋升为可复用安装包。
-        os.replace(partial, target)
-        _log_update_event("update.download.completed", "download completed", asset=asset.name)
-        return target
+Downloader = _Downloader
 
 
-class PackageVerifier:
+
+class PackageVerifier(PlatformPackageVerifier):
     """校验安装包完整性，并按发布策略追加操作系统签名校验。"""
 
     def __init__(
@@ -1066,103 +1142,20 @@ class PackageVerifier:
         verify_func: Callable[[Path, UpdateAsset], None] | None = None,
         run_func: Callable[..., subprocess.CompletedProcess] = subprocess.run,
     ) -> None:
-        self.os_name = normalize_os(os_name or sys.platform)
-        self.trusted_publishers = tuple(trusted_publishers)
-        self.trusted_thumbprints = tuple(
-            _normalize_certificate_fingerprint(value)
-            for value in trusted_thumbprints
-            if str(value).strip()
+        super().__init__(
+            os_name=os_name or sys.platform,
+            trusted_publishers=tuple(trusted_publishers),
+            trusted_thumbprints=tuple(trusted_thumbprints),
+            require_os_signature=require_os_signature,
+            verify_func=verify_func,
+            run_func=run_func,
+            normalize_os=normalize_os,
+            normalize_fingerprint=_normalize_certificate_fingerprint,
+            verify_file_hash=_verify_file_hash,
+            error_factory=VerificationError,
         )
-        self.require_os_signature = bool(require_os_signature)
-        self._verify_func = verify_func
-        self._run = run_func
 
-    def verify(self, path: Path, asset: UpdateAsset) -> None:
-        # 哈希来自 Ed25519 签名清单。暂缓 Authenticode 时也必须先证明文件未被替换。
-        _verify_file_hash(path, asset)
-        if not self.require_os_signature:
-            return
-        if self._verify_func:
-            self._verify_func(path, asset)
-            return
-        if self.os_name == "windows":
-            self._verify_windows(path)
-        elif self.os_name == "macos":
-            self._verify_macos(path, asset)
-        else:
-            return
-
-    def _verify_windows(self, path: Path) -> None:
-        if not self.trusted_thumbprints:
-            raise VerificationError("Windows updater requires trusted thumbprint allowlist")
-        script = (
-            "$s=Get-AuthenticodeSignature -LiteralPath $args[0];"
-            "$cert=$s.SignerCertificate;"
-            "[Console]::OutputEncoding=[Text.Encoding]::UTF8;"
-            "if ($null -eq $cert) {"
-            "ConvertTo-Json @{Status=[string]$s.Status;Subject='';Thumbprint='';SHA256Fingerprint=''}; exit 0"
-            "};"
-            "$sha256=[System.BitConverter]::ToString("
-            "[System.Security.Cryptography.SHA256]::Create().ComputeHash($cert.RawData)"
-            ").Replace('-','');"
-            "ConvertTo-Json @{"
-            "Status=[string]$s.Status;"
-            "Subject=[string]$cert.Subject;"
-            "Thumbprint=[string]$cert.Thumbprint;"
-            "SHA256Fingerprint=$sha256"
-            "}"
-        )
-        result = self._run(
-            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script, str(path)],
-            capture_output=True,
-            text=True,
-            shell=False,
-            timeout=20,
-        )
-        if result.returncode != 0:
-            raise VerificationError("Authenticode verification command failed")
-        try:
-            payload = json.loads(result.stdout or "{}")
-        except json.JSONDecodeError as exc:
-            raise VerificationError("Authenticode output was invalid") from exc
-        if payload.get("Status") != "Valid":
-            raise VerificationError("Authenticode signature is not valid")
-        subject = str(payload.get("Subject") or "")
-        thumbprints = {
-            _normalize_certificate_fingerprint(payload.get("Thumbprint")),
-            _normalize_certificate_fingerprint(payload.get("SHA256Fingerprint")),
-        }
-        if not any(value and value in self.trusted_thumbprints for value in thumbprints):
-            raise VerificationError("Authenticode signer thumbprint is not trusted")
-        if self.trusted_publishers and not any(publisher in subject for publisher in self.trusted_publishers):
-            raise VerificationError("Authenticode signer publisher is not trusted")
-        return
-
-    def _verify_macos(self, path: Path, asset: UpdateAsset) -> None:
-        if not self.trusted_publishers:
-            raise VerificationError("macOS updater requires trusted publisher allowlist")
-        results: tuple[subprocess.CompletedProcess[Any], ...]
-        if asset.installer_type == "pkg":
-            signature_result = self._run(["pkgutil", "--check-signature", str(path)], capture_output=True, text=True, shell=False, timeout=20)
-            gatekeeper_result = self._run(["spctl", "-a", "-vv", "-t", "install", str(path)], capture_output=True, text=True, shell=False, timeout=20)
-            results = (signature_result, gatekeeper_result)
-        else:
-            results = (self._run(["spctl", "-a", "-vv", "-t", "open", str(path)], capture_output=True, text=True, shell=False, timeout=20),)
-        if any(result.returncode != 0 for result in results):
-            raise VerificationError("macOS package signature check failed")
-        output = "\n".join(f"{result.stdout}\n{result.stderr}" for result in results)
-        if not any(publisher in output for publisher in self.trusted_publishers):
-            raise VerificationError("macOS signer is not trusted")
-
-
-@dataclass(frozen=True)
-class InstallResult:
-    exit_code: int
-    succeeded: bool
-    log_path: Path
-
-
-class InstallerRunner:
+class InstallerRunner(InstallerRunnerCore):
     """updater helper 侧的安装器入口；每次启动前都重新执行 PackageVerifier。"""
 
     def __init__(
@@ -1172,25 +1165,17 @@ class InstallerRunner:
         run_func: Callable[..., subprocess.CompletedProcess] = subprocess.run,
         popen_func: Callable[..., subprocess.Popen] = subprocess.Popen,
     ) -> None:
-        self.package_verifier = package_verifier
-        self._run = run_func
-        self._popen = popen_func
-
-    def run_verified_installer(self, path: Path, asset: UpdateAsset, *, version: str, log_path: Path | None = None) -> InstallResult:
-        self.package_verifier.verify(path, asset)
-        log_path = log_path or user_logs_root() / f"update_install_{sanitize_filename(version)}.log"
-        argv = self._install_argv(path, asset, log_path)
-        _log_update_event("update.install.started", "installer started", version=version, installer=asset.name)
-        result = self._run(argv, shell=False, timeout=None)
-        succeeded = result.returncode == 0
-        _log_update_event(
-            "update.install.exit",
-            "installer exited",
-            level="INFO" if succeeded else "ERROR",
-            version=version,
-            exit_code=result.returncode,
+        super().__init__(
+            package_verifier=package_verifier,
+            run_func=run_func,
+            popen_func=popen_func,
+            default_staging_dir=default_update_staging_dir,
+            logs_root=user_logs_root,
+            sanitize_filename=sanitize_filename,
+            log_event=_log_update_event,
+            verification_error=VerificationError,
+            install_error=InstallError,
         )
-        return InstallResult(exit_code=int(result.returncode), succeeded=succeeded, log_path=log_path)
 
     def launch_verified_installer(
         self,
@@ -1201,6 +1186,8 @@ class InstallerRunner:
         log_path: Path,
         install_dir: Path,
         restart_handoff_path: Path | None,
+        restart_handoff_token: str = "",
+        approved_root: Path | None = None,
     ) -> subprocess.Popen:
         """验证后异步启动会覆盖当前安装目录的 Inno 安装器。
 
@@ -1210,34 +1197,16 @@ class InstallerRunner:
         安装成功后的重启由 Inno 调用新版本 helper 完成。
         """
 
-        if normalize_os(asset.os) != "windows" or asset.installer_type.lower() != "inno":
-            raise InstallError("detached self-update currently requires a Windows Inno installer")
-        self.package_verifier.verify(path, asset)
-        argv = self._install_argv(
+        return super().launch_verified_installer(
             path,
             asset,
-            log_path,
+            version=version,
+            log_path=log_path,
             install_dir=install_dir,
             restart_handoff_path=restart_handoff_path,
+            restart_handoff_token=restart_handoff_token,
+            approved_root=approved_root,
         )
-        _log_update_event(
-            "update.install.started",
-            "installer started",
-            version=version,
-            installer=asset.name,
-            detached=True,
-        )
-        process_kwargs: dict[str, Any] = {"shell": False, "close_fds": True}
-        if os.name == "nt":
-            process_kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-        process = self._popen(argv, **process_kwargs)
-        _log_update_event(
-            "update.install.handoff",
-            "installer process detached from updater helper",
-            version=version,
-            installer_pid=getattr(process, "pid", 0),
-        )
-        return process
 
     @staticmethod
     def _install_argv(
@@ -1247,25 +1216,17 @@ class InstallerRunner:
         *,
         install_dir: Path | None = None,
         restart_handoff_path: Path | None = None,
+        restart_handoff_token: str = "",
     ) -> list[str]:
-        os_name = normalize_os(asset.os)
-        installer_type = asset.installer_type.lower()
-        if os_name == "windows" and installer_type == "msi":
-            return ["msiexec.exe", "/i", str(path), "/passive", "/norestart", "/L*v", str(log_path)]
-        if os_name == "windows" and installer_type == "inno":
-            argv = [str(path), "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", f"/LOG={log_path}"]
-            if install_dir is not None:
-                argv.append(f"/DIR={install_dir}")
-            if restart_handoff_path is not None:
-                argv.append(f"/UCrawlRestartHandoff={restart_handoff_path}")
-            return argv
-        if os_name == "windows" and installer_type == "nsis":
-            return [str(path), "/S"]
-        if os_name == "macos" and installer_type == "pkg":
-            return ["/usr/sbin/installer", "-pkg", str(path), "-target", "/"]
-        if os_name == "linux" and installer_type == "appimage":
-            raise InstallError("AppImage updates require the updater helper symlink switch path")
-        raise InstallError(f"unsupported installer type: {asset.os}/{asset.installer_type}")
+        return build_installer_argv(
+            path,
+            asset,
+            log_path,
+            install_error=InstallError,
+            install_dir=install_dir,
+            restart_handoff_path=restart_handoff_path,
+            restart_handoff_token=restart_handoff_token,
+        )
 
 
 def write_update_asset_descriptor(installer_path: Path, asset: UpdateAsset) -> Path:
@@ -1292,9 +1253,17 @@ def write_update_asset_descriptor(installer_path: Path, asset: UpdateAsset) -> P
 
 
 def _parse_rfc3339(value: str) -> datetime:
+    raw = str(value)
+    if raw.endswith("Z"):
+        raw = f"{raw[:-1]}+00:00"
     try:
-        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).astimezone(timezone.utc)
-    except ValueError as exc:
+        parsed = datetime.fromisoformat(raw)
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            raise ManifestError(f"datetime must include a timezone: {value!r}")
+        return parsed.astimezone(timezone.utc)
+    except ManifestError:
+        raise
+    except (OverflowError, ValueError) as exc:
         raise ManifestError(f"invalid datetime: {value!r}") from exc
 
 
@@ -1350,11 +1319,7 @@ def _normalize_certificate_fingerprint(value: Any) -> str:
 
 def default_installer_types(os_name: str) -> tuple[str, ...]:
     if os_name == "windows":
-        return ("msi", "inno", "nsis", "exe")
-    if os_name == "macos":
-        return ("pkg", "dmg")
-    if os_name == "linux":
-        return ("AppImage", "deb", "rpm", "appimage")
+        return ("inno",)
     return ()
 
 
@@ -1375,14 +1340,39 @@ def _is_local_development_asset_url(parsed: urllib.parse.ParseResult) -> bool:
 
 def validate_asset_url(url: str, allowed_hosts: set[str] | frozenset[str], *, development_mode: bool = False) -> None:
     """生产 URL 必须使用 HTTPS 且命中 host 白名单；裸 IP 与 localhost 一律拒绝。"""
-    parsed = urllib.parse.urlparse(str(url or ""))
+    if (
+        type(url) is not str
+        or not url
+        or url != url.strip()
+        or any(ord(character) < 0x20 or ord(character) == 0x7F for character in url)
+    ):
+        raise ManifestError("asset URL is invalid")
+    raw_url = url
+    try:
+        parsed = urllib.parse.urlparse(raw_url)
+    except ValueError as exc:
+        raise ManifestError("asset URL is invalid") from exc
+    if parsed.username is not None or parsed.password is not None:
+        raise ManifestError("asset URL must not contain userinfo")
+    if "#" in raw_url:
+        raise ManifestError("asset URL must not contain a fragment")
     if development_mode and _is_local_development_asset_url(parsed):
         return
     if parsed.scheme != "https":
         raise ManifestError("asset URL must use https")
-    host = (parsed.hostname or "").lower()
-    if not host:
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise ManifestError("asset URL port is invalid") from exc
+    if port not in {None, 443}:
+        raise ManifestError("asset URL must use the default https port")
+    raw_host = parsed.hostname or ""
+    if not raw_host:
         raise ManifestError("asset URL host is missing")
+    try:
+        host = canonicalize_host(raw_host)
+    except DomainPolicyViolation as exc:
+        raise ManifestError("asset URL host is invalid") from exc
     if host in {"localhost", "127.0.0.1", "::1"}:
         raise ManifestError("asset URL must not point to localhost")
     try:
@@ -1391,8 +1381,22 @@ def validate_asset_url(url: str, allowed_hosts: set[str] | frozenset[str], *, de
         pass
     else:
         raise ManifestError("asset URL must not use a bare IP address")
-    if host not in allowed_hosts:
+    if host not in _canonicalize_allowed_hosts(allowed_hosts):
         raise ManifestError(f"asset URL host is not trusted: {host}")
+
+
+def _canonicalize_manifest_hosts(hosts: list[str]) -> tuple[str, ...]:
+    try:
+        return tuple(dict.fromkeys(canonicalize_host(host) for host in hosts))
+    except DomainPolicyViolation as exc:
+        raise ManifestError("manifest trustedHosts contains an invalid host") from exc
+
+
+def _canonicalize_allowed_hosts(hosts: object) -> frozenset[str]:
+    try:
+        return frozenset(canonicalize_host(host) for host in hosts)  # type: ignore[union-attr]
+    except (DomainPolicyViolation, TypeError) as exc:
+        raise ManifestError("allowed update host is invalid") from exc
 
 
 def sanitize_filename(name: str) -> str:
@@ -1403,56 +1407,46 @@ def sanitize_filename(name: str) -> str:
     return value
 
 
-def _header_int(headers: Any, name: str) -> int | None:
-    value = None
-    if isinstance(headers, Mapping):
-        value = headers.get(name) or headers.get(name.lower())
-    else:
-        getter = getattr(headers, "get", None)
-        if callable(getter):
-            value = getter(name)
-    if value is None:
-        return None
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return None
-
-
-def _header_value(headers: Any, name: str) -> str:
-    if isinstance(headers, Mapping):
-        value = headers.get(name) or headers.get(name.lower())
-    else:
-        getter = getattr(headers, "get", None)
-        value = getter(name) if callable(getter) else None
-    return str(value or "")
-
-
-def _content_range_start(headers: Any) -> int | None:
-    value = _header_value(headers, "Content-Range")
-    match = re.match(r"(?:bytes\s+(\d+)-\d+/\d+|\*)", value)
-    if not match:
-        return None
-    try:
-        return int(match.group(1))
-    except (TypeError, ValueError):
-        return None
-
-
-def _hash_existing_partial(path: Path, hasher: Any) -> None:
-    with Path(path).open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            hasher.update(chunk)
-
-
 def _verify_file_hash(path: Path, asset: UpdateAsset) -> None:
     file_path = Path(path)
-    if file_path.stat().st_size != asset.size:
-        raise VerificationError("installer size does not match manifest")
+    handle: Any | None = None
+    primary_error: BaseException | None = None
     hasher = hashlib.sha256()
-    with file_path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 512), b""):
+    try:
+        handle = open_regular_binary(
+            file_path,
+            approved_root=file_path.parent,
+            mode="rb",
+        )
+        if os.fstat(handle.fileno()).st_size != asset.size:
+            raise VerificationError("installer size does not match manifest")
+        remaining = asset.size
+        while remaining:
+            chunk = handle.read(min(1024 * 512, remaining))
+            if not chunk:
+                raise VerificationError("installer size does not match manifest")
             hasher.update(chunk)
+            remaining -= len(chunk)
+        if handle.read(1):
+            raise VerificationError("installer size does not match manifest")
+    except VerificationError as exc:
+        primary_error = exc
+        raise
+    except OSError as exc:
+        failure = VerificationError("installer file could not be read")
+        primary_error = failure
+        raise failure from exc
+    except BaseException as exc:
+        primary_error = exc
+        raise
+    finally:
+        if handle is not None:
+            run_typed_cleanup_actions(
+                primary_error,
+                ((handle.close, "installer verification handle cleanup failed"),),
+                error_factory=VerificationError,
+                failure_message="installer verification handle cleanup failed",
+            )
     if hasher.hexdigest().lower() != asset.sha256.lower():
         raise VerificationError("installer hash does not match manifest")
 
@@ -1477,19 +1471,22 @@ def _is_sensitive_update_detail_key(key: Any) -> bool:
 
 
 def _log_update_event(event: str, message: str, *, level: str = "INFO", **details: Any) -> None:
-    safe_details = {
-        key: value
-        for key, value in details.items()
-        if not _is_sensitive_update_detail_key(key)
-    }
-    debug_logger.log(
-        component="Updater",
-        action=event,
-        message=message,
-        level=level,
-        status_code=event,
-        details=safe_details,
-    )
+    try:
+        safe_details = {
+            key: value
+            for key, value in details.items()
+            if not _is_sensitive_update_detail_key(key)
+        }
+        debug_logger.log(
+            component="Updater",
+            action=event,
+            message=message,
+            level=level,
+            status_code=event,
+            details=safe_details,
+        )
+    except BaseException:
+        return
 
 
 def log_update_event(event: str, message: str, *, level: str = "INFO", **details: Any) -> None:

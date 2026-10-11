@@ -9,7 +9,6 @@ import re
 import secrets
 import subprocess
 import sys
-import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -26,12 +25,20 @@ from app.config.update_trust import (
     UPDATE_TRUSTED_PUBLISHERS,  # noqa: F401 - 为 GUI 调用方保留兼容导出
     UPDATE_TRUSTED_THUMBPRINTS,  # noqa: F401 - 为 GUI 调用方保留兼容导出
 )
+from app.services.github_release_pages import (
+    release_html_url as _release_html_url,
+    release_tag_from_html as _release_tag_from_html,
+    release_tag_from_url as _release_tag_from_url,
+    response_final_url as _response_final_url,
+)
 from app.services.secure_updater import (
     APP_ID,
     DEFAULT_ALLOWED_HOSTS,
     DEFAULT_CHANNEL,
     DEFAULT_MANIFEST_NAME,
     DEFAULT_SIGNATURE_NAME,
+    ED25519_SIGNATURE_BYTES,
+    MAX_SIGNED_MANIFEST_BYTES,
     AssetSelector,
     DownloadError,
     Downloader,
@@ -44,16 +51,49 @@ from app.services.secure_updater import (
     UpdateManifestVerifier,
     VerificationError,
     VersionPolicy,
+    _atomic_write_text,
+    default_update_staging_dir,
     load_local_update_state,
     log_update_event,
     open_trusted_url,
+    record_last_seen_update,
     record_pending_install,
+    rollback_pending_install,
     sanitize_filename,
-    save_local_update_state,
     validate_asset_url,
 )
+from app.services.update_metadata_cache import (
+    MetadataIdentityConflictError,
+    generation_is_fresh,
+    load_active_generation,
+    metadata_record,
+    release_authority_scope,
+    release_discovery_scope,
+    verified_record_paths,
+    write_active_generation,
+)
+from app.services.updater_metadata_download import download_metadata_file
+from app.services.updater_atomic_io import atomic_write_bytes
+from app.services.updater_launch_capability import (
+    LaunchBinding,
+    UpdaterCapabilityError,
+    file_sha256,
+    load_installed_release_identity,
+)
+from app.services.updater_helper_launcher import (
+    REVISION_AUTH_TOKEN_ENV as REVISION_AUTH_TOKEN_ENV,
+    launch_leased_updater_helper,
+)
+from app.services.updater_installer_lease import verified_file_lease
+from app.services.updater_path_safety import (
+    ensure_approved_directory,
+    ensure_regular_or_missing,
+    replace_between_approved_roots,
+    require_regular_file,
+    temporary_approved_directory,
+)
 from app.utils.runtime_paths import user_cache_root
-from shared.release_identity import ReleaseIdentity, compare_semver, parse_release_tag
+from shared.release_identity import ReleaseIdentity, SemVer, compare_semver, parse_release_tag
 
 LATEST_RELEASE_API_URL = "https://api.github.com/repos/haohaizi554/UniversalCrawler/releases/latest"
 LATEST_RELEASE_PAGE_URL = "https://github.com/haohaizi554/UniversalCrawler/releases/latest"
@@ -65,8 +105,9 @@ UPDATE_STATUS_CURRENT = "current"
 UPDATE_STATUS_AVAILABLE = "available"
 UPDATE_STATUS_LOCAL_NEWER = "local_newer"
 UPDATE_STATUS_UNTRUSTED = "untrusted"
-REVISION_AUTH_TOKEN_ENV = "UCRAWL_REVISION_AUTH_TOKEN"
 REVISION_AUTH_TTL_SECONDS = 30 * 60
+MAX_RELEASE_API_BYTES = 2_000_000
+MAX_RELEASE_PAGE_BYTES = 256_000
 
 
 class UpdateCheckError(RuntimeError):
@@ -75,6 +116,14 @@ class UpdateCheckError(RuntimeError):
 
 class SignedMetadataUnavailableError(UpdateCheckError):
     """Release 存在，但缺少 latest.json 或对应签名。"""
+
+
+class SignedMetadataIntegrityError(UpdateCheckError):
+    """Fresh signed metadata failed verification and must not fall back."""
+
+
+def default_update_metadata_dir() -> Path:
+    return user_cache_root() / "updates" / "metadata"
 
 
 @dataclass(frozen=True)
@@ -183,60 +232,51 @@ class PreparedUpdate:
     revision_authorization_token: str = field(default="", repr=False)
 
 
-def _sha256_path(path: Path) -> str:
-    digest = hashlib.sha256()
-    with Path(path).open("rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
 def _write_revision_authorization(
     *,
     manifest_path: str | Path,
     identity: ReleaseIdentity,
     now: float | None = None,
+    approved_metadata_root: Path | None = None,
 ) -> tuple[Path, str]:
     """创建只供 helper 消费一次的本地回退授权，不把原始 token 写入磁盘。"""
 
-    manifest = Path(manifest_path).resolve()
-    if not manifest.is_file():
-        raise VerificationError("revision authorization manifest is missing")
+    try:
+        root = ensure_approved_directory(
+            approved_metadata_root or default_update_metadata_dir()
+        )
+        manifest = require_regular_file(manifest_path, approved_root=root)
+    except OSError as exc:
+        raise VerificationError("revision authorization manifest is missing or unsafe") from exc
     issued_at = int(time.time() if now is None else now)
     token = secrets.token_urlsafe(32)
     target = manifest.parent / f".ucrawl-revision-auth-{secrets.token_hex(16)}.json"
+    try:
+        manifest_digest = file_sha256(
+            manifest,
+            approved_root=root,
+            max_bytes=MAX_SIGNED_MANIFEST_BYTES,
+        )
+    except (OSError, UpdaterCapabilityError) as exc:
+        raise VerificationError(
+            "revision authorization manifest is missing or unsafe"
+        ) from exc
     payload = {
         "schema": 1,
         "targetVersion": identity.version,
         "targetRevision": identity.revision,
         "targetTag": identity.tag,
-        "manifestSha256": _sha256_path(manifest),
+        "manifestSha256": manifest_digest,
         "tokenSha256": hashlib.sha256(token.encode("utf-8")).hexdigest(),
         "issuedAt": issued_at,
         "expiresAt": issued_at + REVISION_AUTH_TTL_SECONDS,
     }
-    descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f".{target.name}.",
-        suffix=".tmp",
-        dir=manifest.parent,
+    atomic_write_bytes(
+        target,
+        (json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n").encode(
+            "utf-8"
+        ),
     )
-    temporary = Path(temporary_name)
-    try:
-        try:
-            os.chmod(temporary, 0o600)
-        except OSError:
-            pass
-        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as stream:
-            descriptor = -1
-            json.dump(payload, stream, ensure_ascii=False, separators=(",", ":"))
-            stream.write("\n")
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary, target)
-    finally:
-        if descriptor >= 0:
-            os.close(descriptor)
-        temporary.unlink(missing_ok=True)
     return target, token
 
 
@@ -281,6 +321,16 @@ def prepare_verified_update(
         cancel_event=cancel_event,
         progress_callback=progress_callback,
     )
+    try:
+        staging_root = ensure_approved_directory(default_update_staging_dir())
+        installer_path = require_regular_file(
+            installer_path,
+            approved_root=staging_root,
+        )
+    except OSError as exc:
+        raise VerificationError(
+            "downloaded updater package is outside the approved staging root"
+        ) from exc
     package_verifier_cls(
         trusted_publishers=UPDATE_TRUSTED_PUBLISHERS,
         trusted_thumbprints=UPDATE_TRUSTED_THUMBPRINTS,
@@ -292,6 +342,7 @@ def prepare_verified_update(
         authorization, authorization_token = _write_revision_authorization(
             manifest_path=result.manifest_path,
             identity=manifest.identity,
+            approved_metadata_root=default_update_metadata_dir(),
         )
         authorization_path = os.fspath(authorization)
     return PreparedUpdate(
@@ -319,13 +370,23 @@ def launch_prepared_update(
     installer_path = Path(prepared.installer_path)
     manifest_path = Path(prepared.manifest_path)
     signature_path = Path(prepared.signature_path)
-    for path, label in (
-        (installer_path, "installer"),
-        (manifest_path, "manifest"),
-        (signature_path, "signature"),
-    ):
-        if not path.is_file():
-            raise UpdateCheckError(f"prepared update {label} is missing")
+    try:
+        staging_root = ensure_approved_directory(default_update_staging_dir())
+        metadata_root = ensure_approved_directory(default_update_metadata_dir())
+        installer_path = require_regular_file(
+            installer_path,
+            approved_root=staging_root,
+        )
+        manifest_path = require_regular_file(
+            manifest_path,
+            approved_root=metadata_root,
+        )
+        signature_path = require_regular_file(
+            signature_path,
+            approved_root=metadata_root,
+        )
+    except OSError as exc:
+        raise UpdateCheckError("prepared update paths are outside approved updater roots") from exc
     authorization_path = (
         Path(prepared.revision_authorization_path)
         if prepared.revision_authorization_path
@@ -334,54 +395,73 @@ def launch_prepared_update(
     authorization_token = str(prepared.revision_authorization_token or "")
     if bool(authorization_path) != bool(authorization_token):
         raise UpdateCheckError("prepared revision authorization is incomplete")
-    if authorization_path is not None and not authorization_path.is_file():
-        raise UpdateCheckError("prepared revision authorization is missing")
-    log_path = Path(prepared.log_path)
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    install_root = Path(sys.executable).resolve().parent
-    helper_exe = install_root / "updater_helper.exe"
-    if not helper_exe.is_file():
-        raise UpdateCheckError(f"packaged updater helper is missing: {helper_exe}")
-    argv = [
-        os.fspath(helper_exe),
-        "--installer",
-        os.fspath(installer_path),
-        "--manifest",
-        os.fspath(manifest_path),
-        "--signature",
-        os.fspath(signature_path),
-        "--version",
-        prepared.version,
-        "--release-revision",
-        str(prepared.release_revision),
-        "--log-path",
-        os.fspath(log_path),
-        "--install-dir",
-        os.fspath(install_root),
-        "--restart-argv-json",
-        json.dumps([str(item) for item in restart_argv]),
-        "--wait-pid",
-        str(os.getpid()),
-    ]
     if authorization_path is not None:
-        argv.extend(["--revision-authorization", os.fspath(authorization_path)])
-    record_pending_install(
-        version=prepared.version,
-        release_revision=prepared.release_revision,
-        installer_path=os.fspath(installer_path),
-        log_path=os.fspath(log_path),
-    )
-    process_kwargs: dict[str, Any] = {
-        "shell": False,
-        "close_fds": True,
-    }
-    if os.name == "nt":
-        process_kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-    if authorization_path is not None:
-        environment = os.environ.copy()
-        environment[REVISION_AUTH_TOKEN_ENV] = authorization_token
-        process_kwargs["env"] = environment
-    return popen(argv, **process_kwargs)
+        try:
+            authorization_path = require_regular_file(
+                authorization_path,
+                approved_root=metadata_root,
+            )
+        except OSError as exc:
+            raise UpdateCheckError("prepared revision authorization is missing or unsafe") from exc
+    try:
+        log_path = ensure_regular_or_missing(
+            Path(prepared.log_path),
+            approved_root=staging_root,
+        )
+    except OSError as exc:
+        raise UpdateCheckError("prepared update log path is outside staging") from exc
+    try:
+        install_root = ensure_approved_directory(Path(sys.executable).resolve().parent)
+    except OSError as exc:
+        raise UpdateCheckError("packaged updater identity or helper is unsafe") from exc
+    with verified_file_lease(
+        install_root / "updater_helper.exe",
+        approved_root=install_root,
+        error_factory=UpdateCheckError,
+        target_label="packaged updater helper",
+        cleanup_error_callback=lambda exc: log_update_event(
+            "update.install.helper_lease_cleanup_failed",
+            "verified updater helper lease cleanup failed after process creation",
+            level="ERROR",
+            error_type=type(exc).__name__,
+        ),
+    ) as helper_exe:
+        try:
+            current_identity = load_installed_release_identity(install_root)
+        except UpdaterCapabilityError as exc:
+            raise UpdateCheckError("packaged updater identity is unsafe") from exc
+        restart_values = tuple(str(item) for item in restart_argv)
+        launch_binding = LaunchBinding(
+            installer_path=installer_path,
+            manifest_path=manifest_path,
+            signature_path=signature_path,
+            log_path=log_path,
+            install_root=install_root,
+            target_identity=ReleaseIdentity(
+                prepared.version,
+                prepared.release_revision,
+            ),
+            current_identity=current_identity,
+            restart_argv=restart_values,
+            parent_pid=os.getpid(),
+            restart_handoff_path=(
+                staging_root / f".ucrawl-restart-{secrets.token_hex(16)}.json"
+                if restart_values
+                else None
+            ),
+            revision_authorization_path=authorization_path,
+        )
+        return launch_leased_updater_helper(
+            helper_exe,
+            launch_binding,
+            staging_root=staging_root,
+            metadata_root=metadata_root,
+            revision_authorization_token=authorization_token,
+            popen=popen,
+            record_pending=record_pending_install,
+            rollback_pending=rollback_pending_install,
+            error_factory=UpdateCheckError,
+        )
 
 
 def normalize_version(value: Any) -> str:
@@ -448,13 +528,21 @@ def fetch_latest_release_payload(
         },
     )
     try:
-        with open_trusted_url(request, timeout=timeout, allowed_hosts={"api.github.com"}) as response:
+        with open_trusted_url(
+            request,
+            timeout=timeout,
+            allowed_hosts={"api.github.com"},
+            max_response_bytes=MAX_RELEASE_API_BYTES + 1,
+        ) as response:
             final_url = _response_final_url(response, api_url)
             try:
                 validate_asset_url(final_url, {"api.github.com"})
             except ManifestError as exc:
                 raise UpdateCheckError(f"GitHub release API must use trusted HTTPS: {exc}") from exc
-            payload = response.read().decode("utf-8")
+            payload_bytes = response.read(MAX_RELEASE_API_BYTES + 1)
+            if len(payload_bytes) > MAX_RELEASE_API_BYTES:
+                raise UpdateCheckError("GitHub release response is too large")
+            payload = payload_bytes.decode("utf-8")
     except urllib.error.HTTPError as exc:
         if exc.code in {403, 429} and api_url == LATEST_RELEASE_API_URL:
             return fetch_latest_release_page_payload(timeout=timeout)
@@ -463,7 +551,7 @@ def fetch_latest_release_payload(
         raise UpdateCheckError(f"GitHub release request failed: {exc}") from exc
     try:
         data = json.loads(payload)
-    except json.JSONDecodeError as exc:
+    except (json.JSONDecodeError, RecursionError) as exc:
         raise UpdateCheckError("GitHub release response was not valid JSON") from exc
     if not isinstance(data, dict):
         raise UpdateCheckError("GitHub release response had an unexpected shape")
@@ -485,13 +573,21 @@ def fetch_latest_release_page_payload(
     )
     try:
         # GitHub 会把 /latest 重定向到 /tag/<version>；handler 在跟随前验证目标 host。
-        with open_trusted_url(request, timeout=timeout, allowed_hosts={"github.com"}) as response:
+        with open_trusted_url(
+            request,
+            timeout=timeout,
+            allowed_hosts={"github.com"},
+            max_response_bytes=MAX_RELEASE_PAGE_BYTES + 1,
+        ) as response:
             final_url = _response_final_url(response, page_url)
             try:
                 validate_asset_url(final_url, {"github.com"})
             except ManifestError as exc:
                 raise UpdateCheckError(f"GitHub release page must use trusted HTTPS: {exc}") from exc
-            body = response.read(256_000).decode("utf-8", errors="ignore")
+            body_bytes = response.read(MAX_RELEASE_PAGE_BYTES + 1)
+            if len(body_bytes) > MAX_RELEASE_PAGE_BYTES:
+                raise UpdateCheckError("GitHub release page is too large")
+            body = body_bytes.decode("utf-8", errors="ignore")
     except urllib.error.HTTPError as exc:
         raise UpdateCheckError(f"GitHub release page request failed with HTTP {exc.code}") from exc
     except (OSError, TimeoutError, urllib.error.URLError) as exc:
@@ -506,37 +602,6 @@ def fetch_latest_release_page_payload(
         "name": tag_name,
         "html_url": html_url,
     }
-
-
-def _response_final_url(response: Any, fallback: str) -> str:
-    getter = getattr(response, "geturl", None)
-    return str(getter() if callable(getter) else fallback)
-
-
-def _release_tag_from_url(url: str) -> str:
-    parsed = urllib.parse.urlparse(url)
-    match = re.search(r"/releases/tag/([^/?#]+)", parsed.path)
-    if not match:
-        return ""
-    return urllib.parse.unquote(match.group(1))
-
-
-def _release_tag_from_html(html: str) -> str:
-    match = re.search(r'href="[^"]*/releases/tag/([^"/?#]+)', html)
-    if not match:
-        return ""
-    return urllib.parse.unquote(match.group(1))
-
-
-def _release_html_url(tag_name: str, page_url: str) -> str:
-    parsed = urllib.parse.urlparse(page_url)
-    path = parsed.path.strip("/")
-    parts = path.split("/")
-    if len(parts) >= 2:
-        owner, repo = parts[0], parts[1]
-    else:
-        owner, repo = "haohaizi554", "UniversalCrawler"
-    return f"{parsed.scheme or 'https'}://{parsed.netloc or 'github.com'}/{owner}/{repo}/releases/tag/{urllib.parse.quote(tag_name)}"
 
 
 def check_for_update(
@@ -604,6 +669,7 @@ def check_secure_update(
     它没有签名 manifest，不能授权下载或安装。
     """
 
+
     configured_public_key = UPDATE_PUBLIC_KEY_PEM if public_key_pem is None else public_key_pem
     if not str(configured_public_key or "").strip():
         raise UpdateCheckError("安全更新公钥未配置，无法验证 latest.json 签名")
@@ -615,27 +681,40 @@ def check_secure_update(
     except ValueError as exc:
         raise UpdateCheckError(str(exc)) from exc
 
-    metadata_dir = user_cache_root() / "updates" / "metadata"
-    metadata_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        metadata_dir = ensure_approved_directory(
+            default_update_metadata_dir(),
+            create=True,
+        )
+    except OSError as exc:
+        raise UpdateCheckError("update metadata directory is unsafe") from exc
 
     verifier = UpdateManifestVerifier(public_key_pem=configured_public_key, app_id=app_id, channel=channel)
     selector = AssetSelector(os_name=os_name, arch=arch)
-    managed_state = state if state is not None else load_local_update_state()
+    managed_state = state
     verified_candidates: tuple[UpdateCandidate, ...]
 
     if manifest_path is not None and signature_path is not None:
         try:
+            approved_manifest = require_regular_file(
+                Path(manifest_path),
+                approved_root=metadata_dir,
+            )
+            approved_signature = require_regular_file(
+                Path(signature_path),
+                approved_root=metadata_dir,
+            )
             verified_candidates = (
                 _candidate_from_verified_metadata(
                     verifier=verifier,
                     selector=selector,
                     local_version=normalized_local,
-                    manifest_path=Path(manifest_path),
-                    signature_path=Path(signature_path),
+                    manifest_path=approved_manifest,
+                    signature_path=approved_signature,
                     release_url=release_url,
                 ),
             )
-        except (ManifestError, ValueError) as exc:
+        except (OSError, ManifestError, ValueError) as exc:
             raise UpdateCheckError(str(exc)) from exc
     else:
         try:
@@ -664,10 +743,22 @@ def check_secure_update(
                 return replace(readonly_result, status=UPDATE_STATUS_UNTRUSTED)
             return readonly_result
 
-    ranked_candidates = _sort_candidates_desc(_deduplicate_candidates(verified_candidates))
-    available_candidates = tuple(
+    if managed_state is None:
+        managed_state = load_local_update_state()
+    ranked_candidates = _sort_candidates_desc(
+        _deduplicate_candidates(
+            verified_candidates,
+            metadata_root=metadata_dir,
+        )
+    )
+    eligible_candidates = tuple(
         candidate
         for candidate in ranked_candidates
+        if _candidate_is_channel_eligible(candidate, channel=channel)
+    )
+    available_candidates = tuple(
+        candidate
+        for candidate in eligible_candidates
         if _candidate_is_available(
             candidate,
             current_version=normalized_local,
@@ -678,15 +769,16 @@ def check_secure_update(
         )
     )
     if state is None:
-        if ranked_candidates:
+        if eligible_candidates:
             # last_seen 是最近一次可信检查的观察值，不是版本回滚的授权基线。
             # 这会纠正历史测试/预发布候选写入的陈旧记录。
-            managed_state.last_seen_version = ranked_candidates[0].identity.version
-            managed_state.last_seen_revision = ranked_candidates[0].identity.revision
-        save_local_update_state(managed_state)
+            managed_state = record_last_seen_update(
+                eligible_candidates[0].identity.version,
+                release_revision=eligible_candidates[0].identity.revision,
+            )
 
     selection_pool = (
-        ranked_candidates
+        eligible_candidates
         if selected_candidate_id is not None or selected_version is not None
         else available_candidates
     )
@@ -708,12 +800,12 @@ def check_secure_update(
             status=UPDATE_STATUS_AVAILABLE,
             local_version=normalized_local,
             local_revision=local_identity.revision,
-            candidates=ranked_candidates if manual else available_candidates,
+            candidates=eligible_candidates if manual else available_candidates,
         )
 
-    if not ranked_candidates:
-        raise UpdateCheckError("No signed update candidates were available")
-    latest_candidate = ranked_candidates[0]
+    if not eligible_candidates:
+        raise UpdateCheckError("No channel-eligible signed update candidates were available")
+    latest_candidate = eligible_candidates[0]
     if local_identity > latest_candidate.identity:
         status = UPDATE_STATUS_LOCAL_NEWER
     else:
@@ -729,7 +821,7 @@ def check_secure_update(
         status=status,
         local_version=normalized_local,
         local_revision=local_identity.revision,
-        candidates=ranked_candidates if manual else available_candidates,
+        candidates=eligible_candidates if manual else available_candidates,
     )
 
 
@@ -744,9 +836,12 @@ def _candidate_from_verified_metadata(
     tag_name: str = "",
     release_name: str = "",
 ) -> UpdateCandidate:
-    manifest = verifier.load_verified(Path(manifest_path), Path(signature_path))
+    try:
+        manifest = verifier.load_verified(Path(manifest_path), Path(signature_path))
+    except ManifestError as exc:
+        raise SignedMetadataIntegrityError(str(exc)) from exc
     if tag_name and tag_name != manifest.tag:
-        raise UpdateCheckError(
+        raise SignedMetadataIntegrityError(
             f"Release tag {tag_name} does not match signed manifest tag {manifest.tag}"
         )
     asset = selector.select(manifest)
@@ -781,6 +876,43 @@ def _fetch_verified_update_candidates(
     manual: bool,
     max_candidates: int,
 ) -> tuple[UpdateCandidate, ...]:
+    discovery_scope = release_discovery_scope(
+        release_client,
+        page_size=max_candidates,
+    )
+    identity_scope = release_authority_scope(release_client)
+    auto_check_interval = getattr(
+        release_client,
+        "auto_check_interval_seconds",
+        0,
+    )
+    if (
+        discovery_scope
+        and not manual
+        and type(auto_check_interval) is int
+        and auto_check_interval > 0
+    ):
+        active_generation = load_active_generation(
+            metadata_dir,
+            expected_scope=discovery_scope,
+        )
+        if active_generation is not None and generation_is_fresh(
+            active_generation,
+            max_age_seconds=auto_check_interval,
+        ):
+            cached = _load_cached_update_candidates(
+                verifier=verifier,
+                selector=selector,
+                metadata_dir=metadata_dir,
+                local_version=local_version,
+                discovery_scope=discovery_scope,
+            )
+            if cached:
+                log_update_event(
+                    "update.check.throttled",
+                    "automatic signed update discovery throttled",
+                )
+                return cached
     try:
         if hasattr(release_client, "fetch_manifest_location_candidates"):
             locations = tuple(
@@ -797,7 +929,8 @@ def _fetch_verified_update_candidates(
             selector=selector,
             metadata_dir=metadata_dir,
             local_version=local_version,
-        )
+            discovery_scope=discovery_scope,
+        ) if discovery_scope else ()
         if cached:
             log_update_event(
                 "update.check.cache_fallback",
@@ -810,12 +943,17 @@ def _fetch_verified_update_candidates(
             raise SignedMetadataUnavailableError(str(exc)) from exc
         raise UpdateCheckError(str(exc)) from exc
     if not locations or all(location.not_modified for location in locations):
+        discovery = locations[0] if locations else ManifestLocations()
         cached = _load_cached_update_candidates(
             verifier=verifier,
             selector=selector,
             metadata_dir=metadata_dir,
             local_version=local_version,
-        )
+            expected_etag=discovery.etag,
+            expected_last_modified=discovery.last_modified,
+            require_discovery_token=True,
+            discovery_scope=discovery_scope,
+        ) if discovery_scope else ()
         if cached:
             return cached
         raise UpdateCheckError("GitHub release manifest was not modified and no cached manifest was provided")
@@ -829,15 +967,27 @@ def _fetch_verified_update_candidates(
             continue
         attempted_candidates += 1
         try:
-            with tempfile.TemporaryDirectory(prefix=".candidate-", dir=metadata_dir) as temp_dir:
-                temp_root = Path(temp_dir)
-                temp_manifest = _download_metadata_file(
+            with temporary_approved_directory(
+                metadata_dir,
+                prefix=".candidate-",
+            ) as temp_root:
+                temp_manifest = download_metadata_file(
                     location.manifest_url,
                     temp_root / DEFAULT_MANIFEST_NAME,
+                    max_bytes=MAX_SIGNED_MANIFEST_BYTES,
+                    open_url=open_trusted_url,
+                    validate_url=validate_asset_url,
+                    write_bytes=atomic_write_bytes,
+                    final_url=_response_final_url,
                 )
-                temp_signature = _download_metadata_file(
+                temp_signature = download_metadata_file(
                     location.signature_url,
                     temp_root / DEFAULT_SIGNATURE_NAME,
+                    max_bytes=ED25519_SIGNATURE_BYTES,
+                    open_url=open_trusted_url,
+                    validate_url=validate_asset_url,
+                    write_bytes=atomic_write_bytes,
+                    final_url=_response_final_url,
                 )
                 # 先验证临时下载，再触碰 last-known-good 缓存；tag 可能被重新发布，
                 # 因此内容摘要也进入文件名，使每一代已验证元数据不可变。
@@ -851,15 +1001,29 @@ def _fetch_verified_update_candidates(
                     tag_name=location.tag_name,
                     release_name=location.release_name,
                 )
-                digest = hashlib.sha256(temp_manifest.read_bytes()).hexdigest()
+                digest = file_sha256(
+                    temp_manifest,
+                    approved_root=temp_root,
+                    max_bytes=MAX_SIGNED_MANIFEST_BYTES,
+                )
                 manifest_path, signature_path = _metadata_targets(
                     metadata_dir,
                     location,
                     index,
                     content_digest=digest,
                 )
-                temp_manifest.replace(manifest_path)
-                temp_signature.replace(signature_path)
+                replace_between_approved_roots(
+                    temp_manifest,
+                    manifest_path,
+                    source_root=temp_root,
+                    target_root=metadata_dir,
+                )
+                replace_between_approved_roots(
+                    temp_signature,
+                    signature_path,
+                    source_root=temp_root,
+                    target_root=metadata_dir,
+                )
             candidates.append(
                 _candidate_from_verified_metadata(
                     verifier=verifier,
@@ -876,7 +1040,20 @@ def _fetch_verified_update_candidates(
             missing_metadata_candidates += 1
             errors.append(str(exc))
             log_update_event("update.check.candidate_skipped", str(exc), level="WARN")
-        except (ManifestError, DownloadError, UpdateCheckError, ValueError) as exc:
+        except SignedMetadataIntegrityError as exc:
+            log_update_event(
+                "update.check.integrity_failed",
+                str(exc),
+                level="SECURITY",
+            )
+            raise UpdateCheckError(str(exc)) from exc
+        except (
+            ManifestError,
+            DownloadError,
+            UpdateCheckError,
+            UpdaterCapabilityError,
+            ValueError,
+        ) as exc:
             errors.append(str(exc))
             log_update_event("update.check.candidate_skipped", str(exc), level="WARN")
     if not candidates:
@@ -885,7 +1062,8 @@ def _fetch_verified_update_candidates(
             selector=selector,
             metadata_dir=metadata_dir,
             local_version=local_version,
-        )
+            discovery_scope=discovery_scope,
+        ) if discovery_scope else ()
         if cached:
             log_update_event(
                 "update.check.cache_fallback",
@@ -898,7 +1076,39 @@ def _fetch_verified_update_candidates(
             raise SignedMetadataUnavailableError(detail or "Signed update metadata is not published")
         detail = "; ".join(error for error in errors if error)
         raise UpdateCheckError(detail or "No signed update candidates were available")
-    return tuple(candidates)
+    deduplicated = _deduplicate_candidates(
+        tuple(candidates),
+        metadata_root=metadata_dir,
+    )
+    etags = {location.etag for location in locations if location.etag}
+    last_modified_values = {
+        location.last_modified for location in locations if location.last_modified
+    }
+    if len(etags) > 1 or len(last_modified_values) > 1:
+        raise UpdateCheckError("GitHub release discovery returned inconsistent cache validators")
+    try:
+        write_active_generation(
+            metadata_dir,
+            etag=next(iter(etags), ""),
+            last_modified=next(iter(last_modified_values), ""),
+            records=(
+                metadata_record(
+                    Path(candidate.manifest_path),
+                    Path(candidate.signature_path),
+                    release_url=candidate.html_url,
+                    tag_name=candidate.tag_name,
+                    release_name=candidate.release_name,
+                    candidate_id=candidate.candidate_id,
+                )
+                for candidate in deduplicated
+            ),
+            atomic_write_text=_atomic_write_text,
+            scope=discovery_scope,
+            identity_scope=identity_scope,
+        )
+    except (MetadataIdentityConflictError, OSError, UpdaterCapabilityError) as exc:
+        raise UpdateCheckError(str(exc)) from exc
+    return deduplicated
 
 
 def _load_cached_update_candidates(
@@ -907,19 +1117,26 @@ def _load_cached_update_candidates(
     selector: AssetSelector,
     metadata_dir: Path,
     local_version: str,
+    expected_etag: str = "",
+    expected_last_modified: str = "",
+    require_discovery_token: bool = False,
+    discovery_scope: str = "",
 ) -> tuple[UpdateCandidate, ...]:
-    pairs: list[tuple[Path, Path]] = []
-    legacy_manifest = metadata_dir / DEFAULT_MANIFEST_NAME
-    legacy_signature = metadata_dir / DEFAULT_SIGNATURE_NAME
-    if legacy_manifest.exists() and legacy_signature.exists():
-        pairs.append((legacy_manifest, legacy_signature))
-    for manifest_path in metadata_dir.glob(f"*.{DEFAULT_MANIFEST_NAME}"):
-        signature_path = manifest_path.with_name(f"{manifest_path.name}.sig")
-        if signature_path.exists():
-            pairs.append((manifest_path, signature_path))
-
+    generation = load_active_generation(
+        metadata_dir,
+        expected_etag=expected_etag,
+        expected_last_modified=expected_last_modified,
+        require_discovery_token=require_discovery_token,
+        expected_scope=discovery_scope,
+    )
+    if generation is None:
+        return ()
     candidates: list[UpdateCandidate] = []
-    for manifest_path, signature_path in pairs:
+    for record in generation.records:
+        paths = verified_record_paths(metadata_dir, record)
+        if paths is None:
+            return ()
+        manifest_path, signature_path = paths
         try:
             candidates.append(
                 _candidate_from_verified_metadata(
@@ -928,15 +1145,23 @@ def _load_cached_update_candidates(
                     local_version=local_version,
                     manifest_path=manifest_path,
                     signature_path=signature_path,
+                    release_url=record.release_url,
+                    tag_name=record.tag_name,
+                    release_name=record.release_name,
                 )
             )
         except (ManifestError, UpdateCheckError, ValueError) as exc:
             log_update_event("update.check.cached_candidate_skipped", str(exc), level="WARN")
-    return _collapse_cached_update_generations(tuple(candidates))
+    return _deduplicate_candidates(
+        tuple(candidates),
+        metadata_root=metadata_dir,
+    )
 
 
 def _collapse_cached_update_generations(
     candidates: tuple[UpdateCandidate, ...],
+    *,
+    metadata_root: Path,
 ) -> tuple[UpdateCandidate, ...]:
     """按签名发布时间折叠同一发布身份的历史缓存，保留无法判定的新旧冲突。"""
 
@@ -948,7 +1173,13 @@ def _collapse_cached_update_generations(
     for identity, generations in grouped.items():
         distinct_by_digest: dict[tuple[str, str], UpdateCandidate] = {}
         for candidate in generations:
-            distinct_by_digest.setdefault(_candidate_metadata_digest(candidate), candidate)
+            distinct_by_digest.setdefault(
+                _candidate_metadata_digest(
+                    candidate,
+                    metadata_root=metadata_root,
+                ),
+                candidate,
+            )
         distinct = tuple(distinct_by_digest.values())
         if len(distinct) <= 1:
             selected.extend(distinct)
@@ -998,13 +1229,25 @@ def _parse_signed_publication_time(value: str) -> datetime | None:
     return parsed.astimezone(timezone.utc)
 
 
-def _candidate_metadata_digest(candidate: UpdateCandidate) -> tuple[str, str]:
+def _candidate_metadata_digest(
+    candidate: UpdateCandidate,
+    *,
+    metadata_root: Path,
+) -> tuple[str, str]:
     try:
         return (
-            hashlib.sha256(Path(candidate.manifest_path).read_bytes()).hexdigest(),
-            hashlib.sha256(Path(candidate.signature_path).read_bytes()).hexdigest(),
+            file_sha256(
+                Path(candidate.manifest_path),
+                approved_root=metadata_root,
+                max_bytes=MAX_SIGNED_MANIFEST_BYTES,
+            ),
+            file_sha256(
+                Path(candidate.signature_path),
+                approved_root=metadata_root,
+                max_bytes=ED25519_SIGNATURE_BYTES,
+            ),
         )
-    except OSError as exc:
+    except (OSError, UpdaterCapabilityError) as exc:
         raise UpdateCheckError(
             f"verified candidate metadata disappeared: {candidate.identity.tag}"
         ) from exc
@@ -1065,6 +1308,18 @@ def _candidate_is_available(
     return policy.allowed
 
 
+def _candidate_is_channel_eligible(
+    candidate: UpdateCandidate,
+    *,
+    channel: str,
+) -> bool:
+    try:
+        version = SemVer.parse(candidate.version)
+    except ValueError:
+        return False
+    return not (channel == "stable" and bool(version.prerelease))
+
+
 def _select_update_candidate(
     candidates: tuple[UpdateCandidate, ...],
     *,
@@ -1119,6 +1374,8 @@ def _result_from_candidate(
 
 def _deduplicate_candidates(
     candidates: tuple[UpdateCandidate, ...],
+    *,
+    metadata_root: Path,
 ) -> tuple[UpdateCandidate, ...]:
     """折叠相同签名元数据，并拒绝同一身份指向不同清单的远端冲突。"""
 
@@ -1126,7 +1383,10 @@ def _deduplicate_candidates(
     digests: dict[ReleaseIdentity, tuple[str, str]] = {}
     for candidate in candidates:
         identity = candidate.identity
-        digest = _candidate_metadata_digest(candidate)
+        digest = _candidate_metadata_digest(
+            candidate,
+            metadata_root=metadata_root,
+        )
         if identity in unique:
             if digests[identity] != digest:
                 raise UpdateCheckError(f"conflicting signed manifests for release identity {identity.tag}")
@@ -1148,32 +1408,3 @@ def _release_identity_from_text(value: Any) -> ReleaseIdentity:
             return ReleaseIdentity(version, 0)
         except ValueError as exc:
             raise UpdateCheckError(str(exc)) from exc
-
-
-def _download_metadata_file(url: str, target: Path, *, timeout: float = 8.0, max_bytes: int = 2_000_000) -> Path:
-    allowed_hosts = {"github.com", "objects.githubusercontent.com", "release-assets.githubusercontent.com"}
-    try:
-        validate_asset_url(url, allowed_hosts)
-    except ManifestError as exc:
-        raise DownloadError(f"metadata URL must use trusted HTTPS: {exc}") from exc
-    request = urllib.request.Request(url, headers={"User-Agent": "UniversalCrawlerPro/update-check"})
-    try:
-        # 签名元数据允许重定向到 GitHub 资产 CDN，但不能越出该 host 白名单。
-        with open_trusted_url(request, timeout=timeout, allowed_hosts=allowed_hosts) as response:
-            final_url = _response_final_url(response, url)
-            try:
-                validate_asset_url(final_url, allowed_hosts)
-            except ManifestError as exc:
-                raise DownloadError(f"metadata URL must use trusted HTTPS: {exc}") from exc
-            data = response.read(max_bytes + 1)
-    except urllib.error.HTTPError as exc:
-        if exc.code == 404:
-            raise MetadataNotFoundError("metadata download failed with HTTP 404") from exc
-        raise DownloadError(f"metadata download failed with HTTP {exc.code}") from exc
-    except (OSError, TimeoutError, urllib.error.URLError) as exc:
-        raise DownloadError(f"metadata download failed: {exc}") from exc
-    if len(data) > max_bytes:
-        raise DownloadError("metadata file exceeds size limit")
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_bytes(data)
-    return target

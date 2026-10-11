@@ -19,7 +19,12 @@ from app.web.api_result import error_result, finalize_api_result
 from app.web.controller_config_service import WebControllerConfigService
 from app.web.controller_route_service import require_valid_video_id
 from app.web.session_runtime import is_local_host
-from shared.release_identity import ReleaseIdentity, load_runtime_release_identity
+from shared.release_identity import (
+    MAX_RELEASE_CANDIDATE_ID_LENGTH,
+    MAX_RELEASE_VERSION_LENGTH,
+    ReleaseIdentity,
+    load_runtime_release_identity,
+)
 
 
 def _finalize_route_result(payload: Any, *, enforce_statuses: set[int] | None = None) -> Any:
@@ -60,11 +65,14 @@ class FrontendActionRequest(_RequestModel):
         return handler(value)
 
 class UpdateCheckRequest(_RequestModel):
-    local_version: str = Field(default="", max_length=40)
+    local_version: str = Field(default="", max_length=MAX_RELEASE_VERSION_LENGTH)
 
 class UpdatePrepareRequest(UpdateCheckRequest):
-    selected_version: str = Field(default="", max_length=40)
-    selected_candidate_id: str = Field(default="", max_length=80)
+    selected_version: str = Field(default="", max_length=MAX_RELEASE_VERSION_LENGTH)
+    selected_candidate_id: str = Field(
+        default="",
+        max_length=MAX_RELEASE_CANDIDATE_ID_LENGTH,
+    )
     confirm_revision_change: bool = False
 
 class UpdateSkipRequest(UpdatePrepareRequest):
@@ -113,7 +121,7 @@ def _select_update_result(result: Any, *, candidate_id: str = "", version: str =
     selected_version = str(version or "").strip()
     if selected_version:
         return result.for_version(selected_version)
-    return result.for_candidate(result.candidates[0].candidate_id)
+    return result.for_candidate(result.selected_identity.candidate_id)
 
 
 async def _run_controller_worker_call(func: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:

@@ -30,7 +30,7 @@
 
 ## 关键原则
 
-- 版本号只认 `pyproject.toml`
+- 版本号只认 `shared/version.py`；`pyproject.toml` 通过动态元数据投影该值
 - 安装器版本不得手工硬编码
 - 打包态用户数据不得回写进仓库
 - 开发态与打包态路径必须继续遵守 `runtime_paths.py` 规范
@@ -51,6 +51,7 @@
 打包链路一旦调整，下面这些文件必须一起看，避免“构建脚本变了，但 README / 安装器 / 路径规则没同步”：
 
 - 版本与展示名：
+  - `shared/version.py`
   - `pyproject.toml`
   - `packaging/project_meta.py`
 - 便携版构建：
@@ -150,7 +151,7 @@ dist/installer/
 命名规则：
 
 - 安装包文件名自动带当前项目版本
-- 版本号来源于 `pyproject.toml`
+- 版本号来源于 `shared/version.py`，`pyproject.toml` 不维护第二份字面量
 - 安装后运行时用户数据应写入 `%LOCALAPPDATA%` / `AppData`
 
 ### 发布构建器
@@ -197,21 +198,22 @@ python packaging/build_release.py --build-only
 
 当前版本同步关系如下：
 
-- Python 包版本：`pyproject.toml`
+- 产品版本事实源：`shared/version.py`
+- Python 包版本投影：`pyproject.toml` 动态读取 `shared.version.__version__`
 - 打包元数据：`packaging/project_meta.py`
 - 便携版说明：`packaging/build_portable.py` 写入 `BUILD_INFO.txt`
 - 安装器版本：`packaging/build_installer.py` 注入 `installer.iss`
 - 安装包输出名：同样由 `build_installer.py` 注入
 
-如果你要发布新版本，优先修改：
+如果你要发布新版本，优先修改 `shared/version.py` 中的统一版本值，并让发布构建器完成受控投影与提交：
 
-```toml
-[project]
-version = "x.y.z"
+```python
+__version__ = "x.y.z"
 ```
 
 不要再手改：
 
+- `pyproject.toml` 的动态版本配置
 - `installer.iss` 的版本号
 - 安装包文件名
 - 便携版构建说明里的版本文本

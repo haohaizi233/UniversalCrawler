@@ -16,6 +16,7 @@ from PyQt6.QtWidgets import (
 
 from app.ui.components.combo_popup import ThemedComboBox
 from app.ui.dialogs.chromed_dialog import ChromedDialog
+from app.ui.dialogs.update_candidate_options import normalize_update_candidates
 from shared.localization import normalize_language, tr
 from shared.version import format_version_label
 
@@ -178,6 +179,7 @@ class UpdateCheckDialog(ChromedDialog):
         local_version: str = "",
         latest_version: str = "",
         release_url: str = "",
+        selected_candidate_id: str = "",
         candidates: tuple[Any, ...] = (),
         language: str = "zh-CN",
     ) -> None:
@@ -202,7 +204,12 @@ class UpdateCheckDialog(ChromedDialog):
             self.resize(760, 720)
         self._release_url = str(release_url or "").strip()
         self._initial_details = str(details or "")
-        self._candidate_options = self._normalize_candidates(candidates, latest_version=latest_version, release_url=release_url)
+        self._candidate_options = normalize_update_candidates(
+            candidates,
+            latest_version=latest_version,
+            release_url=release_url,
+            selected_candidate_id=selected_candidate_id,
+        )
         self._selected_version = self._candidate_options[0]["version"] if self._candidate_options else str(latest_version or "")
         self._selected_candidate_id = self._candidate_options[0]["candidate_id"] if self._candidate_options else ""
         self.release_link: QLabel | None = None
@@ -507,49 +514,6 @@ class UpdateCheckDialog(ChromedDialog):
     def _display_version(version: str) -> str:
         return format_version_label(version, fallback="-")
 
-    @classmethod
-    def _normalize_candidates(cls, candidates: tuple[Any, ...], *, latest_version: str, release_url: str) -> list[dict[str, Any]]:
-        options: list[dict[str, Any]] = []
-        for candidate in candidates or ():
-            version = str(cls._candidate_value(candidate, "version") or "").strip()
-            if not version:
-                continue
-            revision = int(cls._candidate_value(candidate, "release_revision") or 0)
-            tag = str(cls._candidate_value(candidate, "tag_name") or "").strip()
-            candidate_id = str(cls._candidate_value(candidate, "candidate_id") or tag).strip()
-            options.append(
-                {
-                    "version": version,
-                    "revision": revision,
-                    "candidate_id": candidate_id,
-                    "tag": tag,
-                    "name": str(cls._candidate_value(candidate, "release_name") or ""),
-                    "release_url": str(cls._candidate_value(candidate, "html_url") or release_url or ""),
-                    "notes": str(cls._candidate_value(candidate, "notes") or ""),
-                    "asset": str(cls._candidate_value(candidate, "asset_name") or ""),
-                }
-            )
-        if not options and latest_version:
-            options.append(
-                {
-                    "version": str(latest_version),
-                    "revision": 0,
-                    "candidate_id": str(latest_version),
-                    "tag": str(latest_version),
-                    "name": str(latest_version),
-                    "release_url": str(release_url or ""),
-                    "notes": "",
-                    "asset": "",
-                }
-            )
-        return options
-
-    @staticmethod
-    def _candidate_value(candidate: Any, key: str) -> Any:
-        if isinstance(candidate, dict):
-            return candidate.get(key)
-        return getattr(candidate, key, "")
-
     def _candidate_label(self, option: dict[str, Any]) -> str:
         version = self._display_version(option["version"])
         revision = int(option.get("revision") or 0)
@@ -645,6 +609,7 @@ class UpdateDownloadDialog(ChromedDialog):
     ) -> None:
         self._language = normalize_language(language)
         self._terminal_state = False
+        self._installing = False
         self._release_url = str(release_url or "").strip()
         super().__init__(
             parent,
@@ -740,10 +705,21 @@ class UpdateDownloadDialog(ChromedDialog):
         self.install_button = QPushButton(self._tr("安装并重启"))
         self.install_button.setObjectName("DialogPrimaryButton")
         self.install_button.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.install_button.clicked.connect(self.install_requested.emit)
+        self.install_button.clicked.connect(self._request_install)
         self.install_button.hide()
         button_row.addWidget(self.install_button)
         return button_row
+
+    def _request_install(self) -> None:
+        if self._installing or not self.install_button.isEnabled():
+            return
+        self.set_installing()
+        self.install_requested.emit()
+
+    def set_installing(self) -> None:
+        self._installing = True
+        self.install_button.setDefault(False)
+        self.install_button.setEnabled(False)
 
     def set_progress(self, progress: dict) -> None:
         percent = max(0, min(100, int(float(progress.get("percent") or 0))))
@@ -761,6 +737,7 @@ class UpdateDownloadDialog(ChromedDialog):
 
     def set_error(self, message: str) -> None:
         self._terminal_state = True
+        self._installing = False
         self.status_icon.set_status("error", self._colors)
         self.state_label.setText(self._tr("更新下载失败"))
         self.detail_label.setText(self._tr(str(message or "未知错误")))
@@ -770,6 +747,7 @@ class UpdateDownloadDialog(ChromedDialog):
 
     def set_cancelling(self) -> None:
         self._terminal_state = True
+        self._installing = False
         self.state_label.setText(self._tr("正在取消下载"))
         self.detail_label.setText(self._tr("正在等待下载线程停止，请稍候。"))
         self.cancel_button.hide()
@@ -781,6 +759,7 @@ class UpdateDownloadDialog(ChromedDialog):
 
     def set_ready(self, installer_path: str) -> None:
         self._terminal_state = True
+        self._installing = False
         self.status_icon.set_status("current", self._colors)
         self.progress_bar.setValue(100)
         self.state_label.setText(self._tr("更新已准备好"))
@@ -788,6 +767,7 @@ class UpdateDownloadDialog(ChromedDialog):
         self.cancel_button.hide()
         self.retry_button.hide()
         self.install_button.show()
+        self.install_button.setEnabled(True)
         self.install_button.setDefault(True)
 
     def reject(self) -> None:

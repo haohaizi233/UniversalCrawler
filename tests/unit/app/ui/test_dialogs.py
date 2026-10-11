@@ -523,3 +523,36 @@ class SelectionDialogLanguageTests(unittest.TestCase):
         dialog.done(QDialog.DialogCode.Accepted)
 
         controller.uninstall.assert_called_once()
+
+
+@unittest.skipUnless(_pyqt6_available(), "PyQt6 is not installed")
+class UpdateDownloadDialogStateTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.app = _qt_app()
+
+    def test_install_request_is_one_shot_until_ready_state_is_restored(self):
+        from app.ui.dialogs.update_check import UpdateDownloadDialog
+
+        dialog = UpdateDownloadDialog(
+            version="v3.6.21",
+            asset_name="setup.exe",
+            language="zh-CN",
+        )
+        requests: list[bool] = []
+        dialog.install_requested.connect(lambda: requests.append(True))
+        try:
+            dialog.set_ready("D:/updates/setup.exe")
+
+            dialog.install_button.click()
+            dialog.install_button.click()
+
+            self.assertEqual(requests, [True])
+            self.assertFalse(dialog.install_button.isEnabled())
+
+            dialog.set_ready("D:/updates/setup.exe")
+            self.assertTrue(dialog.install_button.isEnabled())
+        finally:
+            dialog.close()
+            dialog.deleteLater()
+            self.app.processEvents()

@@ -12,7 +12,7 @@ class _FakeWebSocket:
     def __init__(self, *, cookies=None, headers=None, client_host="127.0.0.1"):
         self.cookies = cookies or {}
         self.headers = headers or {}
-        self.url = SimpleNamespace(scheme="ws", netloc="testserver")
+        self.url = SimpleNamespace(scheme="ws", netloc="testserver", hostname="127.0.0.1")
         self.client = SimpleNamespace(host=client_host)
         self.closed = None
 
@@ -81,6 +81,18 @@ class WebSocketSessionBinderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(registry._contexts, {"session-a": context})
         self.assertFalse(context.has_active_websocket())
         self.assertFalse(registry._contexts["session-a"].has_active_websocket())
+
+    async def test_bind_reuses_http_loopback_host_check(self):
+        registry = self._registry()
+        binder = WebSocketSessionBinder(registry, default_session_id="default")
+        ws = _FakeWebSocket(client_host="127.0.0.1")
+        ws.url.hostname = "rebind.attacker.test"
+
+        binding = await binder.bind(ws)
+
+        self.assertIsNone(binding)
+        self.assertEqual(ws.closed, (1008, "passwordless Web access requires a loopback host"))
+        self.assertEqual(registry._contexts, {})
 
     async def test_bind_rejects_remote_client_without_origin_or_token(self):
         registry = self._registry()

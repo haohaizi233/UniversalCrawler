@@ -437,7 +437,7 @@ class WebWorkflowService:
             pending_item.status = VideoStatus.TIMED_OUT.label
         else:
             pending_item.status = VideoStatus.FAILED.label
-        pending_item.progress = 0
+        retained_progress = pending_item.progress
         if pending_item.meta is None:
             pending_item.meta = {}
         pending_item.meta["download_error"] = error_msg
@@ -447,7 +447,11 @@ class WebWorkflowService:
         )
         await self.broadcast(
             "video_state_changed",
-            build_video_state_event(pending_item.id, pending_item, requested_progress=0).to_payload(),
+            build_video_state_event(
+                pending_item.id,
+                pending_item,
+                requested_progress=retained_progress,
+            ).to_payload(),
         )
         await self._emit_log(f"❌ 下载失败: {error_msg}")
 

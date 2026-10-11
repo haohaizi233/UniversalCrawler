@@ -35,10 +35,19 @@ class WebWorkflowRouteService:
 
     async def start_crawl(self, request: Request, body: dict) -> dict:
         context = self._get_request_context(request)
-        payload = self._normalize_authorized_save_dir(context, body)
-        if isinstance(payload, dict) and payload.get("status") == "error":
-            return payload
-        return await context.workflow.start_crawl(payload, log_error=False)
+        if not isinstance(body, dict):
+            return error_result("请求体必须是 JSON 对象")
+        save_dir = body.get("save_dir")
+        if save_dir is not None and not isinstance(save_dir, str):
+            return error_result("save_dir 必须是字符串或 null")
+        try:
+            with context.open_operation_directory(save_dir if save_dir else None) as opened:
+                payload = dict(body)
+                if opened:
+                    payload["save_dir"] = opened
+                return await context.workflow.start_crawl(payload, log_error=False)
+        except PermissionError as exc:
+            return error_result(str(exc), http_status=403)
 
     async def stop_crawl(self, request: Request) -> dict:
         context = self._get_request_context(request)
@@ -50,7 +59,16 @@ class WebWorkflowRouteService:
 
     async def direct_download(self, request: Request, body: dict) -> dict:
         context = self._get_request_context(request)
-        payload = self._normalize_authorized_save_dir(context, body)
-        if isinstance(payload, dict) and payload.get("status") == "error":
-            return payload
-        return await context.workflow.direct_download(payload, log_error=False)
+        if not isinstance(body, dict):
+            return error_result("请求体必须是 JSON 对象")
+        save_dir = body.get("save_dir")
+        if save_dir is not None and not isinstance(save_dir, str):
+            return error_result("save_dir 必须是字符串或 null")
+        try:
+            with context.open_operation_directory(save_dir if save_dir else None) as opened:
+                payload = dict(body)
+                if opened:
+                    payload["save_dir"] = opened
+                return await context.workflow.direct_download(payload, log_error=False)
+        except PermissionError as exc:
+            return error_result(str(exc), http_status=403)

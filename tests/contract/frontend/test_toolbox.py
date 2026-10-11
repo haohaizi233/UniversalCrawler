@@ -407,7 +407,11 @@ def test_toolbox_actions_use_new_contract_with_legacy_start_fallback() -> None:
         "parameters": {"source": "input.mp4"},
     }
     assert result["cancelPayload"] == {"tool_id": "media_probe", "run_id": "run-7"}
-    assert result["openPayload"] == {"tool_id": "media_probe", "result_id": "result-9"}
+    assert result["openPayload"] == {
+        "tool_id": "media_probe",
+        "result_id": "result-9",
+        "run_id": "run-7",
+    }
 
 
 def test_toolbox_runtime_consumes_delta_sections_without_polling() -> None:

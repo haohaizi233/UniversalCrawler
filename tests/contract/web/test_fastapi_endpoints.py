@@ -30,6 +30,9 @@ def _create_test_client():
     client.get("/api/session/bootstrap")
     cookie_name = client.app.state.web_session_cookie_name
     session_id = client.cookies.get(cookie_name)
+    csrf_token = client.cookies.get(client.app.state.web_csrf_cookie_name)
+    if csrf_token:
+        client.headers["X-Ucrawl-Session-Token"] = csrf_token
     client._ucrawl_context = client.app.state.web_session_registry.get_or_create(session_id)
     return client
 
@@ -409,7 +412,7 @@ class ScanEndpointTests(unittest.TestCase):
         self.assertIn(r.json().get("status"), ("ok", "error"))
 
     def test_scan_valid_directory(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             self.client._ucrawl_context.approve_directory(tmp)
             r = self.client.post("/api/scan", json={"directory": tmp})
             self.assertEqual(r.status_code, 200)
@@ -419,7 +422,7 @@ class ScanEndpointTests(unittest.TestCase):
 
     def test_scan_with_scan_limit(self):
         """scan_limit 参数支持整数。"""
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             self.client._ucrawl_context.approve_directory(tmp)
             r = self.client.post("/api/scan", json={"directory": tmp, "scan_limit": 100})
             self.assertEqual(r.status_code, 200)
@@ -427,7 +430,7 @@ class ScanEndpointTests(unittest.TestCase):
 
     def test_scan_scan_limit_invalid_type(self):
         """scan_limit 必须是整数。"""
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             self.client._ucrawl_context.approve_directory(tmp)
             r = self.client.post("/api/scan", json={"directory": tmp, "scan_limit": "abc"})
             self.assertEqual(r.status_code, 200)
@@ -435,7 +438,7 @@ class ScanEndpointTests(unittest.TestCase):
 
     def test_scan_scan_limit_zero(self):
         """scan_limit 必须大于 0。"""
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             self.client._ucrawl_context.approve_directory(tmp)
             r = self.client.post("/api/scan", json={"directory": tmp, "scan_limit": 0})
             self.assertEqual(r.status_code, 200)
@@ -541,7 +544,7 @@ class SearchEndpointValidationTests(unittest.TestCase):
             captured.update(kwargs)
             return {"status": "ok", "items": []}
 
-        with TemporaryDirectory() as tmp, patch(
+        with TemporaryDirectory(ignore_cleanup_errors=True) as tmp, patch(
             "app.web.server.run_cli_search",
             side_effect=fake_run_cli_search,
         ):
@@ -743,7 +746,7 @@ class DirListChangeTests(unittest.TestCase):
         self.assertEqual(r.status_code, 200)
 
     def test_dir_list_with_specific_path(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             self.client._ucrawl_context.approve_directory(tmp)
             r = self.client.get(f"/api/dir/list?path={tmp}")
             self.assertEqual(r.status_code, 200)
@@ -751,10 +754,11 @@ class DirListChangeTests(unittest.TestCase):
             self.assertIn("subdirs", data)
 
     def test_dir_list_nonexistent_path(self):
-        """Z:\\__definitely_not_exist_12345__ 应当返回 error 字段。"""
-        path = "Z:\\__definitely_not_exist_12345__"
-        self.client._ucrawl_context.approve_directory(path)
-        r = self.client.get(f"/api/dir/list?path={path}")
+        """已授权根下的缺失子目录应当返回 error 字段。"""
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            self.client._ucrawl_context.approve_directory(tmp)
+            path = os.path.join(tmp, "__definitely_not_exist_12345__")
+            r = self.client.get(f"/api/dir/list?path={path}")
         self.assertEqual(r.status_code, 200)
         data = r.json()
         self.assertIn("error", data)
@@ -766,11 +770,11 @@ class DirListChangeTests(unittest.TestCase):
         self.assertTrue(_is_error_response(r.json()))
 
     def test_dir_change_nonexistent(self):
-        """不存在的目录可能由 os.path.exists 解释为存在（Windows 路径兼容），
-        所以只验证返回是合法 dict 不崩溃。"""
-        path = "Z:\\__definitely_not_exist_12345__\\foo"
-        self.client._ucrawl_context.approve_directory(path)
-        r = self.client.post("/api/dir/change", json={"directory": path})
+        """已授权根下的缺失子目录应返回合法错误，而不是崩溃。"""
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            self.client._ucrawl_context.approve_directory(tmp)
+            path = os.path.join(tmp, "__definitely_not_exist_12345__", "foo")
+            r = self.client.post("/api/dir/change", json={"directory": path})
         self.assertEqual(r.status_code, 200)
         self.assertIn("status", r.json())
 
@@ -780,7 +784,7 @@ class DirListChangeTests(unittest.TestCase):
         self.assertTrue(_is_error_response(r.json()))
 
     def test_dir_change_valid(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             self.client._ucrawl_context.approve_directory(tmp)
             r = self.client.post("/api/dir/change", json={"directory": tmp})
             self.assertEqual(r.status_code, 200)
@@ -872,20 +876,29 @@ class ServerCORSHeadersTests(unittest.TestCase):
         cls.client = _create_test_client()
 
     def test_cors_header_present(self):
-        r = self.client.get("/api/ping", headers={"Origin": "http://localhost"})
-        self.assertEqual(r.status_code, 200)
-        # CORS 中间件应返回 access-control-allow-origin
-        self.assertIn("access-control-allow-origin", {k.lower() for k in r.headers.keys()})
+        foreign_loopback = self.client.get(
+            "/api/ping",
+            headers={"Origin": "http://127.0.0.1:59999"},
+        )
+        self.assertEqual(foreign_loopback.status_code, 403)
+        foreign_headers = {key.lower() for key in foreign_loopback.headers.keys()}
+        self.assertNotIn("access-control-allow-origin", foreign_headers)
+        self.assertNotIn("access-control-allow-credentials", foreign_headers)
+
+        own_origin = self.client.get("/api/ping", headers={"Origin": "http://testserver"})
+        self.assertEqual(own_origin.status_code, 200)
+        self.assertEqual(own_origin.headers.get("access-control-allow-origin"), "http://testserver")
+        self.assertEqual(own_origin.headers.get("access-control-allow-credentials"), "true")
 
     def test_cors_header_absent_for_untrusted_remote_origin(self):
         r = self.client.get("/api/ping", headers={"Origin": "https://untrusted.example"})
-        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.status_code, 403)
         self.assertNotIn("access-control-allow-origin", {k.lower() for k in r.headers.keys()})
 
     def test_cors_header_present_for_explicitly_configured_origin(self):
         with patch.dict(os.environ, {"UCRAWL_ALLOWED_ORIGINS": "https://console.example"}):
             client = _create_test_client()
-        r = client.get("/api/ping", headers={"Origin": "https://console.example"})
+            r = client.get("/api/ping", headers={"Origin": "https://console.example"})
         self.assertEqual(r.status_code, 200)
         self.assertEqual(r.headers.get("access-control-allow-origin"), "https://console.example")
 

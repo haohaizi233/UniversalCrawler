@@ -82,11 +82,42 @@ def _auto_convert(v: str):
     except ValueError:
         return v
 
+def _resolve_web_shutdown_callback(app: Any | None):
+    candidate = app
+    if candidate is None:
+        from app.web.server import active_web_app
+
+        candidate = active_web_app
+    state = getattr(candidate, "state", None)
+    callback = getattr(state, "web_shutdown_callback", None)
+    return callback if callable(callback) else None
+
+
+def _raise_system_exit(exit_code: int) -> None:
+    raise SystemExit(exit_code)
+
+
+def _exit_without_skipping_lifespan(exit_code: int) -> None:
+    """非 0 结束，但走解释器退出而不是 os._exit，避免跳过 lifespan。"""
+
+    import asyncio
+
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = None
+    if loop is not None and loop.is_running():
+        loop.call_soon_threadsafe(_raise_system_exit, exit_code)
+        return
+    raise SystemExit(exit_code)
+
+
 def inject_script_async(
     script_path: str,
     controller: Any,
     strict: bool = False,
     delay: float = 0.0,
+    app: Any | None = None,
     **kwargs,
 ) -> threading.Thread:
     """异步执行注入脚本（不阻塞 Web 服务）。
@@ -112,8 +143,14 @@ def inject_script_async(
             rc = 1
         if rc != 0 and strict:
             print(f"❌ 注入脚本退出码 {rc}，按 --script-strict 退出")
-            import os
-            os._exit(rc)
+            callback = _resolve_web_shutdown_callback(app)
+            if callback is not None:
+                callback(rc)
+            else:
+                try:
+                    _exit_without_skipping_lifespan(rc)
+                except SystemExit:
+                    return
         else:
             print(f"✅ 注入脚本完成 (rc={rc})")
 

@@ -292,7 +292,7 @@ class WebController(WebMediaScanRuntimeMixin, ControllerSessionMixin, MediaLibra
     DOWNLOAD_ERROR_STATUS_CODE = "WEB_DL_ERROR"
     DOWNLOAD_FINISHED_MESSAGE = "Web 端下载任务完成"
     DOWNLOAD_ERROR_MESSAGE = "Web 端下载任务失败"
-    DOWNLOAD_ERROR_PROGRESS = 0
+    DOWNLOAD_ERROR_PROGRESS = None
     PROGRESS_EVENT_MIN_INTERVAL_SECONDS = 0.25
 
     def __init__(self, loop: asyncio.AbstractEventLoop, send_func: Callable):
@@ -854,15 +854,26 @@ class WebController(WebMediaScanRuntimeMixin, ControllerSessionMixin, MediaLibra
                 "spider_running": self.current_spider.isRunning() if self.current_spider else None,
             },
         )
-        self.bridge.emit("log", {"message": "✅ 爬虫任务结束"})
+        run_succeeded = getattr(spider, "run_succeeded", None) if spider is not None else None
+        if run_succeeded is False:
+            self.bridge.emit("log", {"message": "❌ 爬虫任务未成功结束"})
+            finish_message = "Web 端爬虫任务未成功结束"
+            finish_status = "WEB_CRAWL_FINISH_FAILED"
+            finish_level = "ERROR"
+        else:
+            self.bridge.emit("log", {"message": "✅ 爬虫任务结束"})
+            finish_message = "Web 端爬虫任务结束"
+            finish_status = "WEB_CRAWL_FINISH"
+            finish_level = "INFO"
         if spider is not None:
             self._disconnect_spider_signals(spider)
         self.bridge.emit("crawl_state", {"is_running": False})
         debug_logger.log(
             component="WebController",
             action="crawl_finished",
-            message="Web 端爬虫任务结束",
-            status_code="WEB_CRAWL_FINISH",
+            level=finish_level,
+            message=finish_message,
+            status_code=finish_status,
         )
         self.current_spider = None
         # 防御性清理：确保 _pending_selection_strategy 不残留

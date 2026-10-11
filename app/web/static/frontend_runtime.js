@@ -31,6 +31,8 @@
   let frontendVersion = 0;
   let frontendSectionSignatures = {};
   let pendingRenderSections = new Set();
+  let pendingRenderProgressFlags = [];
+  let nextScheduledRenderProgressOnly = false;
   let pendingActionSequences = new Set();
   let pendingActionRequests = new Map();
   let renderFrame = null;
@@ -39,7 +41,45 @@
   let frontendDeltaTimer = null;
   let startPromise = null;
 
+  function readCookie(name) {
+    const prefix = `${name}=`;
+    const parts = String(document.cookie || "").split("; ");
+    for (const part of parts) {
+      if (part.startsWith(prefix)) return decodeURIComponent(part.slice(prefix.length));
+    }
+    return "";
+  }
+
+  function isSameOriginRequest(input) {
+    try {
+      const raw = typeof input === "string" ? input : (input && input.url) || "";
+      const url = new URL(raw, window.location.href);
+      return url.origin === window.location.origin;
+    } catch (_error) {
+      return true;
+    }
+  }
+
+  function installSessionTokenFetch() {
+    if (typeof window.fetch !== "function" || window.fetch.__ucrawlSessionToken) return;
+    const nativeFetch = window.fetch.bind(window);
+    const wrapped = function (input, init) {
+      const nextInit = init ? { ...init } : {};
+      if (!isSameOriginRequest(input)) return nativeFetch(input, nextInit);
+      const headers = new Headers(nextInit.headers || (input instanceof Request ? input.headers : undefined));
+      if (!headers.has("X-Ucrawl-Session-Token")) {
+        const token = readCookie("ucrawl_csrf_token");
+        if (token) headers.set("X-Ucrawl-Session-Token", token);
+      }
+      nextInit.headers = headers;
+      return nativeFetch(input, nextInit);
+    };
+    wrapped.__ucrawlSessionToken = true;
+    window.fetch = wrapped;
+  }
+
   function configure(options = {}) {
+    installSessionTokenFetch();
     if (active) return window.UcpFrontendRuntime;
     dependencies = Object.freeze({ ...options });
     configured = true;
@@ -120,6 +160,8 @@
     if (!active) return;
     const list = Array.isArray(sections) ? sections : [sections || "all"];
     for (const section of list) pendingRenderSections.add(section || "all");
+    pendingRenderProgressFlags.push(nextScheduledRenderProgressOnly === true);
+    nextScheduledRenderProgressOnly = false;
     if (renderFrame) return;
     const generation = lifecycleGeneration;
     const frame = { kind: "pending", id: null, generation };
@@ -137,7 +179,18 @@
   function flushRenderSections(generation = lifecycleGeneration) {
     if (!isCurrentGeneration(generation)) return;
     const sections = new Set(pendingRenderSections);
+    const progressFlags = pendingRenderProgressFlags.splice(0);
     pendingRenderSections.clear();
+    if (
+      progressFlags.length > 0 &&
+      progressFlags.every(flag => flag === true) &&
+      sections.has("active_downloads") &&
+      !sections.has("download_options") &&
+      !sections.has("settings_snapshot") &&
+      !sections.has("all")
+    ) {
+      sections.progressOnly = true;
+    }
     if (!sections.size) return;
     if (sections.has("all")) {
       if (typeof dependencies.renderAll === "function") dependencies.renderAll();
@@ -185,7 +238,8 @@
     if (!isCurrentGeneration(generation) || !delta || typeof delta !== "object") return false;
     const localVersion = Number(frontendVersion || 0);
     const deltaVersion = Number(delta.version || 0);
-    if (!delta.full && deltaVersion && deltaVersion <= localVersion) return false;
+    const sections = delta.sections && typeof delta.sections === "object" ? delta.sections : {};
+    if (!delta.full && deltaVersion && deltaVersion <= localVersion && Object.keys(sections).length === 0) return false;
     const deltaBaseVersion = Number(delta.base_version || 0);
     if (!delta.full && deltaBaseVersion > localVersion) {
       appendUiLog("增量状态基线不连续，正在重新同步...");
@@ -193,12 +247,14 @@
       return false;
     }
 
+    const changed = [];
+    if (Array.isArray(delta.deleted_ids) && delta.deleted_ids.length) {
+      changed.push(...removeDeletedFromState(delta.deleted_ids, { source: "delta", delta }));
+    }
     const state = currentState() || {};
-    const sections = delta.sections && typeof delta.sections === "object" ? delta.sections : {};
     const requestedChanged = Array.isArray(delta.changed_sections)
       ? delta.changed_sections.slice()
       : Object.keys(sections);
-    const changed = [];
     const nextState = { ...state };
     for (const [key, value] of Object.entries(sections)) {
       if (frontendSectionSignatures[key] === undefined) {
@@ -210,7 +266,7 @@
       frontendSectionSignatures[key] = nextSignature;
     }
     if (delta.full) changed.push(...requestedChanged);
-    frontendVersion = Number(delta.version || frontendVersion || 0);
+    frontendVersion = deltaVersion > localVersion ? deltaVersion : localVersion;
     if (frontendVersion) nextState.version = frontendVersion;
     replaceState(nextState);
     markStateOperation();
@@ -218,12 +274,11 @@
     for (const [key, value] of Object.entries(sections)) {
       changed.push(...patchSection(key, value, { source: "delta", delta }));
     }
-    if (Array.isArray(delta.deleted_ids) && delta.deleted_ids.length) {
-      changed.push(...removeDeletedFromState(delta.deleted_ids, { source: "delta", delta }));
-    }
     const uniqueChanged = Array.from(new Set(changed.filter(Boolean)));
     rememberFrontendSectionSignatures(Object.keys(sections));
+    nextScheduledRenderProgressOnly = delta.active_downloads_update_kind === "progress";
     if (uniqueChanged.length) scheduleRenderSections(uniqueChanged);
+    else nextScheduledRenderProgressOnly = false;
     return uniqueChanged.length > 0;
   }
 
@@ -529,10 +584,17 @@
     frontendSectionSignatures = {};
     stateOperationEpoch = 0;
     pendingRenderSections.clear();
+    pendingRenderProgressFlags = [];
+    nextScheduledRenderProgressOnly = false;
     bindLifecycleListeners();
-    // 首载有意并发启动 WebSocket 与 REST 全量快照：前者尽快接收实时状态，后者提供完整快照。
-    connectWS();
-    startPromise = fetchFrontendState();
+    const generation = lifecycleGeneration;
+    startPromise = fetch("/api/session/bootstrap", { cache: "no-store", credentials: "same-origin" })
+      .catch(() => null)
+      .then(() => {
+        if (!isCurrentGeneration(generation)) return false;
+        connectWS();
+        return fetchFrontendState();
+      });
     return startPromise;
   }
 

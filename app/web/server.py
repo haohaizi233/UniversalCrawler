@@ -7,14 +7,16 @@ import mimetypes
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
+from starlette.datastructures import Headers, MutableHeaders
 
 from app.utils.runtime_paths import resolve_resource_file
 from app.web.rest_router import build_rest_router
 from app.web.session_runtime import (
     build_public_web_session_profile,
     configured_allowed_origins,
+    is_allowed_origin,
 )
 from app.web.ws_router import build_ws_router
 from shared.runtime_adapters import run_cli_search
@@ -23,6 +25,7 @@ from shared.version import __version__
 
 # 仅为旧导入提供默认会话，实际请求必须从 session_context 取控制器。
 controller = None
+active_web_app = None
 
 NO_CACHE_HEADERS = {
     "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
@@ -46,6 +49,56 @@ def _configured_index_html(index_path, config_manager) -> str:
     html = index_path.read_text(encoding="utf-8")
     html = html.replace('data-theme="light"', f'data-theme="{theme}"', 1)
     return html.replace("__UCRAWL_VERSION__", load_runtime_release_identity().tag)
+
+
+class OwnOriginCORSMiddleware:
+    """只反射本服务自己的源，不把任意回环端口当成可信来源。"""
+
+    def __init__(self, app) -> None:
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        headers = Headers(scope=scope)
+        origin = headers.get("origin")
+        host = headers.get("host") or ""
+        scheme = scope.get("scheme") or "http"
+        own_origin = f"{scheme}://{host}" if host else ""
+        allowed = bool(
+            origin
+            and own_origin
+            and is_allowed_origin(origin, expected_origin=own_origin)
+        )
+        if (
+            allowed
+            and scope.get("method") == "OPTIONS"
+            and headers.get("access-control-request-method")
+        ):
+            response = Response(
+                status_code=204,
+                headers={
+                    "Access-Control-Allow-Origin": origin or "",
+                    "Access-Control-Allow-Credentials": "true",
+                    "Access-Control-Allow-Methods": headers.get("access-control-request-method") or "*",
+                    "Access-Control-Allow-Headers": headers.get("access-control-request-headers") or "*",
+                    "Vary": "Origin",
+                },
+            )
+            await response(scope, receive, send)
+            return
+
+        async def send_with_origin(message):
+            if allowed and origin and message["type"] == "http.response.start":
+                raw = MutableHeaders(scope=message)
+                if "access-control-allow-origin" not in raw:
+                    raw["Access-Control-Allow-Origin"] = origin
+                    raw["Access-Control-Allow-Credentials"] = "true"
+                    raw.add_vary_header("Origin")
+            await send(message)
+
+        await self.app(scope, receive, send_with_origin)
 
 
 def _apply_no_cache_headers(response):
@@ -79,11 +132,11 @@ def create_app(lifespan=None, *, access_token: str | None = None) -> FastAPI:
     app.add_middleware(
         CORSMiddleware,
         allow_origins=sorted(configured_allowed_origins()),
-        allow_origin_regex=r"^https?://(?:localhost|127\.0\.0\.1|\[::1\])(?::\d+)?$",
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
     )
+    app.add_middleware(OwnOriginCORSMiddleware)
 
 
 
@@ -151,6 +204,8 @@ def create_app(lifespan=None, *, access_token: str | None = None) -> FastAPI:
         access_cookie_name=ACCESS_COOKIE_NAME,
     )
     composition_holder["composition"] = composition
+    global active_web_app
+    active_web_app = app
     publish_app_state(
         app,
         composition=composition,

@@ -3,7 +3,7 @@ import tempfile
 import textwrap
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 class ScriptApiParsingTests(unittest.TestCase):
     def test_parse_kv_args_auto_converts_types(self):
@@ -109,6 +109,29 @@ class ScriptApiAsyncTests(unittest.TestCase):
         exit_mock.assert_not_called()
 
     def test_inject_script_async_exits_when_strict_and_failed(self):
+        from types import SimpleNamespace
+
+        from app.web.script_api import inject_script_async
+
+        callback = Mock()
+        app = SimpleNamespace(state=SimpleNamespace(web_shutdown_callback=callback))
+        with (
+            patch("app.web.script_api.run_injected_script", return_value=3),
+            patch("os._exit") as exit_mock,
+        ):
+            thread = inject_script_async(
+                "demo.py",
+                controller=object(),
+                strict=True,
+                app=app,
+            )
+            thread.join(timeout=2)
+
+        self.assertFalse(thread.is_alive())
+        exit_mock.assert_not_called()
+        callback.assert_called_once_with(3)
+
+    def test_inject_script_async_without_callback_does_not_skip_with_os_exit(self):
         from app.web.script_api import inject_script_async
 
         with (
@@ -119,7 +142,7 @@ class ScriptApiAsyncTests(unittest.TestCase):
             thread.join(timeout=2)
 
         self.assertFalse(thread.is_alive())
-        exit_mock.assert_called_once_with(3)
+        exit_mock.assert_not_called()
 
 if __name__ == "__main__":
     unittest.main()

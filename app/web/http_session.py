@@ -18,6 +18,33 @@ from app.web.session_runtime import (
 )
 
 
+_PUBLIC_ASSET_PATHS = {"/", "/favicon.ico", "/webui-icon.ico"}
+
+
+def _header(headers, name: str) -> str | None:
+    if headers is None:
+        return None
+    getter = getattr(headers, "get", None)
+    if callable(getter):
+        direct = getter(name)
+        if direct is not None:
+            return str(direct)
+        lowered = getter(name.lower())
+        if lowered is not None:
+            return str(lowered)
+    items = getattr(headers, "items", None)
+    if callable(items):
+        for key, value in items():
+            if str(key).lower() == name.lower():
+                return str(value)
+    return None
+
+
+def _with_referrer_policy(response):
+    response.headers["Referrer-Policy"] = "no-referrer"
+    return response
+
+
 def _annotate_release_failure(primary_error: BaseException) -> None:
     try:
         add_note = getattr(primary_error, "add_note", None)
@@ -54,25 +81,44 @@ class HttpSessionCoordinator:
     async def handle(self, request: Request, call_next):
         # 健康检查不进入应用访问鉴权边界。
         if request.url.path == "/healthz":
-            return await call_next(request)
+            rejected = self._reject_disallowed_origin(request)
+            if rejected is not None:
+                return rejected
+            return _with_referrer_policy(await call_next(request))
 
         access_response = self._enforce_application_access(request)
         if access_response is not None:
-            return access_response
+            return _with_referrer_policy(access_response)
+        rejected = self._reject_disallowed_origin(request)
+        if rejected is not None:
+            return rejected
         # 公共存活探针不应分配带控制器的会话；它仍放在访问检查之后，
         # 使无密码模式下的 DNS 重绑定防护同样覆盖 /api/ping。
         if request.url.path == "/api/ping":
-            return await call_next(request)
+            return _with_referrer_policy(await call_next(request))
 
-        session_id = request.cookies.get(self._session_cookie_name) or uuid4().hex
+        if self._is_public_asset(request.url.path):
+            existing = self._matching_existing_context(request)
+            if existing is None:
+                return _with_referrer_policy(await call_next(request))
+            session_id = existing.session_id
+        else:
+            session_id = request.cookies.get(self._session_cookie_name)
+            if not session_id:
+                client = getattr(request, "client", None)
+                client_host = getattr(client, "host", None)
+                if is_loopback_request_host(request.url.hostname, client_host):
+                    session_id = self._default_session_id
+                else:
+                    session_id = uuid4().hex
         try:
             context = self._session_registry.acquire_http_context(session_id)
         except WebSessionCapacityError:
-            return JSONResponse(
+            return _with_referrer_policy(JSONResponse(
                 {"status": "error", "error": "Web session capacity exhausted; retry later"},
                 status_code=503,
                 headers={"Cache-Control": "no-store", "Retry-After": "1"},
-            )
+            ))
         request.state.session_id = session_id
         request.state.session_context = context
         primary_error: BaseException | None = None
@@ -82,29 +128,31 @@ class HttpSessionCoordinator:
             client_host = getattr(client, "host", None)
             token_valid = self.has_valid_session_token(request, context)
             is_public_ping = request.url.path == "/api/ping"
+            is_session_bootstrap = request.url.path == "/api/session/bootstrap"
             if (
                 is_api_request
                 and not is_public_ping
+                and not is_session_bootstrap
                 and not is_local_host(client_host)
                 and not token_valid
             ):
-                return JSONResponse(
+                return _with_referrer_policy(JSONResponse(
                     {"status": "error", "error": "缺少或无效的会话令牌"},
                     status_code=403,
-                )
+                ))
 
-            if is_api_request and request.method in {"POST", "PUT", "DELETE"}:
-                origin = request.headers.get("origin")
+            if is_api_request and request.method in {"POST", "PUT", "DELETE", "GET"}:
+                origin = _header(request.headers, "origin")
                 if origin and not self.is_request_origin_allowed(request, origin):
-                    return JSONResponse(
+                    return _with_referrer_policy(JSONResponse(
                         {"status": "error", "error": "不允许的请求来源"},
                         status_code=403,
-                    )
-                if origin and not token_valid:
-                    return JSONResponse(
+                    ))
+                if origin and request.method in {"POST", "PUT", "DELETE"} and not token_valid:
+                    return _with_referrer_policy(JSONResponse(
                         {"status": "error", "error": "缺少或无效的会话令牌"},
                         status_code=403,
-                    )
+                    ))
 
             response = await call_next(request)
             secure_cookie = request.url.scheme == "https"
@@ -135,7 +183,7 @@ class HttpSessionCoordinator:
                     samesite="strict",
                     secure=secure_cookie,
                 )
-            return response
+            return _with_referrer_policy(response)
         except BaseException as error:
             primary_error = error
             raise
@@ -170,6 +218,7 @@ class HttpSessionCoordinator:
             if secrets.compare_digest(str(query_token), self._access_token):
                 response = RedirectResponse(url="/", status_code=303)
                 response.headers["Cache-Control"] = "no-store"
+                response.headers["Referrer-Policy"] = "no-referrer"
                 response.set_cookie(
                     self._access_cookie_name,
                     self._access_token,
@@ -200,8 +249,35 @@ class HttpSessionCoordinator:
 
     def has_valid_session_token(self, request: Request, context: WebSessionContext | None = None) -> bool:
         session_context = context or self.get_request_context(request)
-        request_token = request.headers.get(self._session_token_header) or request.cookies.get(self._csrf_cookie_name)
-        return secrets.compare_digest(request_token or "", session_context.csrf_token)
+        request_token = _header(request.headers, self._session_token_header)
+        if not request_token:
+            return False
+        return secrets.compare_digest(request_token, session_context.csrf_token)
+
+    @staticmethod
+    def _is_public_asset(path: str) -> bool:
+        if path in _PUBLIC_ASSET_PATHS:
+            return True
+        return path.startswith("/static/") or path.startswith("/ui-icon/")
+
+    def _matching_existing_context(self, request: Request) -> WebSessionContext | None:
+        session_id = request.cookies.get(self._session_cookie_name)
+        if not session_id:
+            return None
+        context = self._session_registry.peek(session_id)
+        if context is None or not self.has_valid_session_token(request, context):
+            return None
+        return context
+
+    def _reject_disallowed_origin(self, request: Request):
+        origin = _header(request.headers, "origin")
+        if not origin or self.is_request_origin_allowed(request, origin):
+            return None
+        return _with_referrer_policy(JSONResponse(
+            {"status": "error", "error": "不允许的请求来源"},
+            status_code=403,
+            headers={"Cache-Control": "no-store"},
+        ))
 
     @staticmethod
     def _request_origin(request: Request) -> str:

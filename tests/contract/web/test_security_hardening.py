@@ -25,6 +25,9 @@ class WebSecurityHardeningTests(unittest.TestCase):
         self.client.get("/api/session/bootstrap")
         cookie_name = self.client.app.state.web_session_cookie_name
         session_id = self.client.cookies.get(cookie_name)
+        csrf_token = self.client.cookies.get(self.client.app.state.web_csrf_cookie_name)
+        if csrf_token:
+            self.client.headers["X-Ucrawl-Session-Token"] = csrf_token
         self.context = self.client.app.state.web_session_registry.get_or_create(session_id)
 
     def test_search_rejects_authority_before_executor(self):
@@ -175,7 +178,7 @@ class WebSecurityHardeningTests(unittest.TestCase):
         self.assertEqual(route_endpoints["/ws"], "app.web.ws_router")
 
     def test_directory_listing_rejects_unapproved_root(self):
-        with tempfile.TemporaryDirectory() as outside_root:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as outside_root:
             response = self.client.get("/api/dir/list", params={"path": outside_root})
 
         self.assertEqual(response.status_code, 403)
@@ -184,7 +187,7 @@ class WebSecurityHardeningTests(unittest.TestCase):
         original_config_dir = cfg.get("common", "save_directory", "")
         original_runtime_dir = self.context.controller.current_save_dir
         try:
-            with tempfile.TemporaryDirectory() as outside_root:
+            with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as outside_root:
                 response = self.client.put(
                     "/api/config",
                     json={"common": {"save_directory": outside_root}},
@@ -202,7 +205,7 @@ class WebSecurityHardeningTests(unittest.TestCase):
         original_config_dir = cfg.get("common", "save_directory", "")
         original_runtime_dir = self.context.controller.current_save_dir
         try:
-            with tempfile.TemporaryDirectory() as outside_root:
+            with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as outside_root:
                 response = self.client.post(
                     "/api/frontend/action",
                     json={
@@ -703,7 +706,7 @@ class WebSecurityHardeningTests(unittest.TestCase):
         shutdown.assert_not_called()
 
     def test_delete_endpoint_surfaces_unapproved_media_path(self):
-        with tempfile.TemporaryDirectory() as outside_root:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as outside_root:
             item = VideoItem(url="", title="outside", source="local")
             item.local_path = os.fspath(Path(outside_root, "outside.mp4"))
             self.context.controller._store_video_item(item)
@@ -718,12 +721,15 @@ class WebSecurityHardeningTests(unittest.TestCase):
         self.context.controller.file_service.delete_media.assert_not_called()
 
     def test_media_endpoint_requires_session_token_even_for_loopback(self):
-        csrf_cookie = self.client.app.state.web_csrf_cookie_name
-        self.client.cookies.delete(csrf_cookie)
+        self.client.headers.pop("X-Ucrawl-Session-Token", None)
 
         response = self.client.get("/api/media/nonexistent_id")
 
         self.assertEqual(response.status_code, 403)
+        self.assertIn(
+            self.client.app.state.web_csrf_cookie_name,
+            self.client.cookies,
+        )
 
     def test_delete_and_rename_reject_invalid_video_ids(self):
         delete_response = self.client.delete("/api/video/bad.id")
@@ -736,7 +742,7 @@ class WebSecurityHardeningTests(unittest.TestCase):
         self.assertEqual(rename_response.status_code, 400)
 
     def test_unsatisfiable_media_range_returns_416(self):
-        with tempfile.TemporaryDirectory() as temp_dir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
             media_path = Path(temp_dir, "sample.mp4")
             media_path.write_bytes(b"0123456789")
             self.context.approve_directory(temp_dir)
@@ -754,7 +760,7 @@ class WebSecurityHardeningTests(unittest.TestCase):
         self.assertEqual(response.headers.get("Content-Range"), "bytes */10")
 
     def test_media_suffix_range_returns_file_tail(self):
-        with tempfile.TemporaryDirectory() as temp_dir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
             media_path = Path(temp_dir, "sample.mp4")
             media_path.write_bytes(b"0123456789")
             self.context.approve_directory(temp_dir)
@@ -839,9 +845,15 @@ class WebSecurityHardeningTests(unittest.TestCase):
         bootstrap = remote_client.get(f"/?access_token={access_token}")
         self.assertEqual(bootstrap.status_code, 303)
         self.assertEqual(bootstrap.headers.get("location"), "/")
+        self.assertEqual(bootstrap.headers.get("referrer-policy"), "no-referrer")
         self.assertNotIn(access_token, bootstrap.headers.get("location", ""))
 
         self.assertEqual(remote_client.get("/").status_code, 200)
+        self.assertEqual(len(registry._contexts), contexts_before_ping)
+        session = remote_client.get("/api/session/bootstrap")
+        self.assertEqual(session.status_code, 200)
+        self.assertEqual(remote_client.get("/api/frontend/state").status_code, 403)
+        remote_client.headers["X-Ucrawl-Session-Token"] = session.json()["csrf_token"]
         self.assertEqual(remote_client.get("/api/frontend/state").status_code, 200)
 
     def test_passwordless_local_mode_rejects_dns_rebinding_host(self):

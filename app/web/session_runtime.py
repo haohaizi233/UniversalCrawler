@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from concurrent.futures import Future, ThreadPoolExecutor
 from collections import deque
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 import os
 import ipaddress
@@ -23,6 +23,7 @@ from shared.execution_profile import ExecutionProfile, public_web_profile
 from shared.filesystem_directory_capability import (
     FilesystemDirectoryCapability,
     ensure_regular_directory,
+    filesystem_child_directory_capability,
     open_filesystem_directory_capability,
 )
 
@@ -388,6 +389,125 @@ class WebSessionContext:
             if selected_error is not None and selected_error is not primary_error:
                 raise selected_error
 
+    @contextmanager
+    def lease_bound_root_capabilities(
+        self,
+    ) -> Iterator[tuple[tuple[str, FilesystemDirectoryCapability], ...]]:
+        """持有同一份根目录租约，并交出仍绑定的目录能力。"""
+
+        with self.lease_approved_root_grants_snapshot():
+            with self._approved_roots_lock:
+                bound = tuple(
+                    (authority.grant[0], authority.capability)
+                    for authority in self._approved_root_authorities.values()
+                )
+            for _root, capability in bound:
+                capability.assert_bound()
+            yield bound
+
+    @contextmanager
+    def open_operation_directory(self, directory: str | None) -> Iterator[str | None]:
+        """在整个操作期间持有根租约，并用该能力打开子目录。"""
+
+        with self.lease_bound_root_capabilities() as roots:
+            if not directory:
+                yield None
+                return
+            with self._bind_approved_directory(roots, directory) as opened:
+                yield opened
+
+    def snapshot_authorized_subdirectories(
+        self,
+        path: str,
+    ) -> tuple[bool, list[dict[str, str]], str, list[dict[str, str]]]:
+        """用当前租约上的目录能力枚举子目录，而不是 realpath 后 listdir。"""
+
+        candidate = os.path.abspath(os.path.normpath(os.path.expanduser(path)))
+        with self.lease_bound_root_capabilities() as roots:
+            _root_key, capability, parts = self._resolve_leased_directory(roots, candidate)
+            with ExitStack() as stack:
+                current = capability
+                try:
+                    for component in parts:
+                        current = stack.enter_context(
+                            filesystem_child_directory_capability(current, component)
+                        )
+                    current.assert_bound()
+                    snapshot = current.snapshot_children()
+                    listing_root = os.fspath(current.root)
+                except FileNotFoundError:
+                    return False, [], "", self._leased_drive_entries(roots)
+                except OSError:
+                    return False, [], "", self._leased_drive_entries(roots)
+            subdirs = [
+                {
+                    "name": child.name,
+                    "path": os.path.join(listing_root, child.name),
+                }
+                for child in snapshot.children
+                if child.is_directory and not child.name.startswith(".")
+            ]
+            subdirs.sort(key=lambda item: item["name"].lower())
+            parent_candidate = os.path.dirname(candidate)
+            parent_key = os.path.normcase(parent_candidate) if parent_candidate else ""
+            parent = (
+                parent_candidate
+                if parent_key
+                and any(
+                    is_within_root(parent_key, os.path.normcase(root))
+                    for root, _capability in roots
+                )
+                else ""
+            )
+            return True, subdirs, parent, self._leased_drive_entries(roots)
+
+    @contextmanager
+    def _bind_approved_directory(
+        self,
+        roots: tuple[tuple[str, FilesystemDirectoryCapability], ...],
+        directory: str,
+    ) -> Iterator[str]:
+        candidate = os.path.abspath(os.path.normpath(os.path.expanduser(directory)))
+        _root_key, capability, parts = self._resolve_leased_directory(roots, candidate)
+        with ExitStack() as stack:
+            current = capability
+            for component in parts:
+                current = stack.enter_context(
+                    filesystem_child_directory_capability(current, component)
+                )
+            current.assert_bound()
+            yield normalize_directory(candidate)
+
+    @staticmethod
+    def _resolve_leased_directory(
+        roots: tuple[tuple[str, FilesystemDirectoryCapability], ...],
+        candidate: str,
+    ) -> tuple[str, FilesystemDirectoryCapability, tuple[str, ...]]:
+        candidate_key = os.path.normcase(candidate)
+        matches = [
+            (os.path.normcase(root), capability)
+            for root, capability in roots
+            if is_within_root(candidate_key, os.path.normcase(root))
+        ]
+        if not matches:
+            raise PermissionError("目录未被当前会话授权访问")
+        root_key, capability = max(matches, key=lambda item: len(item[0]))
+        relative = os.path.relpath(candidate_key, root_key)
+        if relative in {"", os.curdir}:
+            parts: tuple[str, ...] = ()
+        else:
+            parts = tuple(Path(relative).parts)
+        return root_key, capability, parts
+
+    @staticmethod
+    def _leased_drive_entries(
+        roots: tuple[tuple[str, FilesystemDirectoryCapability], ...],
+    ) -> list[dict[str, str]]:
+        return [
+            {"name": root, "path": root}
+            for root in sorted(os.path.normcase(root) for root, _capability in roots)
+        ]
+
     def _bind_tool_execution_profile_provider(self) -> None:
         frontend_state_service = getattr(
             self.controller,
@@ -513,6 +633,12 @@ class WebSessionRegistry:
     def acquire_http_context(self, session_id: str) -> WebSessionContext:
         """Find or create and reserve an HTTP context in one critical section."""
         return self._get_or_create_context(session_id, acquire_http=True)
+
+    def peek(self, session_id: str) -> WebSessionContext | None:
+        """返回已经存在的会话，不创建控制器。"""
+
+        with self._lock:
+            return self._contexts.get(session_id)
 
     def _get_or_create_context(
         self,

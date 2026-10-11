@@ -52,6 +52,7 @@ class RemoteReleaseInfo:
     release_tags: tuple[str, ...] = ()
     occupied_tags: tuple[str, ...] = ()
     resumable_tags: tuple[str, ...] = ()
+    blocked_tags: tuple[str, ...] = ()
     error: str = ""
 
     @classmethod
@@ -63,13 +64,16 @@ class RemoteReleaseInfo:
         release_tags: tuple[str, ...] = (),
         occupied_tags: tuple[str, ...] = (),
         resumable_tags: tuple[str, ...] = (),
+        blocked_tags: tuple[str, ...] = (),
     ) -> "RemoteReleaseInfo":
         """Build a normalized snapshot of releases and immutable Git tags.
 
         ``release_tags`` are backed by a public GitHub Release. ``occupied_tags``
         additionally includes bare local/remote refs left by an interrupted
-        publication. Only bare tags verified against the current HEAD belong in
-        ``resumable_tags``.
+        publication. A revision tag is resumable only when it points at the
+        current commit and its Release is still a draft whose assets are missing
+        or whose summary matches. Public releases and summary conflicts belong
+        in ``blocked_tags`` so the next attempt allocates another revision.
         """
 
         published: set[ReleaseIdentity] = set()
@@ -84,11 +88,15 @@ class RemoteReleaseInfo:
 
         occupied = set(published)
         occupied.update(parse_release_tag(tag) for tag in occupied_tags)
+        blocked = {parse_release_tag(tag) for tag in blocked_tags}
+        occupied.update(blocked)
         resumable = {parse_release_tag(tag) for tag in resumable_tags}
-        # A public Release is immutable and complete from the planner's point of
-        # view. Automatic resume is reserved for a definitely incomplete bare tag.
+        # A public Release is immutable. A draft whose summary conflicts, or
+        # whose assets cannot be shown to match, is also closed: resuming it
+        # would pin every retry to the same tag.
         resumable.intersection_update(occupied)
         resumable.difference_update(published)
+        resumable.difference_update(blocked)
         return cls(
             version=latest.version,
             release_revision=latest.revision,
@@ -98,6 +106,9 @@ class RemoteReleaseInfo:
             ),
             resumable_tags=tuple(
                 identity.tag for identity in sorted(resumable, reverse=True)
+            ),
+            blocked_tags=tuple(
+                identity.tag for identity in sorted(blocked, reverse=True)
             ),
         )
 
@@ -158,7 +169,7 @@ class RemoteReleaseInfo:
         return 0 if highest < 0 else highest + 1
 
     def target_revision_for(self, version: str) -> int:
-        """Resume the newest safe bare tag, otherwise allocate the next revision."""
+        """Reuse only the newest draft that is still safe; otherwise take the next revision."""
 
         normalized = normalize_version(version)
         highest = self.highest_revision_for(normalized)

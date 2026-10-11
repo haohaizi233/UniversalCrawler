@@ -96,12 +96,12 @@
     PROJECTION_KEYS.forEach(key => { if (source[key] && typeof source[key] === "object" && !Array.isArray(source[key])) apply(source[key]); });
     BATCH_KEYS.forEach(key => {
       const batch = source[key]; const sourceBatch = record(batch); const touched = (Array.isArray(batch) ? batch : batchRows(sourceBatch)).map(apply).filter(Boolean);
-      const target = String(first(sourceBatch.selected_tool_id, touched[0], source.toolbox_selected_tool_id, Object.keys(cache).length === 1 ? Object.keys(cache)[0] : ""));
+      const target = String(first(sourceBatch.selected_tool_id, touched[0], source.toolbox_selected_tool_id, ""));
       if (target && Array.isArray(sourceBatch.history)) cache[target] = merge(cache[target], { tool_id: target, history: sourceBatch.history });
     });
     return cache;
   }
-  function projectionFor(snapshot, toolId) { const cache = reduceProjectionCache({}, snapshot); return cache[String(toolId)] || (Object.keys(cache).length === 1 ? cache[Object.keys(cache)[0]] : {}); }
+  function projectionFor(snapshot, toolId) { const cache = reduceProjectionCache({}, snapshot); return cache[String(toolId)] || {}; }
   function projectionFields(projection) {
     const source = record(projection); const form = record(source.form);
     for (const value of [form.fields, source.parameter_fields, source.parameters]) {
@@ -153,6 +153,7 @@
     if (["validate", "start"].includes(kind)) payload.parameters = { ...record(values) };
     if (kind === "cancel" && first(source.runId, source.run_id, source.execution_id)) payload.run_id = String(first(source.runId, source.run_id, source.execution_id));
     if (kind === "openResult" && first(source.resultId, source.result_id, record(source.result).id, record(source.result).result_id)) payload.result_id = String(first(source.resultId, source.result_id, record(source.result).id, record(source.result).result_id));
+    if (kind === "openResult" && first(source.runId, source.run_id, source.execution_id)) payload.run_id = String(first(source.runId, source.run_id, source.execution_id));
     if (kind === "admitCandidates") {
       payload.run_id = String(first(source.runId, source.run_id, ""));
       const candidateIds = Array.isArray(source.candidateIds)

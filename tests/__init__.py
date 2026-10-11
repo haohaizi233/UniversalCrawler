@@ -14,6 +14,7 @@ _PROCESS_TEST_DIRECTORY = TemporaryDirectory(
     ignore_cleanup_errors=True,
 )
 TEST_USER_DATA_ROOT = Path(_PROCESS_TEST_DIRECTORY.name) / "user_data"
+TEST_USER_DATA_ROOT.mkdir(parents=True, exist_ok=True)
 
 if not os.environ.get("UCRAWL_USER_DATA_ROOT", "").strip():
     os.environ["UCRAWL_USER_DATA_ROOT"] = str(TEST_USER_DATA_ROOT)

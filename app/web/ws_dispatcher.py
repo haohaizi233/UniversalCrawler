@@ -139,11 +139,15 @@ class WebSocketMessageDispatcher:
         return payload
 
     async def _handle_start_crawl(self, data: dict[str, Any], context: WebSessionContext) -> None:
+        save_dir = data.get("save_dir")
+        if save_dir is not None and not isinstance(save_dir, str):
+            await self._emit_log(context, "❌ save_dir 必须是字符串")
+            return
         try:
-            with context.lease_approved_root_grants_snapshot():
-                payload = await self._normalize_authorized_save_dir(data, context)
-                if payload is None:
-                    return
+            with context.open_operation_directory(save_dir if save_dir else None) as opened:
+                payload = dict(data)
+                if opened:
+                    payload["save_dir"] = opened
                 await context.workflow.start_crawl(payload, log_error=True)
         except PermissionError:
             await self._emit_log(context, f"❌ {DIRECTORY_NOT_AUTHORIZED_MESSAGE}")
@@ -195,9 +199,8 @@ class WebSocketMessageDispatcher:
             return
 
         try:
-            with context.lease_approved_root_grants_snapshot():
-                directory = context.require_directory(directory)
-                await context.controller.async_change_dir(directory)
+            with context.open_operation_directory(directory) as opened:
+                await context.controller.async_change_dir(opened or directory)
         except PermissionError:
             await self._emit_log(context, f"❌ {DIRECTORY_NOT_AUTHORIZED_MESSAGE}")
 
@@ -327,11 +330,15 @@ class WebSocketMessageDispatcher:
             await self._emit_log(context, f"❌ {DIRECTORY_NOT_AUTHORIZED_MESSAGE}")
 
     async def _handle_download(self, data: dict[str, Any], context: WebSessionContext) -> None:
+        save_dir = data.get("save_dir")
+        if save_dir is not None and not isinstance(save_dir, str):
+            await self._emit_log(context, "❌ save_dir 必须是字符串")
+            return
         try:
-            with context.lease_approved_root_grants_snapshot():
-                payload = await self._normalize_authorized_save_dir(data, context)
-                if payload is None:
-                    return
+            with context.open_operation_directory(save_dir if save_dir else None) as opened:
+                payload = dict(data)
+                if opened:
+                    payload["save_dir"] = opened
                 await context.workflow.direct_download(payload, log_error=True)
         except PermissionError:
             await self._emit_log(context, f"❌ {DIRECTORY_NOT_AUTHORIZED_MESSAGE}")

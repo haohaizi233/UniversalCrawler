@@ -904,7 +904,7 @@ class RuntimeAndListCases:
         self.assertEqual(int(result["observed"]["max_retries"]), int(result["target"]["max_retries"]))
         self.assertEqual(int(result["observed"]["max_concurrent"]), int(result["target"]["max_concurrent"]))
 
-    def test_13eb_toolbox_open_button_dispatches_valid_backend_action(self):
+    def test_13eb_public_web_toolbox_start_stays_disabled(self):
         context = self._browser.new_context(viewport={"width": 1280, "height": 720})
         self.addCleanup(context.close)
         page = context.new_page()
@@ -916,26 +916,12 @@ class RuntimeAndListCases:
         page.wait_for_selector("#app-shell", state="visible", timeout=5000)
         page.wait_for_function("window.__ucrawlFrontendStateSettled === true", timeout=5000)
         page.evaluate("switchPage('toolbox')")
-        page.wait_for_selector("#toolDetail .btn-primary", state="visible", timeout=5000)
+        start = page.locator("#toolboxStartButton")
+        start.wait_for(state="visible", timeout=5000)
 
-        with page.expect_response(
-            lambda response: response.url.endswith("/api/frontend/action")
-            and response.request.method == "POST",
-            timeout=5000,
-        ) as response_info:
-            page.click("#toolDetail .btn-primary")
-
-        response = response_info.value
-        request_payload = response.request.post_data_json
-        response_payload = response.json()
-        self.assertEqual(response.status, 200)
-        self.assertEqual(request_payload.get("action"), "run_tool")
-        self.assertTrue(request_payload.get("payload", {}).get("tool_id"))
-        self.assertEqual(response_payload.get("status"), "ok")
-        self.assertEqual(
-            response_payload.get("data", {}).get("tool_id"),
-            request_payload.get("payload", {}).get("tool_id"),
-        )
+        self.assertTrue(start.is_disabled())
+        self.assertIn("btn-primary", start.get_attribute("class") or "")
+        self.assertEqual(page.locator("#toolDetail .btn-primary").count(), 2)
 
     def test_13f_list_pages_reject_stale_workers_and_preserve_shared_selection(self):
         self._goto_ready()

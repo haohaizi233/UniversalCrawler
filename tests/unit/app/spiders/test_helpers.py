@@ -2109,7 +2109,16 @@ class SpiderHelperTests(unittest.TestCase):
             self.assertEqual(spider._effective_proxy_server(), "http://127.0.0.1:9001")
 
         spider.config = {}
-        with patch.dict(os.environ, {"HTTPS_PROXY": "127.0.0.1:7890"}, clear=True):
+        preserved = {
+            key: os.environ[key]
+            for key in ("HOME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "SystemRoot")
+            if key in os.environ
+        }
+        preserved["HTTPS_PROXY"] = "127.0.0.1:7890"
+        with (
+            patch.dict(os.environ, preserved, clear=True),
+            patch("app.spiders.missav.spider.discover_client_proxy", return_value=None),
+        ):
             self.assertEqual(spider._effective_proxy_server(), "http://127.0.0.1:7890")
             self.assertIsNone(spider._effective_proxy_server("直连"))
 

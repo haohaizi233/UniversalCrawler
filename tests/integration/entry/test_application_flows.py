@@ -306,7 +306,7 @@ class RESTAPIEndToEndTests(unittest.TestCase):
 
     def test_dir_change_lifecycle(self):
         """目录变更：change → list → change back。"""
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             _approve_test_directory(self.client, tmp)
             r1 = self.client.post("/api/dir/change", json={"directory": tmp})
             self.assertEqual(r1.json()["status"], "ok")
@@ -316,7 +316,7 @@ class RESTAPIEndToEndTests(unittest.TestCase):
 
     def test_scan_then_state(self):
         """扫描后 state 应反映加载的文件数。"""
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             _approve_test_directory(self.client, tmp)
             # 创建一个假视频文件
             fpath = os.path.join(tmp, "test.mp4")
@@ -486,7 +486,7 @@ class FullIntegrationTests(unittest.TestCase):
 
     def test_full_workflow_no_crawl(self):
         """完整工作流（不含真爬虫）。"""
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             _approve_test_directory(self.client, tmp)
             # 1. 切换目录
             r1 = self.client.post("/api/dir/change", json={"directory": tmp})

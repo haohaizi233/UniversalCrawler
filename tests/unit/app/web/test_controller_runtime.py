@@ -1961,18 +1961,19 @@ class WebControllerRuntimeTests(unittest.TestCase):
         grants = (("D:/downloads", (11, 22)),)
         controller._send_recorded_frontend_event = AsyncMock()
 
+        original_await = controller._await_mutation_worker
+
+        async def replace_after_worker_returns(worker):
+            outcome = await original_await(worker)
+            controller._store_video_item(replacement)
+            return outcome
+
         async def replace_before_executor_waiter_resumes():
-            loop = asyncio.get_running_loop()
-            original_run_in_executor = loop.run_in_executor
-
-            def run_then_replace(executor, func, *args):
-                future = original_run_in_executor(executor, func, *args)
-                future.add_done_callback(
-                    lambda _future: controller._store_video_item(replacement)
-                )
-                return future
-
-            with patch.object(loop, "run_in_executor", side_effect=run_then_replace):
+            with patch.object(
+                controller,
+                "_await_mutation_worker",
+                replace_after_worker_returns,
+            ):
                 return await controller.async_rename_video(
                     item.id,
                     "renamed",

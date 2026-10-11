@@ -354,7 +354,7 @@ class InteractiveCommandTests(unittest.TestCase):
         self.assertEqual(runner_kwargs["keyword"], "测试关键词")
         self.assertEqual(runner_kwargs["save_dir"], r"D:\Downloads\UCP")
         self.assertTrue(runner_kwargs["download"])
-        self.assertEqual(runner_kwargs["config"]["max_items"], 1)
+        self.assertEqual(runner_kwargs["config"]["max_items"], 10)
         self.assertEqual(runner_kwargs["config"]["timeout"], 30)
         self.assertIsNone(runner_kwargs["timeout"])
         runner.run.assert_called_once()
@@ -475,6 +475,42 @@ class InteractiveCommandTests(unittest.TestCase):
         self.assertTrue(any("仅单体" in line for line in missav_lines))
         self.assertTrue(any("代理" in line for line in missav_lines))
 
+    def test_confirmation_hides_cookie_and_proxy_userinfo(self):
+        from cli.interactive.configuration import build_config_summary_lines
+
+        lines = build_config_summary_lines(
+            {
+                "fields": [
+                    {
+                        "key": "cookie",
+                        "summary_label": "Cookie",
+                        "choices": [],
+                    },
+                    {
+                        "key": "proxy",
+                        "summary_label": "代理",
+                        "choices": [],
+                    },
+                ],
+                "auth": {},
+            },
+            {
+                "cookie": "a=1; b=2",
+                "proxy": "http://user:secret@127.0.0.1:7890",
+            },
+            "抖音",
+            "测试",
+            r"D:\Downloads\UCP",
+        )
+        text = "\n".join(lines)
+
+        self.assertNotIn("a=1", text)
+        self.assertNotIn("b=2", text)
+        self.assertNotIn("secret", text)
+        self.assertNotIn("user:", text)
+        self.assertIn("127.0.0.1:7890", text)
+        self.assertIn("[redacted]", text)
+
     def test_download_summary_tolerates_null_titles(self):
         from cli.interactive.prompts import print_download_summary
 
@@ -555,7 +591,7 @@ class InteractiveCommandTests(unittest.TestCase):
         self.assertEqual(result, 0)
         runner_kwargs = runner_cls.call_args.kwargs
         self.assertEqual(runner_kwargs["source"], "xiaohongshu")
-        self.assertEqual(runner_kwargs["config"]["max_items"], 1)
+        self.assertEqual(runner_kwargs["config"]["max_items"], 10)
         self.assertEqual(
             runner_kwargs["config"]["search_max_pages"],
             5,
@@ -774,6 +810,61 @@ class InteractiveCommandTests(unittest.TestCase):
         self.assertEqual(result, 1)
         self.assertIn("cleanup unavailable", stderr.write.call_args.args[0])
         sdk.close.assert_called_once_with()
+
+    def test_interactive_success_is_printed_after_cleanup(self):
+        order: list[str] = []
+        sdk = Mock()
+        sdk.list_platforms.return_value = [
+            {
+                "id": "douyin",
+                "name": "抖音",
+                "search_placeholder": "输入关键词",
+            },
+        ]
+        sdk.close.side_effect = lambda: order.append("close") or True
+        runner = Mock()
+        runner.run.return_value = {"status": "ok", "elapsed": 0.1, "items": []}
+
+        with patch(
+            "cli.interactive.workflow._show_result_items",
+            side_effect=lambda *_args, **_kwargs: order.append("show"),
+        ):
+            result, _sdk_cls, _runner_cls, _cfg_set = self._run(
+                self._make_args(),
+                sdk=sdk,
+                runner=runner,
+                inputs=["1", "测试", "1", "", "y", ""],
+                cookie_path="dy_auth.json",
+            )
+
+        self.assertEqual(result, 0)
+        self.assertEqual(order, ["close", "show"])
+
+    def test_interactive_nonzero_exit_propagates_cleanup_control_flow(self):
+        from cli.interactive.workflow import run_interactive
+
+        for cleanup_error in (
+            KeyboardInterrupt("cleanup interrupted"),
+            SystemExit(11),
+            GeneratorExit("cleanup stopped"),
+        ):
+            with self.subTest(cleanup_type=type(cleanup_error).__name__):
+                args = self._make_args()
+                sdk = Mock()
+                sdk.close.side_effect = cleanup_error
+
+                with patch(
+                    "cli.interactive.workflow._run_interactive_loop",
+                    side_effect=EOFError,
+                ), self.assertRaises(type(cleanup_error)) as raised:
+                    run_interactive(
+                        args,
+                        sdk_cls=Mock(return_value=sdk),
+                        runner_cls=Mock(),
+                    )
+
+                self.assertIs(raised.exception, cleanup_error)
+                sdk.close.assert_called_once_with()
 
     def test_interactive_cleanup_control_propagates_after_success(self):
         from cli.interactive.workflow import run_interactive

@@ -6,7 +6,7 @@ import argparse
 import sys
 
 from app.core.plugin_registry import registry
-from cli.exit_codes import exit_code_for_status
+from cli.exit_codes import CliExitCode, exit_code_for_status
 from shared import download_command_runtime as runtime
 from shared.download_command_runtime import (
     add_download_arguments,
@@ -48,8 +48,14 @@ def handle_download_command(args: argparse.Namespace) -> int:
         args,
         env=_runtime_env(),
     )
+    if outcome == "usage":
+        if error_message:
+            write_text_best_effort(sys.stderr, f"{error_message}\n")
+        return int(CliExitCode.USAGE)
     if error_message:
         write_text_best_effort(sys.stderr, f"{error_message}\n")
+    if isinstance(result, dict):
+        result["status"] = outcome
     if result is not None:
         call_best_effort(
             runtime.emit_result,

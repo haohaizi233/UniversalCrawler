@@ -18,6 +18,7 @@ from cli.exit_codes import CliExitCode, exit_code_for_status
         ("timeout", CliExitCode.TIMEOUT),
         ("cancelled", CliExitCode.CANCELLED),
         ("canceled", CliExitCode.CANCELLED),
+        ("partial", CliExitCode.ERROR),
     ],
 )
 def test_statuses_map_to_stable_process_codes(

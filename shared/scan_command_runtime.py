@@ -119,14 +119,14 @@ def run_scan_command(
     if cleanup_error is None:
         return outcome, result, error_message
 
+    if is_sdk_cleanup_control_flow(cleanup_error):
+        raise cleanup_error
     if operation_error is not None or outcome != "ok":
         return (
             outcome,
             result,
             append_sdk_cleanup_diagnostic(error_message, cleanup_error),
         )
-    if is_sdk_cleanup_control_flow(cleanup_error):
-        raise cleanup_error
     return "error", None, append_sdk_cleanup_diagnostic(None, cleanup_error)
 
 

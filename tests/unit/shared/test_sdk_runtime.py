@@ -745,5 +745,27 @@ class UcrawlSDKCloseTests(unittest.TestCase):
             )
         )
 
+class ListPlatformsProjectionTests(unittest.TestCase):
+    def test_settings_projection_does_not_alias_field_defs(self):
+        from shared.sdk_runtime import _project_platform_manifest
+
+        field_defs = [{"key": "cookie", "label": "Cookie"}]
+        manifest = {
+            "id": "demo",
+            "name": "Demo",
+            "settings": field_defs,
+            "interactive": {"fields": [{"key": "mode"}]},
+        }
+
+        projected = _project_platform_manifest(manifest, field_defs)
+
+        self.assertEqual(projected["id"], "demo")
+        self.assertIsNot(projected["settings"], field_defs)
+        self.assertEqual(projected["settings"], field_defs)
+        projected["settings"].append({"key": "extra"})
+        self.assertEqual(len(field_defs), 1)
+        self.assertIsNot(projected["interactive"], manifest["interactive"])
+
+
 if __name__ == "__main__":
     unittest.main()

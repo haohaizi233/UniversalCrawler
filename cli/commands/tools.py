@@ -131,9 +131,37 @@ def _write_secondary_diagnostic(message: str) -> None:
         pass
 
 
-def _wait_for_run(api: ToolsAPI, queued: Any) -> tuple[Any, bool]:
+_TERMINAL_TOOL_STATUSES = {
+    "ok",
+    "succeeded",
+    "success",
+    "error",
+    "failed",
+    "partial",
+    "timeout",
+    "cancelled",
+    "canceled",
+}
+
+
+def _is_terminal_tool_result(value: Any) -> bool:
+    if not isinstance(value, Mapping):
+        return False
+    return str(value.get("status") or "").lower() in _TERMINAL_TOOL_STATUSES
+
+
+def _tool_shutdown_failure(run_id: Any) -> dict[str, Any]:
+    return {
+        "status": "error",
+        "run_id": run_id,
+        "code": "tool_shutdown_failed",
+        "message": "tool run did not reach a terminal state",
+    }
+
+
+def _wait_for_run(api: ToolsAPI, queued: Any) -> Any:
     if not isinstance(queued, Mapping) or queued.get("status") != "queued":
-        return queued, False
+        return queued
     run_id = queued.get("run_id")
     if type(run_id) is not str or not run_id.strip():
         return {
@@ -142,21 +170,27 @@ def _wait_for_run(api: ToolsAPI, queued: Any) -> tuple[Any, bool]:
             "message": (
                 "tool runner returned a queued result without a valid run_id"
             ),
-        }, False
+        }
     try:
-        return api.wait_for_run(run_id, timeout=None), False
+        return api.wait_for_run(run_id, timeout=None)
     except KeyboardInterrupt:
-        cancelled: Any = {"status": "cancelled", "run_id": run_id}
         try:
             api.cancel(run_id)
+        except (KeyboardInterrupt, SystemExit):
+            raise
         except Exception:
             _write_secondary_diagnostic("tool cancellation request failed\n")
         try:
-            terminal = api.wait_for_run(run_id, timeout=1.0)
+            terminal = api.wait_for_run(run_id, timeout=None)
+        except (KeyboardInterrupt, SystemExit):
+            raise
         except Exception:
             _write_secondary_diagnostic("tool cancellation wait failed\n")
-            terminal = cancelled
-        return terminal, True
+            return _tool_shutdown_failure(run_id)
+        if not _is_terminal_tool_result(terminal):
+            _write_secondary_diagnostic("tool cancellation wait failed\n")
+            return _tool_shutdown_failure(run_id)
+        return terminal
 
 
 def _attach_cleanup_failure(
@@ -236,12 +270,11 @@ def handle_tools_command(args: argparse.Namespace) -> int:
     unexpected_error: BaseException | None = None
     cleanup_error: BaseException | None = None
     cleanup_control_error: KeyboardInterrupt | SystemExit | None = None
-    interrupted = False
     try:
         api = ToolsAPI(execution_profile=_cli_tool_execution_profile())
         result = _execute(api, args, params)
         if args.tools_command == "run":
-            result, interrupted = _wait_for_run(api, result)
+            result = _wait_for_run(api, result)
     except ToolRunnerUnavailableError as exc:
         operation_error = exc
     except BaseException as exc:
@@ -277,14 +310,20 @@ def handle_tools_command(args: argparse.Namespace) -> int:
         raise cleanup_control_error
 
     indent = 2 if getattr(args, "pretty", False) else None
-    sys.stdout.write(json.dumps(result, ensure_ascii=False, indent=indent) + "\n")
-
     if cleanup_error is not None:
-        _write_secondary_diagnostic(_describe_cleanup_failure(cleanup_error) + "\n")
-    if interrupted:
-        return 130
-    if cleanup_error is not None:
+        diagnostic = _describe_cleanup_failure(cleanup_error)
+        _write_secondary_diagnostic(diagnostic + "\n")
+        sys.stdout.write(
+            json.dumps(
+                {"status": "error", "error": diagnostic},
+                ensure_ascii=False,
+                indent=indent,
+            )
+            + "\n"
+        )
         return int(CliExitCode.ERROR)
+
+    sys.stdout.write(json.dumps(result, ensure_ascii=False, indent=indent) + "\n")
 
     if isinstance(result, Mapping) and "status" in result:
         return int(exit_code_for_status(str(result["status"])))

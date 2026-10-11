@@ -12,7 +12,11 @@ from typing import Any
 from cli.exit_codes import CliExitCode, exit_code_for_status
 from cli.interactive import configuration, prompts
 from cli.interactive.catalog import guide_for
-from shared.cli_runner_runtime import CLIRunner
+from shared.cli_runner_runtime import (
+    CLIRunner,
+    command_status_for_result,
+    stop_runner_for_interrupt,
+)
 from shared.execution_profile import local_execution_profile
 from shared.interactive_selection import InteractiveTTYSelection
 from shared.pipe_selection import PipeSelection
@@ -263,12 +267,39 @@ def _suggest_persistent_save_dir(default_save_dir: str) -> str:
     return suggested
 
 
+class _InteractiveCleanupControl(Exception):
+    """Carry cleanup control flow out of the input-interrupt handlers."""
+
+    def __init__(self, error: BaseException) -> None:
+        self.error = error
+
+
+def _close_interactive_sdk(sdk: Any, state: dict[str, Any]) -> BaseException | None:
+    if state.get("closed"):
+        return None
+    state["closed"] = True
+    return close_sdk_once(sdk)
+
+
+def _interrupt_exit(runner: Any) -> int:
+    """停止当前运行器；关闭失败不能伪装成取消成功。"""
+
+    failure = stop_runner_for_interrupt(runner)
+    if failure:
+        write_text_best_effort(sys.stderr, f"{failure}\n")
+        return int(CliExitCode.ERROR)
+    write_text_best_effort(sys.stdout, "\n已取消\n")
+    return int(CliExitCode.CANCELLED)
+
+
 def _run_interactive_loop(
     args: argparse.Namespace,
     *,
     sdk: Any,
     runner_cls: Any,
     command_timeout: float | None,
+    active_runner: dict[str, Any],
+    sdk_state: dict[str, Any],
 ) -> int:
     """Run the reusable multi-platform interaction loop."""
 
@@ -427,6 +458,7 @@ def _run_interactive_loop(
                 download=download,
                 execution_profile=execution_profile,
             )
+            active_runner["runner"] = runner
             result = runner.run()
         except Exception as exc:
             write_text_best_effort(
@@ -441,12 +473,15 @@ def _run_interactive_loop(
                 "❌ 运行器返回了无效结果\n",
             )
             return int(CliExitCode.ERROR)
-        status = str(result.get("status", "error") or "error").lower()
+        status = command_status_for_result(result, download=download)
+        result["status"] = status
         if status != "ok":
-            error = result.get("error", "未知错误")
+            error = result.get("error") or "未知错误"
             try:
                 error_text = str(error)
             except BaseException:
+                error_text = "未知错误"
+            if error_text == "None":
                 error_text = "未知错误"
             write_text_best_effort(
                 sys.stderr,
@@ -454,6 +489,12 @@ def _run_interactive_loop(
             )
             return int(exit_code_for_status(status))
 
+        cleanup_error = _close_interactive_sdk(sdk, sdk_state)
+        if cleanup_error is not None:
+            if is_sdk_cleanup_control_flow(cleanup_error):
+                raise _InteractiveCleanupControl(cleanup_error)
+            write_sdk_cleanup_diagnostic(cleanup_error)
+            return int(CliExitCode.ERROR)
         call_best_effort(
             _show_result_items,
             result,
@@ -488,6 +529,8 @@ def run_interactive(
         return int(CliExitCode.USAGE)
 
     sdk = sdk_cls(verbose=not getattr(args, "quiet", False))
+    active_runner: dict[str, Any] = {"runner": None}
+    sdk_state: dict[str, Any] = {"closed": False}
     try:
         try:
             exit_code = _run_interactive_loop(
@@ -495,23 +538,29 @@ def run_interactive(
                 sdk=sdk,
                 runner_cls=runner_cls,
                 command_timeout=command_timeout,
+                active_runner=active_runner,
+                sdk_state=sdk_state,
             )
-        except (EOFError, KeyboardInterrupt):
+        except EOFError:
             write_text_best_effort(sys.stdout, "\n已取消\n")
             exit_code = int(CliExitCode.CANCELLED)
+        except KeyboardInterrupt:
+            exit_code = _interrupt_exit(active_runner.get("runner"))
+    except _InteractiveCleanupControl as control:
+        raise control.error
     except BaseException as primary_error:
-        cleanup_error = close_sdk_once(sdk)
+        cleanup_error = _close_interactive_sdk(sdk, sdk_state)
         if cleanup_error is not None:
             attach_sdk_cleanup_failure(primary_error, cleanup_error)
         raise
 
-    cleanup_error = close_sdk_once(sdk)
+    cleanup_error = _close_interactive_sdk(sdk, sdk_state)
     if cleanup_error is None:
-        return int(exit_code)
-    if int(exit_code) != int(CliExitCode.OK):
-        write_sdk_cleanup_diagnostic(cleanup_error)
         return int(exit_code)
     if is_sdk_cleanup_control_flow(cleanup_error):
         raise cleanup_error
+    if int(exit_code) != int(CliExitCode.OK):
+        write_sdk_cleanup_diagnostic(cleanup_error)
+        return int(exit_code)
     write_sdk_cleanup_diagnostic(cleanup_error)
     return int(CliExitCode.ERROR)

@@ -779,13 +779,19 @@ class UcrawlSDK:
             }
 
     def list_platforms(self) -> list[dict]:
-        """列出所有可用平台及其元信息。"""
+        """列出所有可用平台及其元信息。
+
+        返回纯字典投影，不把 ``settings_builder.field_defs`` 原对象交给调用方。
+        """
         from app.core.plugin_registry import registry
 
-        return [
-            plugin.get_manifest()
-            for plugin in registry.get_all_plugins()
-        ]
+        projected: list[dict] = []
+        for plugin in registry.get_all_plugins():
+            manifest = plugin.get_manifest()
+            settings_builder = getattr(plugin, "settings_builder", None)
+            field_defs = getattr(settings_builder, "field_defs", None)
+            projected.append(_project_platform_manifest(manifest, field_defs))
+        return projected
 
     def scan_directory(self, directory: str, scan_limit: int | None = None) -> dict:
         """扫描本地目录，返回文件清单。
@@ -924,6 +930,49 @@ def search(
             **config,
         ),
     )
+
+def _json_safe(value: Any) -> Any:
+    """把清单值复制成纯 JSON 结构，避免别名到插件内部对象。"""
+
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    to_dict = getattr(value, "to_dict", None)
+    if callable(to_dict):
+        try:
+            return _json_safe(to_dict())
+        except Exception:
+            return str(value)
+    return str(value)
+
+
+def _project_platform_manifest(manifest: Any, field_defs: Any = None) -> dict:
+    """复制平台清单；settings 始终是新的字典或列表。"""
+
+    if not isinstance(manifest, dict):
+        return {}
+    projected = {
+        str(key): _json_safe(value)
+        for key, value in manifest.items()
+        if key != "settings"
+    }
+    source = field_defs if field_defs is not None else manifest.get("settings")
+    if source is None:
+        return projected
+    settings = _json_safe(source)
+    if settings is source:
+        if isinstance(source, list):
+            settings = [_json_safe(item) for item in source]
+        elif isinstance(source, dict):
+            settings = {str(key): _json_safe(value) for key, value in source.items()}
+        else:
+            settings = {"value": str(source)}
+    projected["settings"] = settings
+    return projected
+
 
 def list_platforms() -> list[dict]:
     """列出所有可用平台。

@@ -484,5 +484,75 @@ class CLIRunnerBuildResultTests(unittest.TestCase):
         self.assertEqual(result["logs"], ["log1"])
         self.assertIn("elapsed", result)
 
+    def test_public_result_drops_cookie_and_proxy_userinfo(self):
+        from shared.cli_runner_runtime import CLIRunner
+
+        runner = CLIRunner(
+            source="douyin",
+            keyword="kw",
+            config={
+                "cookie": "sessionid=secret-cookie",
+                "proxy": "http://user:pass@127.0.0.1:7890",
+            },
+            execution_profile=_local_profile(),
+        )
+        item = MagicMock()
+        item.to_dict.return_value = {
+            "status": "❌ 失败",
+            "local_path": "video.mp4",
+            "meta": {
+                "cookie": "sessionid=secret-cookie",
+                "cookies": {"sid": "secret-cookie"},
+                "proxy": "http://user:pass@127.0.0.1:7890",
+                "download_error": "failed with sessionid=secret-cookie",
+            },
+        }
+        runner.videos = {"v1": item}
+        runner.logs = ["cookie=sessionid=secret-cookie"]
+        import time
+        result = runner._finalize_result(runner._build_result("ok", time.time(), None))
+
+        self.assertEqual(result["status"], "error")
+        self.assertIsNone(result["error"])
+        meta = result["items"][0]["meta"]
+        self.assertNotIn("cookie", meta)
+        self.assertNotIn("cookies", meta)
+        self.assertEqual(meta["proxy"], "http://127.0.0.1:7890")
+        self.assertNotIn("secret-cookie", meta["download_error"])
+        self.assertNotIn("secret-cookie", " ".join(result["logs"]))
+
+    def test_log_redacts_entire_cookie_header(self):
+        from shared.cli_runner_runtime import redact_text
+
+        redacted = redact_text("Cookie: a=1; b=2")
+
+        self.assertEqual(redacted, "Cookie: [redacted]")
+        self.assertNotIn("b=2", redact_text("note Cookie: a=1; b=2 tail"))
+        self.assertIn("tail", redact_text("note Cookie: a=1; b=2 tail"))
+
+    def test_stop_waits_for_terminal_and_reports_shutdown_failure(self):
+        from shared.cli_runner_runtime import CLIRunner
+
+        runner = CLIRunner(
+            source="douyin",
+            keyword="kw",
+            execution_profile=_local_profile(),
+        )
+        runner._spider = MagicMock()
+        runner._spider.isRunning.return_value = False
+        runner._dl_manager = MagicMock()
+        runner._dl_manager.pending_work_counts.return_value = (0, 0)
+        runner._dl_manager.stop_all.return_value = {
+            "all_workers_stopped": False,
+            "dispatcher_stopped": True,
+            "unfinished_workers": ["worker-1"],
+        }
+
+        runner.stop()
+        failure = runner.wait_for_terminal()
+
+        self.assertIn("terminal", failure)
+        runner._spider_session.stop_session = MagicMock()
+
 if __name__ == "__main__":
     unittest.main()

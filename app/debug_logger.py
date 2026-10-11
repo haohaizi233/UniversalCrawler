@@ -42,6 +42,25 @@ _TRUNCATED_URL_AUTHORITY = re.compile(
     flags=re.IGNORECASE,
 )
 _URL_TRAILING_PUNCTUATION = ".,;:!?)]}，。；：！？）》】"
+_COOKIE_PATH_TRAILING = ".,;:!?)]}，。；：！？）》】、\"'"
+_HEADER_SECRET_RE = re.compile(
+    r"(?<![A-Za-z0-9_])(?P<oq>[\"'])?(?P<name>proxy-authorization|authorization|cookie)(?(oq)(?P=oq))\s*[:=]\s*",
+    flags=re.IGNORECASE,
+)
+_QUOTED_SECRET_VALUE_RE = re.compile(r"\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'")
+_AUTH_SECRET_VALUE_RE = re.compile(
+    r"(?:bearer|basic|digest|negotiate|ntlm)\s+\S+|\S+",
+    flags=re.IGNORECASE,
+)
+_QUOTED_NAMED_SECRET_RE = re.compile(
+    r"(?P<prefix>(?<![A-Za-z0-9_])(?:(?P<kq>[\"'])(?:mstoken|cookie|ttwid)(?P=kq)|(?:mstoken|cookie|ttwid))\s*[:=]\s*)"
+    r"(?:\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*')",
+    flags=re.IGNORECASE,
+)
+_ABSOLUTE_COOKIE_PATH_RE = re.compile(
+    r"(?<![A-Za-z0-9_])(?:[A-Za-z]:[\\/][^\s\"']+|\\\\[^\s\"']+)"
+    r"|(?<![A-Za-z0-9_:/])/(?:[^\s\"'/]+/)+[^\s\"']+"
+)
 
 
 def _without_url_query_and_fragment(value: str) -> str:
@@ -191,6 +210,64 @@ def _mask_url_userinfo(value: str) -> str:
         return value
     pieces.append(value[cursor:])
     return "".join(pieces)
+
+
+def _header_secret_value_length(text: str, name: str) -> int:
+    """Consume an entire Cookie / Authorization / Proxy-Authorization value."""
+
+    if not text:
+        return 0
+    quoted = _QUOTED_SECRET_VALUE_RE.match(text)
+    if quoted:
+        return quoted.end()
+    if name.lower() == "cookie":
+        return _cookie_secret_value_length(text)
+    matched = _AUTH_SECRET_VALUE_RE.match(text)
+    return matched.end() if matched else 0
+
+
+def _cookie_secret_value_length(text: str) -> int:
+    segment = re.match(r"[^\s,;]+", text)
+    if segment is None:
+        return 0
+    end = segment.end()
+    while True:
+        separator = re.match(r"[ \t]*;[ \t]*", text[end:])
+        if separator is None:
+            break
+        rest_index = end + separator.end()
+        rest = text[rest_index:]
+        if _HEADER_SECRET_RE.match(text, rest_index):
+            break
+        if rest.lower().startswith(("http://", "https://", "http:\\", "https:\\")):
+            break
+        next_segment = re.match(r"[^\s,;]+", rest)
+        if next_segment is None:
+            break
+        end = rest_index + next_segment.end()
+    return end
+
+
+def _redact_header_secrets(value: str) -> str:
+    """Redact complete header values. proxy-authorization is matched before authorization."""
+
+    pieces: list[str] = []
+    cursor = 0
+    for match in _HEADER_SECRET_RE.finditer(value):
+        if match.start() < cursor:
+            continue
+        value_end = match.end() + _header_secret_value_length(value[match.end() :], match.group("name"))
+        pieces.append(value[cursor : match.end()])
+        pieces.append("[已脱敏]")
+        cursor = value_end
+    if not pieces:
+        return value
+    pieces.append(value[cursor:])
+    return "".join(pieces)
+
+
+def _redact_quoted_named_secrets(value: str) -> str:
+    return _QUOTED_NAMED_SECRET_RE.sub(r"\g<prefix>[已脱敏]", value)
 
 
 def _best_effort_diagnostic(method):
@@ -346,16 +423,78 @@ class DebugLogger:
     def _now(self) -> str:
         return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
+    def _is_cookie_location_key(self, key: str) -> bool:
+        lower_key = str(key or "").strip().lower()
+        return "cookie" in lower_key and lower_key.endswith(("_path", "_file", "_dir"))
+
+    def _cookie_location_label(self, value: Any) -> Any:
+        """Cookie 文件位置最多保留文件名，其它敏感内容整段替换。"""
+        if not isinstance(value, str):
+            return "[已脱敏]"
+        text = value.replace("\n", " ").replace("\r", " ").strip()
+        if not text:
+            return text
+        looks_like_path = (
+            "\\" in text
+            or "/" in text
+            or re.match(r"^[A-Za-z]:", text) is not None
+            or text.lower().endswith((".json", ".cookies", ".cookie"))
+        )
+        if not looks_like_path:
+            return "[已脱敏]"
+        name = text.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
+        return name or "[已脱敏]"
+
     def _is_sensitive_key(self, key: str) -> bool:
         lower_key = key.lower()
-        if lower_key.endswith(("_path", "_file", "_dir")):
-            return False
-        if lower_key in self.SENSITIVE_KEYS:
+        if self._is_cookie_location_key(lower_key) or lower_key in self.SENSITIVE_KEYS:
             return True
         return any(
             marker in lower_key
             for marker in ("authorization", "sessionid", "sessdata", "password", "secret", "token")
         )
+
+    def _redact_known_cookie_paths(self, text: str, *mappings: dict[str, Any] | None) -> str:
+        for mapping in mappings:
+            if not isinstance(mapping, dict):
+                continue
+            for key, value in mapping.items():
+                if not isinstance(value, str) or not self._is_cookie_location_key(str(key)):
+                    continue
+                label = self._cookie_location_label(value)
+                if isinstance(label, str) and value and value != label:
+                    text = text.replace(value, label)
+        return text
+
+    def _redact_cookie_file_paths(self, text: str) -> str:
+        """错误摘要和说明文本不保留 Cookie 文件的绝对路径。"""
+
+        lines = text.split("\n")
+        mentions_cookie = any("cookie" in line.lower() for line in lines)
+
+        def redact_line(line: str) -> str:
+            def repl(match: re.Match[str]) -> str:
+                raw = match.group(0)
+                trimmed = raw.rstrip(_COOKIE_PATH_TRAILING)
+                trailing = raw[len(trimmed) :]
+                name = trimmed.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
+                lowered_line = line.lower()
+                lowered_path = trimmed.lower()
+                lowered_name = name.lower()
+                written_separately = line.strip().rstrip(_COOKIE_PATH_TRAILING) == trimmed
+                cookie_file = (
+                    "cookie" in lowered_line
+                    or "cookie" in lowered_path
+                    or lowered_name.endswith(("_auth.json", ".cookies", ".cookie"))
+                    or (mentions_cookie and written_separately)
+                )
+                if not cookie_file:
+                    return raw
+                return (name or "[已脱敏]") + trailing
+
+            return _ABSOLUTE_COOKIE_PATH_RE.sub(repl, line)
+
+        return "\n".join(redact_line(line) for line in lines)
 
     def _mask_inline_secret(self, value: str) -> str:
         if len(value) > _MAX_DIAGNOSTIC_TEXT_LENGTH:
@@ -373,8 +512,10 @@ class DebugLogger:
             masked,
             flags=re.IGNORECASE,
         )
+        masked = _redact_header_secrets(masked)
+        masked = _redact_quoted_named_secrets(masked)
         masked = re.sub(
-            r"(\b(?:authorization|proxy-authorization|cookie|password|passwd|pwd|secret|token|access_token|refresh_token|sessionid(?:_ss)?|sessdata|mstoken|ttwid)\s*[:=]\s*)"
+            r"(\b(?:password|passwd|pwd|secret|access_token|refresh_token|sessionid(?:_ss)?|sessdata|mstoken|ttwid|token)\s*[:=]\s*)"
             r"(?:bearer\s+)?(?:\"[^\"]*\"|'[^']*'|[^\s,;]+)",
             r"\1[已脱敏]",
             masked,
@@ -383,10 +524,13 @@ class DebugLogger:
         lowered = masked.lower()
         if lowered.startswith("bearer "):
             return "Bearer ***"
-        if lowered.startswith("cookie:"):
-            return "Cookie: [已脱敏]"
-        if lowered.startswith("authorization:"):
-            return "Authorization: [已脱敏]"
+        if "[已脱敏]" not in masked:
+            if lowered.startswith("proxy-authorization:"):
+                return "Proxy-Authorization: [已脱敏]"
+            if lowered.startswith("cookie:"):
+                return "Cookie: [已脱敏]"
+            if lowered.startswith("authorization:"):
+                return "Authorization: [已脱敏]"
         return masked
 
     def _safe_diagnostic_text(
@@ -431,16 +575,11 @@ class DebugLogger:
                 mask_next = True
         return redacted
 
-    def _redact_sensitive_value(self, value: Any) -> Any:
+    def _redact_sensitive_value(self, value: Any, key: str = "") -> Any:
+        if self._is_cookie_location_key(key):
+            return self._cookie_location_label(value)
         if isinstance(value, str):
-            if re.match(
-                r"^\s*(?:cookie|password|passwd|pwd|secret|token|sessionid(?:_ss)?|sessdata|mstoken|ttwid)\s*[:=]",
-                value,
-                flags=re.IGNORECASE,
-            ):
-                return "[已脱敏]"
-            masked = self._mask_inline_secret(value)
-            return masked if masked != value else "[已脱敏]"
+            return "[已脱敏]"
         if isinstance(value, (dict, list, tuple, set)):
             return "[已脱敏]"
         return "***"
@@ -494,7 +633,7 @@ class DebugLogger:
                 continue
             normalized_key = self._normalize_mapping_key(key)
             if self._is_sensitive_key(normalized_key):
-                cleaned[normalized_key] = self._redact_sensitive_value(value)
+                cleaned[normalized_key] = self._redact_sensitive_value(value, key=normalized_key)
                 continue
             if isinstance(value, str):
                 cleaned[normalized_key] = self._mask_inline_secret(value)
@@ -525,7 +664,7 @@ class DebugLogger:
             for key, item in list(value.items())[:20]:
                 normalized_key = self._normalize_mapping_key(key)
                 normalized = (
-                    self._redact_sensitive_value(item)
+                    self._redact_sensitive_value(item, key=normalized_key)
                     if self._is_sensitive_key(normalized_key)
                     else self._normalize_value(item)
                 )
@@ -572,7 +711,7 @@ class DebugLogger:
         details: dict[str, Any] | None,
     ):
         # 错误摘要始终覆盖为“最近一次错误”，这样用户从 UI 打开时能直接看到最新诊断结论。
-        message = self._mask_inline_secret(str(message))
+        message = self._redact_cookie_file_paths(self._mask_inline_secret(str(message)))
         severity = self._infer_error_severity(component, action, status_code, details)
         conclusion = self._build_error_conclusion(component, action, status_code, details)
         suggestions = self._build_error_suggestions(component, action, status_code, details)
@@ -607,7 +746,8 @@ class DebugLogger:
         lines.append("")
         with self._lock:
             # 摘要与普通日志共享 Windows 文件锁降级策略。
-            self._safe_write_text(self.latest_error_summary_file, "\n".join(lines))
+            summary = self._redact_cookie_file_paths("\n".join(lines))
+            self._safe_write_text(self.latest_error_summary_file, summary)
 
     def _infer_error_severity(
         self,
@@ -702,7 +842,13 @@ class DebugLogger:
             return
         component = self._safe_diagnostic_text(component, single_line=True)
         action = self._safe_diagnostic_text(action, single_line=True)
-        message = self._safe_diagnostic_text(message)
+        message = self._redact_cookie_file_paths(
+            self._redact_known_cookie_paths(
+                self._safe_diagnostic_text(message),
+                context,
+                details,
+            )
+        )
         status_code = (
             None
             if status_code is None
@@ -753,7 +899,13 @@ class DebugLogger:
             return
         component = self._safe_diagnostic_text(component, single_line=True)
         api_name = self._safe_diagnostic_text(api_name, single_line=True)
-        message = self._safe_diagnostic_text(message)
+        message = self._redact_cookie_file_paths(
+            self._redact_known_cookie_paths(
+                self._safe_diagnostic_text(message),
+                request,
+                response_summary,
+            )
+        )
         status_code = (
             None
             if status_code is None
@@ -799,7 +951,7 @@ class DebugLogger:
             details["args"] = self._redact_command_args(command_args)
         component = self._safe_diagnostic_text(component, single_line=True)
         tool_name = self._safe_diagnostic_text(tool_name, single_line=True)
-        message = self._safe_diagnostic_text(message)
+        message = self._redact_cookie_file_paths(self._safe_diagnostic_text(message))
         trace_id = (
             ""
             if trace_id is None

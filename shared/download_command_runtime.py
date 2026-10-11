@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
+from shared.cli_runner_runtime import project_download_result
 from shared.execution_profile import ExecutionProfile, local_execution_profile
 from shared.runtime_options import compose_runtime_config
 from shared.sdk_cleanup import (
@@ -225,12 +226,11 @@ def run_download_command(
             if not isinstance(raw_result, dict):
                 error_message = "❌ SDK 返回了无效的下载结果"
             else:
-                result = raw_result
-                outcome = str(
-                    result.get("status", "error") or "error"
-                ).lower()
-                if outcome not in {"ok", "error", "timeout", "cancelled"}:
+                result = project_download_result(raw_result)
+                outcome = result["status"]
+                if outcome not in {"ok", "error", "timeout", "cancelled", "partial"}:
                     outcome = "error"
+                    result["status"] = outcome
     except BaseException as primary_error:
         cleanup_error = close_sdk_once(sdk)
         if cleanup_error is not None:
@@ -241,43 +241,29 @@ def run_download_command(
     if cleanup_error is None:
         return outcome, result, error_message
 
+    if is_sdk_cleanup_control_flow(cleanup_error):
+        raise cleanup_error
     if operation_error is not None or outcome != "ok":
         return (
             outcome,
             result,
             append_sdk_cleanup_diagnostic(error_message, cleanup_error),
         )
-    if is_sdk_cleanup_control_flow(cleanup_error):
-        raise cleanup_error
     return "error", None, append_sdk_cleanup_diagnostic(None, cleanup_error)
 
 def print_pretty(result: dict) -> None:
-    if result.get("status") != "ok":
-        status = result.get("status", "error")
-        if status == "timeout" or "超时" in result.get("error", ""):
-            sys.stderr.write(f"❌ 下载超时: {result.get('error', '未知错误')}\n")
-        else:
-            sys.stderr.write(f"❌ 下载失败: {result.get('error', '未知错误')}\n")
-        elapsed = result.get("elapsed")
-        if elapsed is not None:
-            sys.stderr.write(f"⏱️  耗时: {elapsed}s\n")
+    status = str(result.get("status") or "error")
+    path = result.get("local_path") or ""
+    error = result.get("error") or ""
+    if status != "ok":
+        sys.stderr.write(f"❌ {status}: {error or '未知错误'}\n")
+        if path:
+            sys.stderr.write(f"📂 {path}\n")
         return
 
-    sys.stdout.write(f"✅ 状态: {result['status']}\n")
-    sys.stdout.write(f"📦 平台: {result['source']}\n")
-    sys.stdout.write(f"📝 标题: {result['title']}\n")
-    sys.stdout.write(f"🔗 URL: {result['url']}\n")
-    sys.stdout.write(f"💾 保存目录: {result['save_dir']}\n")
-    if result.get("local_path"):
-        sys.stdout.write(f"📂 本地路径: {result['local_path']}\n")
-    content_type = result.get("content_type", "")
-    if content_type:
-        type_map = {"video": "视频", "gallery": "图集", "image": "图片"}
-        type_label = type_map.get(content_type, content_type)
-        sys.stdout.write(f"🏷️  类型: {type_label}\n")
-    elapsed = result.get("elapsed")
-    if elapsed is not None:
-        sys.stdout.write(f"⏱️  耗时: {elapsed}s\n")
+    sys.stdout.write(f"✅ 状态: {status}\n")
+    if path:
+        sys.stdout.write(f"📂 本地路径: {path}\n")
     sys.stdout.write("\n")
 
 def emit_result(result: dict, *, pretty: bool) -> None:

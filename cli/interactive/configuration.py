@@ -141,6 +141,19 @@ def persist_save_dir(save_dir: str) -> None:
         pass
 
 
+def _redact_confirmation_value(key: str, display: str) -> str:
+    """确认页不展示 cookie 原文，也不展示带用户信息的代理。"""
+
+    name = str(key or "").strip().lower()
+    if name in {"cookie", "cookies"}:
+        return "[redacted]"
+    if name == "proxy" or name.endswith("_proxy"):
+        from shared.cli_runner_runtime import redact_proxy_userinfo
+
+        return redact_proxy_userinfo(display)
+    return display
+
+
 def build_config_summary_lines(
     guide: dict,
     config: dict,
@@ -171,7 +184,7 @@ def build_config_summary_lines(
                 display = str(choice.get("label") or value)
                 break
         label = str(field.get("summary_label") or key)
-        lines.append(f"  {label}: {display}")
+        lines.append(f"  {label}: {_redact_confirmation_value(str(key), display)}")
 
     auth_summary = str(
         guide.get("auth", {}).get("summary") or ""

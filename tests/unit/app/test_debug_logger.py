@@ -121,7 +121,8 @@ class DebugLoggerTests(unittest.TestCase):
             "headers",
         )
 
-        self.assertEqual(result["authorization"], "Bearer ***")
+        self.assertEqual(result["authorization"], "[已脱敏]")
+        self.assertNotIn("abc.def.ghi", result["authorization"])
         self.assertIn("Authorization: [已脱敏]", result["headers"])
 
     def test_pick_used_strips_unknown_signed_query_and_fragment_from_urls(self):
@@ -694,6 +695,147 @@ class DebugLoggerTests(unittest.TestCase):
 
         self.assertTrue(trace_id.startswith("xhs_task_"))
         self.assertNotIn("-", trace_id)
+
+    def test_inline_headers_redact_entire_cookie_authorization_and_proxy_basic(self):
+        result = debug_logger.pick_used(
+            {
+                "headers": (
+                    "Cookie: sessionid=first-secret; ttwid=second-secret; "
+                    "Proxy-Authorization: Basic cHJveHktc2VjcmV0; "
+                    "Authorization: Bearer third-secret"
+                ),
+                "payload": (
+                    '{"msToken": "quoted-ms-secret", '
+                    '"cookie": "quoted-cookie-secret", '
+                    '"ttwid": "quoted-ttwid-secret"}'
+                ),
+                "token": "raw-token-secret",
+            },
+            "headers",
+            "payload",
+            "token",
+        )
+
+        text = str(result)
+        for secret in (
+            "first-secret",
+            "second-secret",
+            "cHJveHktc2VjcmV0",
+            "third-secret",
+            "quoted-ms-secret",
+            "quoted-cookie-secret",
+            "quoted-ttwid-secret",
+            "raw-token-secret",
+        ):
+            self.assertNotIn(secret, text)
+        self.assertIn("Cookie: [已脱敏]", result["headers"])
+        self.assertIn("Proxy-Authorization: [已脱敏]", result["headers"])
+        self.assertIn("Authorization: [已脱敏]", result["headers"])
+        self.assertNotIn("Proxy-[已脱敏]", result["headers"])
+        self.assertNotIn("Basic cHJveHktc2VjcmV0", result["headers"])
+        self.assertEqual(result["token"], "[已脱敏]")
+
+    def test_path_suffix_does_not_skip_sensitive_keys_or_keep_cookie_directories(self):
+        result = debug_logger.pick_used(
+            {
+                "cookie_path": "dy_auth.json",
+                "cookie_file": r"C:\Users\MemoryLeak\AppData\dy_auth.json",
+                "token_path": "super-secret-token",
+                "save_path": r"C:\videos\demo.mp4",
+            },
+            "cookie_path",
+            "cookie_file",
+            "token_path",
+            "save_path",
+        )
+
+        self.assertEqual(result["cookie_path"], "dy_auth.json")
+        self.assertEqual(result["cookie_file"], "dy_auth.json")
+        self.assertNotIn("MemoryLeak", str(result["cookie_file"]))
+        self.assertEqual(result["token_path"], "[已脱敏]")
+        self.assertEqual(result["save_path"], r"C:\videos\demo.mp4")
+
+    def test_error_summary_keeps_only_cookie_file_name(self):
+        absolute = r"C:\Users\MemoryLeak\AppData\dy_auth.json"
+        original_latest = debug_logger.latest_error_summary_file
+        original_session = debug_logger.session_file
+        original_latest_log = debug_logger.latest_file
+        with tempfile.TemporaryDirectory() as temp_dir:
+            debug_logger.latest_error_summary_file = Path(temp_dir) / "latest_error_summary.md"
+            debug_logger.session_file = Path(temp_dir) / "session.log"
+            debug_logger.latest_file = Path(temp_dir) / "latest_debug.log"
+            try:
+                debug_logger.log_exception(
+                    "BiliAPI",
+                    "check_login",
+                    RuntimeError(f"Cookie 文件无法读取: {absolute}"),
+                    context={"cookie_path": absolute, "save_path": r"C:\videos\demo.mp4"},
+                )
+                summary = debug_logger.latest_error_summary_file.read_text(encoding="utf-8")
+            finally:
+                debug_logger.latest_error_summary_file = original_latest
+                debug_logger.session_file = original_session
+                debug_logger.latest_file = original_latest_log
+
+        self.assertNotIn("MemoryLeak", summary)
+        self.assertNotIn("AppData", summary)
+        self.assertIn("dy_auth.json", summary)
+        self.assertIn(r"C:\videos\demo.mp4", summary)
+
+    def test_log_line_redacts_entire_cookie_header(self):
+        original_latest = debug_logger.latest_error_summary_file
+        original_session = debug_logger.session_file
+        original_latest_log = debug_logger.latest_file
+        with tempfile.TemporaryDirectory() as temp_dir:
+            debug_logger.latest_error_summary_file = Path(temp_dir) / "latest_error_summary.md"
+            debug_logger.session_file = Path(temp_dir) / "session.log"
+            debug_logger.latest_file = Path(temp_dir) / "latest_debug.log"
+            try:
+                debug_logger.log(
+                    "ApiClient",
+                    "request",
+                    message="Cookie: a=1; b=2",
+                )
+                content = debug_logger.session_file.read_text(encoding="utf-8")
+            finally:
+                debug_logger.latest_error_summary_file = original_latest
+                debug_logger.session_file = original_session
+                debug_logger.latest_file = original_latest_log
+
+        self.assertIn("Cookie: [已脱敏]", content)
+        self.assertNotIn("a=1", content)
+        self.assertNotIn("b=2", content)
+
+    def test_explanation_redacts_cookie_path_written_on_its_own_line(self):
+        original_latest = debug_logger.latest_error_summary_file
+        original_session = debug_logger.session_file
+        original_latest_log = debug_logger.latest_file
+        cookie_path = r"C:\Users\MemoryLeak\AppData\secrets\bili.json"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            debug_logger.latest_error_summary_file = Path(temp_dir) / "latest_error_summary.md"
+            debug_logger.session_file = Path(temp_dir) / "session.log"
+            debug_logger.latest_file = Path(temp_dir) / "latest_debug.log"
+            try:
+                debug_logger.log(
+                    "BiliAPI",
+                    "check_login",
+                    message=(
+                        "请检查 Cookie 文件是否存在\n"
+                        f"{cookie_path}\n"
+                        r"输出仍在 C:\videos\demo.mp4"
+                    ),
+                )
+                content = debug_logger.session_file.read_text(encoding="utf-8")
+            finally:
+                debug_logger.latest_error_summary_file = original_latest
+                debug_logger.session_file = original_session
+                debug_logger.latest_file = original_latest_log
+
+        self.assertNotIn("MemoryLeak", content)
+        self.assertNotIn("AppData", content)
+        self.assertIn("bili.json", content)
+        self.assertIn(r"C:\videos\demo.mp4", content)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -154,6 +154,12 @@ def main(argv: list[str] | None = None) -> int:
     try:
         return int(handler(args))
     except KeyboardInterrupt:
+        from shared.cli_runner_runtime import current_runner, stop_runner_for_interrupt
+
+        failure = stop_runner_for_interrupt(current_runner())
+        if failure:
+            write_text_best_effort(sys.stderr, f"{failure}\n")
+            return int(CliExitCode.ERROR)
         write_text_best_effort(sys.stderr, "已取消\n")
         return int(CliExitCode.CANCELLED)
 

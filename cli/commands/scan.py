@@ -6,7 +6,7 @@ import argparse
 import sys
 
 from app.config import cfg
-from cli.exit_codes import exit_code_for_status
+from cli.exit_codes import CliExitCode, exit_code_for_status
 from shared import scan_command_runtime as runtime
 from shared.scan_command_runtime import add_scan_arguments
 from shared.sdk_cleanup import call_best_effort, write_text_best_effort
@@ -31,8 +31,14 @@ def handle_scan_command(args: argparse.Namespace) -> int:
         args,
         env=_runtime_env(),
     )
+    if outcome == "usage":
+        if error:
+            write_text_best_effort(sys.stderr, f"{error}\n")
+        return int(CliExitCode.USAGE)
     if error:
         write_text_best_effort(sys.stderr, f"{error}\n")
+    if isinstance(result, dict):
+        result["status"] = outcome
     if result is not None:
         call_best_effort(
             runtime.emit_result,

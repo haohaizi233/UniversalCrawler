@@ -379,7 +379,7 @@ def test_tools_run_interrupt_cancels_and_briefly_waits_on_the_same_api(
         ("run", ("media.probe", {}), {}),
         ("wait_for_run", ("run-42",), {"timeout": None}),
         ("cancel", ("run-42",), {}),
-        ("wait_for_run", ("run-42",), {"timeout": 1.0}),
+        ("wait_for_run", ("run-42",), {"timeout": None}),
     ]
     assert json.loads(capsys.readouterr().out)["status"] == "cancelled"
     assert api.close_calls == 1
@@ -537,7 +537,9 @@ def test_tools_cleanup_failure_is_observable_after_successful_operation(
 
     assert main(["tools", "list"]) == 1
     captured = capsys.readouterr()
-    assert json.loads(captured.out)["operation"] == "list"
+    payload = json.loads(captured.out)
+    assert payload["status"] == "error"
+    assert "cleanup" in payload["error"].lower()
     assert "cleanup" in captured.err.lower()
 
 
@@ -749,23 +751,26 @@ def test_tools_cleanup_annotation_cannot_replace_hostile_operation_error(
     assert raised.value is operation_error
 
 
-def test_tools_interrupt_returns_cancelled_even_when_cancel_cleanup_fails(
+def test_tools_interrupt_reports_shutdown_failure_instead_of_fake_cancel(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """Ctrl+C remains process cancellation when cancel or brief wait has trouble."""
+    """取消等待失败时返回关闭失败，不能伪造 cancelled。"""
     from cli.commands import tools as tools_command
     from cli.main import main
 
     api = RecordingToolsAPI()
+    wait_calls = 0
 
     def interrupted_wait(
         run_id: str,
         *,
         timeout: float | None = None,
     ) -> dict[str, str]:
+        nonlocal wait_calls
+        wait_calls += 1
         api.calls.append(("wait_for_run", (run_id,), {"timeout": timeout}))
-        if timeout is None:
+        if wait_calls == 1:
             raise KeyboardInterrupt
         raise TimeoutError("still stopping")
 
@@ -781,9 +786,9 @@ def test_tools_interrupt_returns_cancelled_even_when_cancel_cleanup_fails(
         lambda *, execution_profile: _bind(api, execution_profile),
     )
 
-    assert main(["tools", "run", "media.probe"]) == 130
+    assert main(["tools", "run", "media.probe"]) == 1
     captured = capsys.readouterr()
-    assert json.loads(captured.out) == {"status": "cancelled", "run_id": "run-42"}
+    assert json.loads(captured.out)["status"] == "error"
     assert "tool cancellation request failed" in captured.err
     assert "tool cancellation wait failed" in captured.err
 
@@ -805,14 +810,17 @@ def test_tools_interrupt_treats_ordinary_cancel_and_wait_failures_as_secondary(
     from cli.main import main
 
     api = RecordingToolsAPI()
+    wait_calls = 0
 
     def interrupted_wait(
         run_id: str,
         *,
         timeout: float | None = None,
     ) -> dict[str, str]:
+        nonlocal wait_calls
+        wait_calls += 1
         api.calls.append(("wait_for_run", (run_id,), {"timeout": timeout}))
-        if timeout is None:
+        if wait_calls == 1:
             raise KeyboardInterrupt
         raise brief_wait_error
 
@@ -828,9 +836,9 @@ def test_tools_interrupt_treats_ordinary_cancel_and_wait_failures_as_secondary(
         lambda *, execution_profile: _bind(api, execution_profile),
     )
 
-    assert main(["tools", "run", "media.probe"]) == 130
+    assert main(["tools", "run", "media.probe"]) == 1
     captured = capsys.readouterr()
-    assert json.loads(captured.out) == {"status": "cancelled", "run_id": "run-42"}
+    assert json.loads(captured.out)["status"] == "error"
     assert "tool cancellation request failed" in captured.err
     assert "tool cancellation wait failed" in captured.err
 
@@ -852,14 +860,17 @@ def test_tools_interrupt_survives_hostile_cancellation_error_metadata(
     from cli.main import main
 
     api = RecordingToolsAPI()
+    wait_calls = 0
 
     def interrupted_wait(
         run_id: str,
         *,
         timeout: float | None = None,
     ) -> dict[str, str]:
+        nonlocal wait_calls
+        wait_calls += 1
         api.calls.append(("wait_for_run", (run_id,), {"timeout": timeout}))
-        if timeout is None:
+        if wait_calls == 1:
             raise KeyboardInterrupt
         if stage == "brief_wait":
             raise HostileCancellationError()
@@ -879,9 +890,15 @@ def test_tools_interrupt_survives_hostile_cancellation_error_metadata(
         lambda *, execution_profile: _bind(api, execution_profile),
     )
 
-    assert main(["tools", "run", "media.probe"]) == 130
+    captured_code = main(["tools", "run", "media.probe"])
     captured = capsys.readouterr()
-    assert json.loads(captured.out) == {"status": "cancelled", "run_id": "run-42"}
+    payload = json.loads(captured.out)
+    if stage == "brief_wait":
+        assert captured_code == 1
+        assert payload["status"] == "error"
+    else:
+        assert captured_code == 130
+        assert payload == {"status": "cancelled", "run_id": "run-42"}
     assert expected_diagnostic in captured.err
 
 
@@ -946,14 +963,17 @@ def test_tools_interrupt_does_not_swallow_control_flow_during_compensation(
 
     api = RecordingToolsAPI()
     control_error = control_type(*control_args)
+    wait_calls = 0
 
     def interrupted_wait(
         run_id: str,
         *,
         timeout: float | None = None,
     ) -> dict[str, str]:
+        nonlocal wait_calls
+        wait_calls += 1
         api.calls.append(("wait_for_run", (run_id,), {"timeout": timeout}))
-        if timeout is None:
+        if wait_calls == 1:
             raise KeyboardInterrupt
         if stage == "brief_wait":
             raise control_error
@@ -978,7 +998,7 @@ def test_tools_interrupt_does_not_swallow_control_flow_during_compensation(
 
 
 @pytest.mark.parametrize("close_mode", ("false", "exception"))
-def test_tools_interrupt_stays_cancelled_when_ordinary_close_cleanup_fails(
+def test_tools_interrupt_cleanup_failure_is_not_reported_as_cancelled(
     close_mode: str,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -1012,9 +1032,9 @@ def test_tools_interrupt_stays_cancelled_when_ordinary_close_cleanup_fails(
         lambda *, execution_profile: _bind(api, execution_profile),
     )
 
-    assert main(["tools", "run", "media.probe"]) == 130
+    assert main(["tools", "run", "media.probe"]) == 1
     captured = capsys.readouterr()
-    assert json.loads(captured.out) == {"status": "cancelled", "run_id": "run-42"}
+    assert json.loads(captured.out)["status"] == "error"
     assert "cleanup" in captured.err.lower()
     assert api.close_calls == 1
 

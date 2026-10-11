@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -21,6 +22,218 @@ from shared.spider_session_runtime import SpiderSession, SpiderSessionBindings
 
 # 保持 CLI 输出实时刷新，便于下载和选择流程即时反馈
 os.environ.setdefault("PYTHONUNBUFFERED", "1")
+
+_SECRET_FIELD_NAMES = {"cookie", "cookies"}
+_SUCCESS_ITEM_STATUSES = {
+    "✅ 完成",
+    "completed",
+    "✅ 本地",
+    "local",
+    "📋 已收集",
+}
+_COMMAND_STATUSES = {"ok", "error", "partial", "timeout", "cancelled", "usage"}
+_COOKIE_ASSIGNMENT = re.compile(
+    r"(?i)\b(?:cookie|cookies)\b\s*[:=]\s*"
+)
+_NEXT_HEADER = re.compile(
+    r"(?i)(?:proxy-authorization|authorization|cookie|cookies)\b\s*[:=]"
+)
+_PROXY_USERINFO = re.compile(
+    r"([a-zA-Z][a-zA-Z0-9+.-]*://)(?:[^/\s:@]+(?::[^/\s@]*)?@)"
+)
+_current_runner: "CLIRunner | None" = None
+
+
+def current_runner() -> "CLIRunner | None":
+    """返回当前正在执行的 CLI 运行器，供 Ctrl+C 收尾。"""
+
+    return _current_runner
+
+
+def redact_proxy_userinfo(value: str) -> str:
+    """去掉代理 URL 中的用户名和密码，保留主机与端口。"""
+
+    return _PROXY_USERINFO.sub(r"\1", value)
+
+
+def _cookie_value_length(text: str) -> int:
+    """Consume a whole Cookie header value, including later semicolon segments."""
+
+    segment = re.match(r"[^\s,;]+", text)
+    if segment is None:
+        return 0
+    end = segment.end()
+    while True:
+        separator = re.match(r"[ \t]*;[ \t]*", text[end:])
+        if separator is None:
+            break
+        rest_index = end + separator.end()
+        rest = text[rest_index:]
+        if _NEXT_HEADER.match(rest):
+            break
+        if rest.lower().startswith(("http://", "https://")):
+            break
+        next_segment = re.match(r"[^\s,;]+", rest)
+        if next_segment is None:
+            break
+        end = rest_index + next_segment.end()
+    return end
+
+
+def _redact_cookie_assignments(text: str) -> str:
+    pieces: list[str] = []
+    cursor = 0
+    for match in _COOKIE_ASSIGNMENT.finditer(text):
+        if match.start() < cursor:
+            continue
+        value_end = match.end() + _cookie_value_length(text[match.end() :])
+        pieces.append(text[cursor : match.end()])
+        pieces.append("[redacted]")
+        cursor = value_end
+    if not pieces:
+        return text
+    pieces.append(text[cursor:])
+    return "".join(pieces)
+
+
+def redact_text(value: str, secrets: tuple[str, ...] = ()) -> str:
+    """从日志或错误文本中去掉 cookie 值和代理用户信息。"""
+
+    text = redact_proxy_userinfo(value)
+    for secret in secrets:
+        if isinstance(secret, str) and len(secret) >= 4 and secret in text:
+            text = text.replace(secret, "[redacted]")
+    return _redact_cookie_assignments(text)
+
+
+def redact_public_value(value: Any, secrets: tuple[str, ...] = ()) -> Any:
+    """公开结果去掉 cookie、cookies，并脱敏 proxy 用户信息。"""
+
+    if isinstance(value, dict):
+        redacted: dict[Any, Any] = {}
+        for key, item in value.items():
+            name = str(key).lower()
+            if name in _SECRET_FIELD_NAMES:
+                continue
+            if name == "proxy" and isinstance(item, str):
+                redacted[key] = redact_proxy_userinfo(item)
+            else:
+                redacted[key] = redact_public_value(item, secrets)
+        return redacted
+    if isinstance(value, list):
+        return [redact_public_value(item, secrets) for item in value]
+    if isinstance(value, tuple):
+        return [redact_public_value(item, secrets) for item in value]
+    if isinstance(value, str):
+        return redact_text(value, secrets)
+    return value
+
+
+def configured_secrets(config: dict | None) -> tuple[str, ...]:
+    """收集配置里的 cookie 原文，供日志替换。"""
+
+    found: list[str] = []
+
+    def walk(value: Any, key: str | None = None) -> None:
+        if key in _SECRET_FIELD_NAMES:
+            if isinstance(value, str):
+                found.append(value)
+            elif isinstance(value, dict):
+                for item in value.values():
+                    if isinstance(item, str):
+                        found.append(item)
+            return
+        if isinstance(value, dict):
+            for child_key, child in value.items():
+                walk(child, str(child_key).lower())
+        elif isinstance(value, list):
+            for child in value:
+                walk(child, key)
+
+    walk(config or {})
+    return tuple(dict.fromkeys(found))
+
+
+def project_download_result(raw: dict) -> dict[str, str]:
+    """下载公开结果只保留路径、状态和错误。"""
+
+    status = str(raw.get("status") or "error").strip().lower()
+    if status == "canceled":
+        status = "cancelled"
+    if status not in _COMMAND_STATUSES:
+        status = "error"
+    path = raw.get("local_path") or ""
+    if not isinstance(path, str):
+        path = "" if path is None else str(path)
+    error = raw.get("error")
+    if not error and isinstance(raw.get("meta"), dict):
+        meta = raw["meta"]
+        error = meta.get("download_error") or meta.get("shutdown_error") or ""
+    error_text = "" if error is None else str(error)
+    return {
+        "status": status,
+        "local_path": redact_text(path),
+        "error": redact_text(error_text),
+    }
+
+
+def _item_download_succeeded(item: Any) -> bool:
+    if not isinstance(item, dict):
+        return False
+    text = str(item.get("status") or "").strip()
+    return text in _SUCCESS_ITEM_STATUSES or text.lower() in _SUCCESS_ITEM_STATUSES
+
+
+def command_status_for_result(result: dict | None, *, download: bool) -> str:
+    """按运行器错误或条目终态得到与退出码一致的命令状态。
+
+    ``error`` 字段只代表运行器错误。下载失败不写入该字段，而是根据条目
+    终态汇总为 ``error`` 或 ``partial``。
+    """
+
+    payload = result if isinstance(result, dict) else {}
+    raw = str(payload.get("status") or "error").strip().lower()
+    if raw == "canceled":
+        raw = "cancelled"
+    if raw in {"timeout", "cancelled", "usage"}:
+        return raw
+    if payload.get("error"):
+        return "error"
+    if not download:
+        return "ok" if raw == "ok" else "error"
+    items = payload.get("items")
+    if not isinstance(items, list) or not items:
+        return "ok" if raw == "ok" else "error"
+    successes = sum(1 for item in items if _item_download_succeeded(item))
+    failures = len(items) - successes
+    if failures and successes:
+        return "partial"
+    if failures:
+        return "error"
+    return "ok"
+
+
+def stop_runner_for_interrupt(runner: Any) -> str | None:
+    """停止运行器并等待 spider 与下载进入终态。
+
+    返回明确的关闭失败说明；进入终态时返回 ``None``。
+    """
+
+    if runner is None:
+        return None
+    stop = getattr(runner, "stop", None)
+    if callable(stop):
+        stop()
+    wait = getattr(runner, "wait_for_terminal", None)
+    if callable(wait):
+        failure = wait()
+        if isinstance(failure, str) and failure:
+            return failure
+        return None
+    failure = getattr(runner, "_stop_failure", None)
+    if isinstance(failure, str) and failure:
+        return failure
+    return None
 
 def _video_status_enum():
     from app.core.state import VideoStatus
@@ -89,10 +302,30 @@ class CLIRunner(ControllerSessionMixin):
         self._cancelled: bool = False       # 选择或 stop() 触发的取消状态
         self._progress_logged_pct: dict[str, int] = {}
         self._last_download_heartbeat_at: float = 0.0
+        self._stop_summary: dict | None = None
+        self._stop_failure: str | None = None
+        self._previous_runner: CLIRunner | None = None
+
+    def _secrets(self) -> tuple[str, ...]:
+        return configured_secrets(self.config)
+
+    def _redact_text(self, message: str) -> str:
+        return redact_text(message, self._secrets())
+
+    def _activate_current(self) -> None:
+        global _current_runner
+        self._previous_runner = _current_runner
+        _current_runner = self
+
+    def _deactivate_current(self) -> None:
+        global _current_runner
+        if _current_runner is self:
+            _current_runner = self._previous_runner
 
     def _log(self, msg: str) -> None:
+        safe = self._redact_text(str(msg))
         if self.verbose:
-            sys.stderr.write(f"[CLI] {msg}\n")
+            sys.stderr.write(f"[CLI] {safe}\n")
             sys.stderr.flush()
 
     def _debug_log(self, action: str, message: str, status_code: str,
@@ -103,19 +336,20 @@ class CLIRunner(ControllerSessionMixin):
             debug_logger.log(
                 component="CLIRunner",
                 action=action,
-                message=message,
+                message=self._redact_text(message),
                 status_code=status_code,
                 level=level,
-                details=details or {},
+                details=redact_public_value(details or {}, self._secrets()),
             )
         except Exception:
             pass  # 诊断日志不是 CLI 执行成功的前置条件。
 
     def _on_log(self, msg: str) -> None:
         """缓存 spider 日志，并按配置实时转发到 stderr。"""
-        self.logs.append(str(msg))
+        safe = self._redact_text(str(msg))
+        self.logs.append(safe)
         if self.log_to_stderr:
-            sys.stderr.write(f"{msg}\n")
+            sys.stderr.write(f"{safe}\n")
             sys.stderr.flush()
 
     def _on_item_found(self, item) -> None:
@@ -252,24 +486,24 @@ class CLIRunner(ControllerSessionMixin):
 
     def _build_download_finished_log_details(self, item) -> dict[str, Any]:
         return {
-            "video_id": item.id,
-            "title": item.title,
-            "local_path": item.local_path or "",
+            "local_path": self._redact_text(item.local_path or ""),
+            "status": str(getattr(item, "status", "") or ""),
+            "error": "",
         }
 
     def _build_download_error_log_details(self, item, error: str) -> dict[str, Any]:
         return {
-            "video_id": item.id,
-            "title": item.title,
-            "error": error,
+            "local_path": self._redact_text(getattr(item, "local_path", "") or ""),
+            "status": str(getattr(item, "status", "") or ""),
+            "error": self._redact_text(str(error)),
         }
 
     def _format_download_finished_message(self, item) -> str:
-        local_path = item.local_path or ""
+        local_path = self._redact_text(item.local_path or "")
         return f"✅ 下载完成: {item.title}" + (f" → {local_path}" if local_path else "")
 
     def _format_download_error_message(self, item, error: str) -> str:
-        return f"❌ 下载失败 [{item.title}]: {error}"
+        return f"❌ 下载失败 [{item.title}]: {self._redact_text(str(error))}"
 
     @staticmethod
     def _render_progress_bar(progress: int, width: int = 18) -> str:
@@ -404,6 +638,26 @@ class CLIRunner(ControllerSessionMixin):
         return True
 
     def run(self) -> dict:
+        """执行任务；无论成功、失败还是中断，都在 finally 中停止残留工作。"""
+
+        self._activate_current()
+        try:
+            try:
+                result = self._execute()
+            finally:
+                failure = self._release_after_run()
+            if (
+                failure
+                and isinstance(result, dict)
+                and result.get("status") in {"ok", "partial", "cancelled"}
+            ):
+                result["status"] = "error"
+                result["error"] = failure
+            return result
+        finally:
+            self._deactivate_current()
+
+    def _execute(self) -> dict:
         """执行任务并返回稳定的 CLI 结果字典。
 
         ``status`` 为 ``ok``、``error``、``timeout`` 或 ``cancelled``。返回值还含
@@ -458,12 +712,16 @@ class CLIRunner(ControllerSessionMixin):
         # 所有回调安装完成后再启动 spider。
         self._log(f"🟢 启动任务 | 模式: {plugin.name} | 关键词: {self.keyword}")
         # 启动记录包含可诊断的活动配置摘要。
+        active_config = redact_public_value(
+            self._summarize_active_config(self.config),
+            self._secrets(),
+        )
         self._debug_log("start_crawl", "CLI 启动爬虫任务", "CLI_CRAWL_START",
                          details={
                              "keyword": self.keyword,
                              "source_id": self.source,
                              "plugin_name": plugin.name,
-                             "active_config": self._summarize_active_config(self.config),
+                             "active_config": active_config,
                          })
         spider.start()
 
@@ -517,9 +775,10 @@ class CLIRunner(ControllerSessionMixin):
         # 取消是独立终态，不与一般错误合并。
         if self._cancelled:
             self._log("用户取消操作")
-            return self._build_result("cancelled", start, "用户取消")
+            return self._finalize_result(self._build_result("cancelled", start, "用户取消"))
 
-        return self._build_result("ok" if not self.error else "error", start)
+        preliminary = "error" if self.error else "ok"
+        return self._finalize_result(self._build_result(preliminary, start))
 
     def _wait_downloads(self, timeout: float = 300) -> bool:
         """等待所有下载任务完成。
@@ -533,8 +792,8 @@ class CLIRunner(ControllerSessionMixin):
         if not self._dl_manager:
             return False
 
-        deadline = time.time() + timeout
-        while time.time() < deadline:
+        deadline = None if timeout is None else time.time() + timeout
+        while deadline is None or time.time() < deadline:
             counter = getattr(self._dl_manager, "pending_work_counts", None)
             counts = counter() if callable(counter) else None
             if isinstance(counts, (tuple, list)) and len(counts) == 2:
@@ -545,7 +804,7 @@ class CLIRunner(ControllerSessionMixin):
             if active == 0 and queued == 0:
                 return False
             self._emit_download_heartbeat()
-            time.sleep(0.5)
+            time.sleep(0.05 if deadline is None else 0.5)
         return True
 
     def _reconcile_download_states(self) -> None:
@@ -577,11 +836,16 @@ class CLIRunner(ControllerSessionMixin):
 
         # 对外结果保持列表形状，内部仍按 video_id 去重。
         items = []
+        secrets = self._secrets()
         for item in self.videos.values():
             try:
-                items.append(item.to_dict())
+                payload = item.to_dict()
             except Exception as e:
                 self._log(f"item 转换失败: {e}")
+                continue
+            if isinstance(payload, dict):
+                payload = redact_public_value(payload, secrets)
+            items.append(payload)
 
         result = {
             "status": status,
@@ -589,20 +853,134 @@ class CLIRunner(ControllerSessionMixin):
             "keyword": self.keyword,
             "save_dir": self.save_dir,
             "items": items,
-            "logs": self.logs,
+            "logs": [self._redact_text(str(entry)) for entry in self.logs],
             "selection_count": self.selection_count,
             "elapsed": elapsed,
             "error": error or self.error,
         }
         return result
 
+    def _finalize_result(self, result: dict) -> dict:
+        """下载失败按条目终态汇总，且不把下载失败写成运行器错误。"""
+
+        if result.get("status") not in {"timeout", "cancelled"}:
+            result["status"] = command_status_for_result(
+                result,
+                download=self.download,
+            )
+            if not self.error:
+                result["error"] = None
+        return redact_public_value(result, self._secrets())
+
+    def _request_stop(self) -> str | None:
+        """请求 spider 与下载停止，并记录明确的关闭失败。"""
+
+        failure = None
+        spider = self._spider
+        if spider is not None:
+            try:
+                running = bool(spider.isRunning())
+            except Exception:
+                running = True
+            if running:
+                try:
+                    self._spider_session.stop_session(spider)
+                except Exception as exc:
+                    failure = f"spider shutdown failed: {exc}"
+        manager = self._dl_manager
+        if manager is None:
+            return failure
+        try:
+            summary = manager.stop_all()
+        except Exception as exc:
+            return failure or f"download shutdown failed: {exc}"
+        if summary is False:
+            return failure or "download shutdown did not reach a terminal state"
+        if isinstance(summary, dict):
+            self._stop_summary = summary
+            unfinished = summary.get("unfinished_workers") or []
+            if (
+                unfinished
+                or summary.get("all_workers_stopped") is False
+                or summary.get("dispatcher_stopped") is False
+            ):
+                failure = failure or "download shutdown did not reach a terminal state"
+        return failure
+
+    def _await_terminal(self) -> str | None:
+        """等待 spider 不再运行且下载队列清空。"""
+
+        spider = self._spider
+        if spider is not None:
+            try:
+                if not self._wait_spider(spider, timeout=None):
+                    return "spider shutdown did not reach a terminal state"
+            except Exception as exc:
+                return f"spider shutdown failed: {exc}"
+        summary = self._stop_summary
+        if isinstance(summary, dict):
+            unfinished = summary.get("unfinished_workers") or []
+            if (
+                unfinished
+                or summary.get("all_workers_stopped") is False
+                or summary.get("dispatcher_stopped") is False
+            ):
+                return "download shutdown did not reach a terminal state"
+        if self._dl_manager is not None:
+            try:
+                if self._wait_downloads(timeout=None):
+                    return "download shutdown did not reach a terminal state"
+            except Exception as exc:
+                return f"download shutdown failed: {exc}"
+        return None
+
+    def _downloads_idle(self) -> bool:
+        manager = self._dl_manager
+        if manager is None:
+            return True
+        counter = getattr(manager, "pending_work_counts", None)
+        counts = counter() if callable(counter) else None
+        if isinstance(counts, (tuple, list)) and len(counts) == 2:
+            active, queued = counts
+            return active == 0 and queued == 0
+        workers = getattr(manager, "workers", []) or []
+        queue = getattr(manager, "queue", None)
+        queued = queue.qsize() if queue is not None and hasattr(queue, "qsize") else 0
+        return len(workers) == 0 and queued == 0
+
+    def _release_after_run(self) -> str | None:
+        """停止仍在运行的 spider 与下载；已进入终态时不再重复关闭。"""
+
+        spider_running = False
+        if self._spider is not None:
+            try:
+                spider_running = bool(self._spider.isRunning())
+            except Exception:
+                spider_running = True
+        if self._cancelled or spider_running or not self._downloads_idle():
+            failure = self._request_stop()
+            if not failure:
+                failure = self._await_terminal()
+            if failure:
+                self._stop_failure = failure
+        return self._stop_failure
+
+    def wait_for_terminal(self) -> str | None:
+        """返回已记录的关闭失败；否则继续等到终态。"""
+
+        if self._stop_failure:
+            return self._stop_failure
+        failure = self._await_terminal()
+        if failure:
+            self._stop_failure = failure
+        return failure
+
     def stop(self) -> None:
         """标记取消并停止当前 spider 与下载管理器。"""
         self._cancelled = True
-        if self._spider and self._spider.isRunning():
-            self._spider_session.stop_session(self._spider)
-        if self._dl_manager:
-            self._dl_manager.stop_all()
+        failure = self._request_stop()
+        if failure:
+            self._stop_failure = failure
 
 def run_search(
     source: str,

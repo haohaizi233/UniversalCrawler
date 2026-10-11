@@ -14,8 +14,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
+from shared.cli_runner_runtime import (
+    command_status_for_result,
+    redact_public_value,
+    stop_runner_for_interrupt,
+)
 from shared.execution_profile import ExecutionProfile, local_execution_profile
 from shared.runtime_options import compose_runtime_config
+from shared.sdk_cleanup import write_text_best_effort
 
 @dataclass(slots=True)
 class SearchCommandEnv:
@@ -232,7 +238,7 @@ def run_search_command(args: argparse.Namespace, *, env: SearchCommandEnv) -> tu
 
     error = validate_args(args, env=env)
     if error:
-        return "usage", {"status": "error", "error": error.removeprefix("❌ ").strip()}
+        return "usage", {"status": "usage", "error": error.removeprefix("❌ ").strip()}
 
     save_dir = getattr(args, "save_dir", None) or env.get_default_save_dir()
     execution_profile = _local_cli_profile(save_dir)
@@ -240,7 +246,7 @@ def run_search_command(args: argparse.Namespace, *, env: SearchCommandEnv) -> tu
     try:
         strategy = build_selection_strategy(args, env=env)
     except (TypeError, ValueError) as exc:
-        return "usage", {"status": "error", "error": str(exc)}
+        return "usage", {"status": "usage", "error": str(exc)}
     command_timeout, legacy_used = resolve_command_timeout(args)
     if legacy_used:
         sys.stderr.write("⚠️ --run-timeout 已弃用，请使用 --timeout\n")
@@ -257,18 +263,52 @@ def run_search_command(args: argparse.Namespace, *, env: SearchCommandEnv) -> tu
         download=not getattr(args, "no_download", False),
         execution_profile=execution_profile,
     )
-    result = runner.run()
-    status = str(result.get("status", "error"))
-    if status not in {"ok", "error", "timeout", "cancelled"}:
+    download = not getattr(args, "no_download", False)
+    try:
+        result = runner.run()
+    except KeyboardInterrupt:
+        failure = stop_runner_for_interrupt(runner)
+        if failure:
+            return "error", {"status": "error", "error": failure}
+        return "cancelled", {
+            "status": "cancelled",
+            "source": source,
+            "keyword": resolve_keyword(args),
+            "save_dir": save_dir,
+            "items": [],
+            "logs": [],
+            "selection_count": 0,
+            "elapsed": 0,
+            "error": "已取消",
+        }
+    if not isinstance(result, dict):
+        return "error", {"status": "error", "error": "运行器返回了无效结果"}
+    result = redact_public_value(result)
+    status = command_status_for_result(result, download=download)
+    if status not in {"ok", "error", "partial", "timeout", "cancelled"}:
         status = "error"
+    result["status"] = status
     return status, result
 
 def print_pretty(result: dict) -> None:
-    if result.get("status") != "ok":
-        sys.stderr.write(f"❌ {result.get('status')}: {result.get('error', '')}\n")
+    status = str(result.get("status") or "error")
+    if status == "usage":
+        write_text_best_effort(sys.stderr, f"❌ {result.get('error', '')}\n")
         return
+    if status not in {"ok", "partial"} and not result.get("items"):
+        write_text_best_effort(
+            sys.stderr,
+            f"❌ {status}: {result.get('error', '')}\n",
+        )
+        return
+    if status != "ok":
+        write_text_best_effort(
+            sys.stderr,
+            f"❌ {status}: {result.get('error') or '下载未全部完成'}\n",
+        )
 
-    sys.stdout.write(f"✅ 状态: {result['status']}\n")
+    marker = "✅" if status == "ok" else "❌"
+    sys.stdout.write(f"{marker} 状态: {result['status']}\n")
     sys.stdout.write(f"📂 平台: {result['source']}\n")
     sys.stdout.write(f"🔍 关键词: {result['keyword']}\n")
     sys.stdout.write(f"💾 保存目录: {result['save_dir']}\n")
@@ -294,6 +334,11 @@ def print_pretty(result: dict) -> None:
         sys.stdout.write("\n")
 
 def emit_result(result: dict, *, pretty: bool) -> None:
+    status = str(result.get("status") or "").lower()
+    if status == "usage":
+        message = str(result.get("error") or "参数错误")
+        write_text_best_effort(sys.stderr, f"❌ {message}\n")
+        return
     if pretty:
         print_pretty(result)
     else:

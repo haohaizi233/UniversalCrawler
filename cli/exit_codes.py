@@ -24,6 +24,7 @@ _STATUS_CODES = {
     "timeout": CliExitCode.TIMEOUT,
     "cancelled": CliExitCode.CANCELLED,
     "canceled": CliExitCode.CANCELLED,
+    "partial": CliExitCode.ERROR,
 }
 
 

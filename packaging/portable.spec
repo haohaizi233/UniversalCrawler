@@ -132,7 +132,7 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[str(project_root / "packaging" / "runtime_hook.py")],
-    excludes=["tkinter"],
+    excludes=["tkinter", "PySide6", "PySide2", "PyQt5"],
     noarchive=False,
     optimize=0,
 )

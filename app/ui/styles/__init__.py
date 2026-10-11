@@ -5,6 +5,7 @@ from .themes import (
     LIGHT_STYLESHEET,
     apply_application_theme,
     apply_dialog_theme,
+    apply_opaque_fullscreen_theme,
     build_palette,
     generate_stylesheet,
     polish_data_views,
@@ -15,6 +16,7 @@ from .themes import (
 __all__ = [
     "apply_application_theme",
     "apply_dialog_theme",
+    "apply_opaque_fullscreen_theme",
     "build_palette",
     "generate_stylesheet",
     "polish_data_views",

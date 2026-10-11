@@ -42,18 +42,6 @@ def _signal_update_download_cancel(window: Any) -> None:
         cancel_event.set()
 
 
-def _join_update_download_thread(window: Any) -> None:
-    worker = window.__dict__.get("_update_download_thread")
-    if worker is threading.current_thread():
-        return
-    is_alive = getattr(worker, "is_alive", None)
-    if callable(is_alive) and is_alive():
-        join = getattr(worker, "join", None)
-        if not callable(join):
-            return
-        join(timeout=window.UPDATE_DOWNLOAD_SHUTDOWN_JOIN_SECONDS)
-
-
 def _shutdown_owned_service(window: Any, owner_flag: str, attribute: str) -> None:
     service = window.__dict__.get(attribute)
     if not window.__dict__.get(owner_flag, False) or service is None:
@@ -120,7 +108,6 @@ def shutdown_main_window(window: Any, event: Any) -> ShutdownFailure | None:
         steps: tuple[tuple[str, Callable[[], Any]], ...] = (
             ("update_download.mark_shutdown", lambda: _mark_update_download_shutdown(window)),
             ("update_download.cancel", lambda: _signal_update_download_cancel(window)),
-            ("update_download.join", lambda: _join_update_download_thread(window)),
             ("ui_update_scheduler.stop", lambda: window._ui_update_scheduler.stop()),
             (
                 "frontend_snapshot_worker.shutdown",

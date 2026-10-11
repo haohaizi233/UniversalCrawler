@@ -12,7 +12,7 @@ from PyQt6.QtCore import QObject
 from PyQt6.QtWidgets import QApplication
 
 from app.ui.layout.app_shell import AppShell
-from app.ui.pages.active_downloads_page import ActiveDownloadsPage
+from app.ui.pages.active_downloads_page import ActiveDownloadsPage, ActiveDownloadsTable
 from app.ui.pages.completed_page import CompletedPage
 from app.ui.pages.download_queue_page import DownloadQueuePage
 from app.ui.pages.failed_page import FailedPage
@@ -153,6 +153,102 @@ class QtLifecycleTests(unittest.TestCase):
             shell.deleteLater()
             self.assertEqual(probe.calls, 1)
         finally:
+            self.app.processEvents()
+
+    def test_progress_snapshot_updates_cells_without_touching_download_options(self) -> None:
+        page = ActiveDownloadsPage()
+        try:
+            page.table.set_rows(
+                [
+                    {"id": "a", "title": "A", "platform": "Bilibili", "progress": 10, "speed": "1", "remaining_time": "9"},
+                    {"id": "b", "title": "B", "platform": "Bilibili", "progress": 20, "speed": "2", "remaining_time": "8"},
+                ]
+            )
+            page.auto_retry.setChecked(False)
+            thread_index = page.thread_combo.findData(1)
+            self.assertGreaterEqual(thread_index, 0)
+            page.thread_combo.setCurrentIndex(thread_index)
+            resets: list[bool] = []
+            page.table.model().modelReset.connect(lambda: resets.append(True))
+
+            page.render(
+                {
+                    "active_downloads_update_kind": "progress",
+                    "download_options": {"auto_retry": True, "max_retries": 1, "max_concurrent": 8},
+                    "active_downloads": [
+                        {"id": "b", "title": "replaced", "progress": 55, "speed": "9MB/s", "remaining_time": "1s"}
+                    ],
+                }
+            )
+
+            self.assertFalse(page.auto_retry.isChecked())
+            self.assertEqual(page.thread_combo.currentData(), 1)
+            self.assertEqual(resets, [])
+            model = page.table.model()
+            row = model.row_for_id("b")
+            self.assertEqual(model.data(model.index(row, 0)), "B")
+            self.assertEqual(model.data(model.index(row, 2)), 55)
+        finally:
+            page.deleteLater()
+            self.app.processEvents()
+
+    def test_active_download_table_restores_scroll_around_row_change(self) -> None:
+        table = ActiveDownloadsTable()
+        try:
+            rows = [
+                {
+                    "id": f"v{index}",
+                    "title": str(index),
+                    "platform": "Bilibili",
+                    "progress": index,
+                    "speed": "1",
+                    "remaining_time": "1",
+                }
+                for index in range(40)
+            ]
+            table.set_rows(rows)
+            table.resize(480, 180)
+            table.show()
+            self.app.processEvents()
+            scrollbar = table.verticalScrollBar()
+            self.assertGreater(scrollbar.maximum(), 0)
+            scrollbar.setValue(8)
+            saved = scrollbar.value()
+            self.assertGreater(saved, 0)
+            resets: list[bool] = []
+            table.model().modelReset.connect(lambda: resets.append(True))
+
+            table.set_rows(rows[:12] + [{"id": "mid", "title": "mid", "platform": "Bilibili", "progress": 1, "speed": "1", "remaining_time": "1"}] + rows[12:])
+
+            self.assertEqual(resets, [])
+            self.assertEqual(scrollbar.value(), min(saved, scrollbar.maximum()))
+        finally:
+            table.close()
+            table.deleteLater()
+            self.app.processEvents()
+
+    def test_progress_kind_skips_active_page_render_and_updates_status_bar(self) -> None:
+        shell = AppShell(is_dark_theme=False, style_provider=self.app)
+        try:
+            shell.current_page_id = "active"
+            page_calls: list[str] = []
+            status_calls: list[dict] = []
+            shell.pages["active"].render = lambda _snapshot: page_calls.append("page")
+            shell.status_bar.render = lambda status: status_calls.append(dict(status))
+
+            shell.render(
+                {
+                    "active_downloads_update_kind": "progress",
+                    "active_downloads": [{"id": "a", "progress": 40, "speed": "1", "remaining_time": "2"}],
+                    "app_status": {"active_count": 1},
+                },
+                changed_sections={"active_downloads", "app_status"},
+            )
+
+            self.assertEqual(page_calls, [])
+            self.assertEqual(status_calls, [{"active_count": 1}])
+        finally:
+            shell.deleteLater()
             self.app.processEvents()
 
 

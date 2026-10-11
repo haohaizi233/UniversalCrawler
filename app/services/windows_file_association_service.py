@@ -8,6 +8,7 @@ from ctypes import wintypes
 import hashlib
 import os
 import subprocess
+import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -67,14 +68,23 @@ class WindowsFileAssociationService:
 
         import winreg
 
-        executable = str(Path(executable_path).resolve())
-        executable_name = Path(executable).name
-        app_prog_id = fr"Applications\{executable_name}"
-        command = f'"{executable}" "%1"'
+        frozen = bool(getattr(sys, "frozen", False))
+        if frozen:
+            executable = str(Path(executable_path).resolve())
+            executable_name = Path(executable).name
+            app_prog_id = fr"Applications\{executable_name}"
+            command = f'"{executable}" "%1"'
+        else:
+            # 源码运行与重启使用同一启动向量，不能把 sys.argv[0] 的 .py 脚本写进打开命令。
+            executable = str(Path(sys.executable).resolve())
+            executable_name = "UniversalCrawlerPro.exe"
+            app_prog_id = fr"Applications\{executable_name}"
+            command = f'"{executable}" -m entry.gui_entry "%1"'
         icon = f"{executable},0"
 
-        self._set_string(winreg, fr"Software\Microsoft\Windows\CurrentVersion\App Paths\{executable_name}", "", executable)
-        self._set_string(winreg, fr"Software\Microsoft\Windows\CurrentVersion\App Paths\{executable_name}", "Path", str(Path(executable).parent))
+        if frozen:
+            self._set_string(winreg, fr"Software\Microsoft\Windows\CurrentVersion\App Paths\{executable_name}", "", executable)
+            self._set_string(winreg, fr"Software\Microsoft\Windows\CurrentVersion\App Paths\{executable_name}", "Path", str(Path(executable).parent))
         self._set_string(winreg, r"Software\RegisteredApplications", self.app_name, APP_REGISTRATION_PATH)
         self._set_string(winreg, APP_REGISTRATION_PATH, "ApplicationName", self.app_name)
         self._set_string(

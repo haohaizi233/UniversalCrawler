@@ -5,6 +5,7 @@ from __future__ import annotations
 import sys
 import threading
 import time
+from types import SimpleNamespace
 
 from pathlib import Path
 from PyQt6.QtCore import QByteArray, QEvent, QPoint, QRect, QSignalBlocker, QSize, Qt, QTimer, pyqtSignal
@@ -42,6 +43,7 @@ from app.services.secure_updater import (
 from app.ui.connection_registry import ConnectionRegistry
 from app.ui.gui_runtime_adapter import QtGuiRuntimeAdapter
 from app.ui.dialogs import FileAssociationDialog
+from app.ui.dialogs.file_paths import resolve_existing_directory
 from app.ui.dialogs.selection import SelectionDialog
 from app.ui.dialogs.update_check import UpdateCheckDialog, UpdateDownloadDialog
 from app.ui.layout.app_shell import AppShell
@@ -64,6 +66,7 @@ from shared.execution_profile import (
     local_execution_profile,
 )
 from app.ui.plugin_settings import read_plugin_run_options
+from app.ui.main_window_theme import apply_main_window_theme_stylesheet
 from app.ui.styles import apply_application_theme, build_palette
 from app.ui.ui_update_scheduler import UiUpdateScheduler
 from app.ui import window_state_persistence
@@ -1402,6 +1405,8 @@ class MainWindow(QMainWindow):
 
     def _finish_setting_update(self, payload: dict[str, object], action_result: dict[str, object]) -> None:
         if action_result.get("status") != "ok":
+            if str(payload.get("key") or "") in {"download_directory", "save_directory"}:
+                self._rollback_pending_save_dir()
             self.append_log(str(action_result.get("message") or "setting update failed"), level="ERROR")
             self.refresh_frontend_state(topics={"settings.update"}, force=True)
             return
@@ -1417,6 +1422,7 @@ class MainWindow(QMainWindow):
             getattr(frontend_state_service, "_config_events_drive_runtime", False) is True
         )
         if normalized_section == "common" and config_key == "save_directory":
+            self.__dict__.pop("_pending_save_dir_rollback", None)
             directory = str(data.get("directory") or value or "")
             if directory and not config_observer_owns_runtime:
                 changed = directory != self.current_save_dir
@@ -1648,6 +1654,8 @@ class MainWindow(QMainWindow):
         self._begin_theme_transition(not bool(self.is_dark_theme))
 
     def _begin_theme_transition(self, is_dark: bool) -> None:
+        if self._theme_sequence_stopped():
+            return
         is_dark = bool(is_dark)
         last_applied = self.__dict__.get("_last_applied_theme_is_dark")
         if last_applied is not None and bool(last_applied) == is_dark:
@@ -1663,9 +1671,25 @@ class MainWindow(QMainWindow):
         ) + 1
         sequence = int(self.__dict__["_theme_transition_sequence"])
         self._set_theme_button_busy(True)
-        QTimer.singleShot(0, lambda: self._commit_theme_toggle_interactive(is_dark, sequence))
+        self._schedule_theme_callback(0, lambda: self._commit_theme_toggle_interactive(is_dark, sequence))
+
+    def _schedule_theme_callback(self, delay_ms: int, callback) -> None:
+        QTimer.singleShot(int(delay_ms), self, callback)
+
+    def _theme_sequence_stopped(self) -> bool:
+        return bool(self.__dict__.get("_theme_callbacks_stopped"))
+
+    def _stop_theme_sequence(self) -> None:
+        self.__dict__["_theme_callbacks_stopped"] = True
+        self.__dict__["_theme_transition_in_progress"] = False
+        self.__dict__["_queued_theme_is_dark"] = None
+        self.__dict__["_theme_transition_sequence"] = int(
+            self.__dict__.get("_theme_transition_sequence", 0) or 0
+        ) + 1
 
     def _commit_theme_toggle_interactive(self, is_dark: bool, sequence: int) -> None:
+        if self._theme_sequence_stopped():
+            return
         if sequence != int(self.__dict__.get("_theme_transition_sequence", 0) or 0):
             return
         queued_before_start = self.__dict__.pop("_queued_theme_is_dark", None)
@@ -1699,6 +1723,8 @@ class MainWindow(QMainWindow):
         failed: bool = False,
         queued: bool | None = None,
     ) -> None:
+        if self._theme_sequence_stopped():
+            return
         applied_is_dark = bool(applied_is_dark)
         queued_after_apply = self.__dict__.pop("_queued_theme_is_dark", None)
         has_next = queued_after_apply is not None and bool(queued_after_apply) != bool(self.is_dark_theme)
@@ -1717,7 +1743,7 @@ class MainWindow(QMainWindow):
             self._set_theme_button_busy(True)
             self._ensure_shell_chrome_visible(reason="theme_transition_queued")
             self._repair_black_shell_if_needed("theme_transition_queued")
-            QTimer.singleShot(16, lambda: self._begin_theme_transition(bool(queued_after_apply)))
+            self._schedule_theme_callback(16, lambda: self._begin_theme_transition(bool(queued_after_apply)))
             return
 
         self._set_theme_button_busy(False)
@@ -1815,69 +1841,16 @@ class MainWindow(QMainWindow):
         update_theme_icon: bool = True,
         freeze_updates: bool = False,
     ) -> None:
-        self._debug_shell_visibility("before_theme_apply")
-        self.__dict__["_last_theme_refresh_frontend_snapshot"] = bool(refresh_frontend_snapshot)
-        freeze_states: list[tuple[QWidget, bool]] = []
-        if freeze_updates and refresh_shell_theme:
-            for widget in (self.__dict__.get("app_shell"),):
-                if widget is None:
-                    continue
-                try:
-                    if not widget.isVisible():
-                        continue
-                    was_enabled = bool(widget.updatesEnabled())
-                    freeze_states.append((widget, was_enabled))
-                    if was_enabled:
-                        widget.setUpdatesEnabled(False)
-                except RuntimeError:
-                    continue
-        try:
-            if refresh_shell_theme:
-                self._close_transient_popups_before_theme()
-            self._apply_root_background()
-            apply_application_theme(self.is_dark_theme)
-            self._apply_root_background()
-            window_chrome = self.__dict__.get("window_chrome")
-            if window_chrome is not None:
-                window_chrome.apply_theme(self.is_dark_theme)
-            title_bar = self.__dict__.get("window_title_bar")
-            if title_bar is not None and window_chrome is None:
-                title_bar.apply_theme(self.is_dark_theme)
-            top_bar = self.__dict__.get("top_bar")
-            if top_bar is not None and refresh_shell_theme and update_theme_icon:
-                top_bar.set_theme_icon(self.is_dark_theme)
-            app_shell = self.__dict__.get("app_shell")
-            if app_shell is not None and refresh_shell_theme:
-                app_shell.apply_theme(self.is_dark_theme)
-            if app_shell is not None and sync_settings_theme:
-                settings_page = getattr(app_shell, "pages", {}).get("settings")
-                sync_theme = getattr(settings_page, "sync_external_theme", None)
-                if callable(sync_theme):
-                    sync_theme(
-                        self.is_dark_theme,
-                        follow_system=bool(cfg.get("appearance", "follow_system", False)),
-                    )
-            self.__dict__["_last_applied_theme_is_dark"] = bool(self.is_dark_theme)
-            self.__dict__["_theme_apply_refreshed_snapshot"] = False
-            if refresh_frontend_snapshot and "_frontend_state_service" in self.__dict__:
-                self._refresh_frontend_after_theme_change()
-                self.__dict__["_theme_apply_refreshed_snapshot"] = True
-            if not self.__dict__.get("_qt_initialized", False):
-                return
-        finally:
-            for widget, was_enabled in reversed(freeze_states):
-                try:
-                    widget.setUpdatesEnabled(was_enabled)
-                    if was_enabled:
-                        widget.update()
-                except RuntimeError:
-                    continue
-            if self.__dict__.get("_qt_initialized", False):
-                self._ensure_shell_chrome_visible(reason="theme_apply_finally")
-                self._repair_black_shell_if_needed("theme_apply_finally")
-                if not self.__dict__.get("_theme_apply_refreshed_snapshot", False):
-                    self._finalize_theme_repaint()
-                self._debug_shell_visibility("after_theme_apply")
+        apply_main_window_theme_stylesheet(
+            self,
+            apply_theme=apply_application_theme,
+            config=cfg,
+            refresh_shell_theme=refresh_shell_theme,
+            sync_settings_theme=sync_settings_theme,
+            refresh_frontend_snapshot=refresh_frontend_snapshot,
+            update_theme_icon=update_theme_icon,
+            freeze_updates=freeze_updates,
+        )
 
     def _apply_root_background(self) -> None:
         palette = build_palette(self.is_dark_theme)
@@ -2321,6 +2294,7 @@ class MainWindow(QMainWindow):
 
     @safe_slot
     def closeEvent(self, event) -> None:
+        self._stop_theme_sequence()
         failure = shutdown_main_window(self, event)
         if failure is None:
             return
@@ -2350,20 +2324,26 @@ class MainWindow(QMainWindow):
         except (AttributeError, TypeError, ValueError) as exc:
             self.append_log(f"配置读取错误: {exc}")
             return
-        run_options.update(self._video_count_run_options(self.current_plugin.id))
+        run_options.update(self._video_count_run_options(self.current_plugin.id, run_options))
         self.sig_start_crawl.emit(keyword, self.current_plugin.id, run_options)
 
-    def _video_count_run_options(self, plugin_id: str) -> dict:
+    def _video_count_run_options(self, plugin_id: str, persisted: dict | None = None) -> dict:
+        """已读到的数量字段保持原值；读失败不回落到 20，B 站不写 max_items=9999。"""
+        persisted = persisted or {}
+        if plugin_id == "bilibili":
+            count_key = "max_pages"
+        elif plugin_id in {"douyin", "kuaishou", "xiaohongshu", "missav"}:
+            count_key = "max_items"
+        else:
+            return {}
+        if count_key in persisted:
+            return {}
         top_bar = self.__dict__.get("top_bar")
         try:
-            count = int(top_bar.current_video_count()) if top_bar is not None else 20
+            count = int(top_bar.current_video_count()) if top_bar is not None else 0
         except (TypeError, ValueError, AttributeError):
-            count = 20
-        if plugin_id == "bilibili":
-            return {"max_pages": count, "max_items": 9999}
-        if plugin_id in {"douyin", "kuaishou", "xiaohongshu", "missav"}:
-            return {"max_items": count}
-        return {}
+            return {}
+        return {} if count < 1 else {count_key: count}
 
     def on_source_changed(self, _index: int) -> None:
         plugin_id = self.combo_source.currentData()
@@ -2393,7 +2373,7 @@ class MainWindow(QMainWindow):
         selected_dir = QFileDialog.getExistingDirectory(
             self,
             "选择保存目录",
-            self.current_save_dir,
+            resolve_existing_directory(self.current_save_dir),
             QFileDialog.Option.ShowDirsOnly,
         )
         self._on_directory_selected(selected_dir)
@@ -2414,10 +2394,25 @@ class MainWindow(QMainWindow):
 
     def set_current_save_dir(self, save_dir: str, *, persist: bool = False) -> None:
         if persist:
+            previous = self.current_save_dir
             if self._submit_frontend_action("update_basic_setting", {"key": "download_directory", "value": save_dir}):
+                self.__dict__["_pending_save_dir_rollback"] = previous
+                self.current_save_dir = save_dir
+                if normalize_media_path(save_dir) != normalize_media_path(previous):
+                    self.sig_change_dir.emit()
                 return
+            return
         self.current_save_dir = save_dir
         self.refresh_frontend_state(topics={"settings.update"} if persist else None)
+
+    def _rollback_pending_save_dir(self) -> None:
+        previous = self.__dict__.pop("_pending_save_dir_rollback", None)
+        if previous is None:
+            return
+        current = self.current_save_dir
+        self.current_save_dir = str(previous)
+        if normalize_media_path(current) != normalize_media_path(str(previous)):
+            self.sig_change_dir.emit()
 
     def add_video_row(self, video_item) -> None:
         self._frontend_state_service.upsert_video(video_item)
@@ -2460,8 +2455,10 @@ class MainWindow(QMainWindow):
                 return []
             dialog = SelectionDialog(self, items=normalized_items, language=self._current_ui_language())
             self._active_selection_dialog = dialog
-            dialog.setModal(True)
-            dialog.setWindowModality(Qt.WindowModality.ApplicationModal)
+            dialog.setModal(False)
+            dialog.setWindowModality(Qt.WindowModality.NonModal)
+            dialog.stop_requested.connect(self._activate_stop_during_selection)
+            self._bind_stop_button_to_selection_dialog()
             dialog.raise_()
             dialog.activateWindow()
             from PyQt6.QtWidgets import QDialog
@@ -2470,14 +2467,44 @@ class MainWindow(QMainWindow):
                 selected = dialog.selected_indices
         except Exception as exc:
             self.append_log(f"任务清单对话框打开失败: {exc}")
-            return None
+            return SimpleNamespace(reason="open_failed", error=exc, selected=None)
         finally:
+            self._unbind_stop_button_from_selection_dialog()
             self._active_selection_dialog = None
         if selected is not None:
             self.append_log(f"用户确认了 {len(selected)} 个任务")
             return selected
         self.append_log("用户取消了任务")
         return None
+
+    def _bind_stop_button_to_selection_dialog(self) -> None:
+        button = getattr(self, "btn_stop", None)
+        clicked = getattr(button, "clicked", None)
+        connect = getattr(clicked, "connect", None)
+        if not callable(connect):
+            return
+        connect(self.dismiss_selection_dialog)
+        self.__dict__["_selection_stop_bound"] = True
+
+    def _unbind_stop_button_from_selection_dialog(self) -> None:
+        if not self.__dict__.pop("_selection_stop_bound", False):
+            return
+        button = getattr(self, "btn_stop", None)
+        clicked = getattr(button, "clicked", None)
+        disconnect = getattr(clicked, "disconnect", None)
+        if not callable(disconnect):
+            return
+        try:
+            disconnect(self.dismiss_selection_dialog)
+        except (TypeError, RuntimeError):
+            pass
+
+    def _activate_stop_during_selection(self) -> None:
+        self.dismiss_selection_dialog()
+        signal = getattr(self, "sig_stop_crawl", None)
+        emit = getattr(signal, "emit", None)
+        if callable(emit):
+            emit()
 
     def dismiss_selection_dialog(self) -> None:
         dialog = self._active_selection_dialog

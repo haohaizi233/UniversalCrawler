@@ -46,6 +46,7 @@ from app.ui.components.log_inspector_sections import (
 )
 from shared.localization import normalize_language, tr
 from shared.log_contract import LOG_CATEGORY_LABELS
+from app.ui.dialogs.file_paths import absolute_export_path
 from app.ui.pages.common import PageFrame, SnapshotActionDelegate, SnapshotActionTable
 from app.ui.styles.themes import resolve_is_dark_theme, theme_colors
 from shared.log_platforms import PlatformUiMeta
@@ -1353,7 +1354,7 @@ class LogCenterPage(PageFrame):
         path, _ = QFileDialog.getSaveFileName(
             self,
             self._t("导出日志详情"),
-            "log_detail.json",
+            absolute_export_path("log_detail.json"),
             self._t("JSON 文件 (*.json);;文本文件 (*.txt)"),
         )
         if not path:

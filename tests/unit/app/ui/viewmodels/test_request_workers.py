@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import threading
+import time
 
 from app.ui.viewmodels.latest_worker import LatestRequestWorker
 from app.ui.viewmodels.sequential_worker import SequentialRequestWorker
@@ -147,3 +148,49 @@ def test_sequential_worker_reports_exact_acceptance_after_shutdown() -> None:
     worker.shutdown()
 
     assert worker.submit("rejected") is False
+
+
+def test_sequential_worker_shutdown_returns_while_process_is_blocked() -> None:
+    started = threading.Event()
+    release = threading.Event()
+
+    def process(_request: str) -> str:
+        started.set()
+        release.wait(timeout=2)
+        return "done"
+
+    worker = SequentialRequestWorker(
+        name="test-sequential-no-join",
+        on_result=lambda _result: None,
+        process=process,
+    )
+    worker.submit("block")
+    assert started.wait(timeout=2)
+    started_at = time.perf_counter()
+    worker.shutdown()
+    elapsed = time.perf_counter() - started_at
+    release.set()
+    worker._thread.join(timeout=2)
+    assert elapsed < 0.5
+    assert not worker._thread.is_alive()
+
+
+def test_latest_request_worker_shutdown_returns_while_process_is_blocked() -> None:
+    started = threading.Event()
+    release = threading.Event()
+
+    def process(_request: str) -> str:
+        started.set()
+        release.wait(timeout=2)
+        return "done"
+
+    worker = LatestRequestWorker(name="test-latest-shutdown", on_result=lambda _result: None, process=process)
+    worker.submit("block")
+    assert started.wait(timeout=2)
+    started_at = time.perf_counter()
+    worker.shutdown()
+    elapsed = time.perf_counter() - started_at
+    release.set()
+    worker._thread.join(timeout=2)
+    assert elapsed < 0.5
+    assert not worker._thread.is_alive()

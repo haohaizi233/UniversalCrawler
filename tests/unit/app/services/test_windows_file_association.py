@@ -1,9 +1,11 @@
+import sys
 import types
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
+from app.services import windows_file_association_service as association_module
 from app.services.windows_file_association_service import USER_CHOICE_EXPERIENCE, WindowsFileAssociationService
 
 class _FakeKey:
@@ -46,8 +48,10 @@ class WindowsFileAssociationServiceTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             executable = Path(tmp) / "UniversalCrawlerPro.exe"
             executable.write_bytes(b"exe")
+            resolved = str(executable.resolve())
             service = WindowsFileAssociationService(app_name="Universal Crawler Pro")
             with patch("app.services.windows_file_association_service.os.name", "nt"), \
+                 patch.object(association_module.sys, "frozen", True, create=True), \
                  patch.dict("sys.modules", {"winreg": fake_winreg}):
                 result = service.register_current_user(
                     executable,
@@ -56,6 +60,10 @@ class WindowsFileAssociationServiceTests(unittest.TestCase):
                 )
 
         self.assertTrue(result.registered)
+        self.assertEqual(
+            writes[(r"Software\Classes\UniversalCrawlerPro.Video\shell\open\command", "")],
+            f'"{resolved}" "%1"',
+        )
         self.assertEqual(
             writes[(r"Software\RegisteredApplications", "Universal Crawler Pro")],
             r"Software\UniversalCrawlerPro\Capabilities",
@@ -72,6 +80,51 @@ class WindowsFileAssociationServiceTests(unittest.TestCase):
             (r"Software\Classes\Applications\UniversalCrawlerPro.exe\shell\open\command", ""),
             writes,
         )
+        self.assertEqual(
+            writes[(r"Software\Classes\Applications\UniversalCrawlerPro.exe\shell\open\command", "")],
+            f'"{resolved}" "%1"',
+        )
+
+    def test_register_current_user_uses_module_launch_vector_when_not_frozen(self):
+        writes = {}
+
+        def create_key(_root, subkey, _reserved, _access):
+            return _FakeKey(subkey)
+
+        def set_value(key, value_name, _reserved, _value_type, value):
+            writes[(key.subkey, value_name)] = value
+
+        fake_winreg = types.SimpleNamespace(
+            HKEY_CURRENT_USER=object(),
+            KEY_WRITE=1,
+            REG_SZ=1,
+            REG_DWORD=4,
+            CreateKeyEx=create_key,
+            SetValueEx=set_value,
+        )
+
+        with TemporaryDirectory() as tmp:
+            script = Path(tmp) / "gui_entry.py"
+            script.write_text("print('entry')\n", encoding="utf-8")
+            service = WindowsFileAssociationService(app_name="Universal Crawler Pro")
+            with patch("app.services.windows_file_association_service.os.name", "nt"), \
+                 patch.object(association_module.sys, "frozen", False, create=True), \
+                 patch.dict("sys.modules", {"winreg": fake_winreg}):
+                result = service.register_current_user(script, include_video=True, include_image=False)
+
+        interpreter = str(Path(sys.executable).resolve())
+        expected = f'"{interpreter}" -m entry.gui_entry "%1"'
+        self.assertTrue(result.registered)
+        self.assertEqual(
+            writes[(r"Software\Classes\UniversalCrawlerPro.Video\shell\open\command", "")],
+            expected,
+        )
+        self.assertNotIn("gui_entry.py", expected)
+        self.assertNotIn(str(script.resolve()), expected)
+        for value in writes.values():
+            if isinstance(value, str):
+                self.assertNotIn("gui_entry.py", value)
+                self.assertNotIn(str(script.resolve()), value)
 
     def test_build_userchoice_hash_matches_known_vector(self):
         user_hash = WindowsFileAssociationService._build_userchoice_hash(

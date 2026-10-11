@@ -260,6 +260,101 @@ class SnapshotTableModelTests(unittest.TestCase):
 
         self.assertEqual(row_interaction_fill_color(option), selection_fill_color(option))
 
+    def test_active_downloads_middle_insert_and_delete_keep_stable_ids(self):
+        model = ActiveDownloadsModel()
+        model.set_rows(
+            [
+                {"id": "a", "title": "A", "platform": "Bilibili", "progress": 10, "speed": "1", "remaining_time": "9"},
+                {"id": "c", "title": "C", "platform": "Bilibili", "progress": 30, "speed": "3", "remaining_time": "7"},
+            ]
+        )
+        resets: list[bool] = []
+        inserted: list[tuple[int, int]] = []
+        removed: list[tuple[int, int]] = []
+        model.modelReset.connect(lambda: resets.append(True))
+        model.rowsInserted.connect(lambda _parent, first, last: inserted.append((first, last)))
+        model.rowsRemoved.connect(lambda _parent, first, last: removed.append((first, last)))
+
+        inserted_changed = model.set_rows(
+            [
+                {"id": "a", "title": "A", "platform": "Bilibili", "progress": 10, "speed": "1", "remaining_time": "9"},
+                {"id": "b", "title": "B", "platform": "Bilibili", "progress": 20, "speed": "2", "remaining_time": "8"},
+                {"id": "c", "title": "C", "platform": "Bilibili", "progress": 30, "speed": "3", "remaining_time": "7"},
+            ]
+        )
+
+        self.assertTrue(inserted_changed)
+        self.assertEqual(resets, [])
+        self.assertEqual(inserted, [(1, 1)])
+        self.assertEqual([model.item_id_at(index) for index in range(3)], ["a", "b", "c"])
+
+        removed_changed = model.set_rows(
+            [
+                {"id": "a", "title": "A", "platform": "Bilibili", "progress": 10, "speed": "1", "remaining_time": "9"},
+                {"id": "c", "title": "C", "platform": "Bilibili", "progress": 30, "speed": "3", "remaining_time": "7"},
+            ]
+        )
+
+        self.assertTrue(removed_changed)
+        self.assertEqual(resets, [])
+        self.assertEqual(removed, [(1, 1)])
+        self.assertEqual([model.item_id_at(index) for index in range(2)], ["a", "c"])
+
+    def test_active_downloads_progress_update_touches_only_progress_cells(self):
+        model = ActiveDownloadsModel()
+        model.set_rows(
+            [
+                {"id": "a", "title": "A", "platform": "Bilibili", "progress": 10, "speed": "1", "remaining_time": "9"},
+                {"id": "b", "title": "B", "platform": "Bilibili", "progress": 20, "speed": "2", "remaining_time": "8"},
+            ]
+        )
+        resets: list[bool] = []
+        changed: list[tuple[int, int]] = []
+        model.modelReset.connect(lambda: resets.append(True))
+        model.dataChanged.connect(
+            lambda top, bottom, _roles: changed.append((top.row(), top.column(), bottom.column()))
+        )
+
+        model.update_progress_rows(
+            [{"id": "b", "title": "replaced", "progress": 55, "speed": "9MB/s", "remaining_time": "1s"}]
+        )
+
+        self.assertEqual(resets, [])
+        self.assertEqual(changed, [(1, ActiveDownloadsModel.PROGRESS_COLUMN, ActiveDownloadsModel.PROGRESS_COLUMN + 2)])
+        self.assertEqual(model.data(model.index(1, 0)), "B")
+        self.assertEqual(model.data(model.index(1, 2)), 55)
+        self.assertEqual(model.data(model.index(1, 3)), "9MB/s")
+        self.assertEqual(model.data(model.index(0, 2)), 10)
+
+    def test_active_downloads_blank_or_duplicate_ids_do_not_reset_model(self):
+        model = ActiveDownloadsModel()
+        model.set_rows(
+            [
+                {"id": "", "title": "A", "platform": "Bilibili", "progress": 10, "speed": "1", "remaining_time": "9"},
+                {"id": "same", "title": "B", "platform": "Bilibili", "progress": 20, "speed": "2", "remaining_time": "8"},
+                {"id": "same", "title": "C", "platform": "Bilibili", "progress": 30, "speed": "3", "remaining_time": "7"},
+            ]
+        )
+        resets: list[bool] = []
+        model.modelReset.connect(lambda: resets.append(True))
+
+        changed = model.set_rows(
+            [
+                {"id": "same", "title": "C", "platform": "Bilibili", "progress": 31, "speed": "3", "remaining_time": "7"},
+                {"id": "", "title": "A", "platform": "Bilibili", "progress": 11, "speed": "1", "remaining_time": "9"},
+                {"id": "same", "title": "B", "platform": "Bilibili", "progress": 21, "speed": "2", "remaining_time": "8"},
+            ]
+        )
+
+        self.assertTrue(changed)
+        self.assertEqual(resets, [])
+        self.assertEqual(model.data(model.index(0, 0)), "C")
+        self.assertEqual(model.data(model.index(0, 2)), 31)
+        self.assertEqual(model.data(model.index(1, 0)), "A")
+        self.assertEqual(model.data(model.index(1, 2)), 11)
+        self.assertEqual(model.data(model.index(2, 0)), "B")
+        self.assertEqual(model.data(model.index(2, 2)), 21)
+
 
 if __name__ == "__main__":
     unittest.main()

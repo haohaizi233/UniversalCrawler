@@ -33,7 +33,7 @@ from PyQt6.QtWidgets import (
 from app.debug_logger import debug_logger
 from app.services.mkv_repair_service import MkvPlaybackRepairService
 from app.services.playback_position_service import PlaybackPositionService
-from app.ui.styles import apply_dialog_theme, resolve_is_dark_theme
+from app.ui.styles import apply_opaque_fullscreen_theme, resolve_is_dark_theme
 from app.ui.task_runtime import LongTaskRunner, ShortTaskRunner, TaskCancelToken
 from shared.localization import normalize_language, tr
 
@@ -89,12 +89,10 @@ class _MediaFullscreenWindow(QWidget):
         self.setProperty("ucpThemeRoot", True)
         self.setWindowTitle("Universal Crawler Pro - Media")
         self.setWindowFlag(Qt.WindowType.Window)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, False)
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.setAutoFillBackground(True)
-        apply_dialog_theme(
-            self,
-            parent=theme_source,
-            is_dark=resolve_is_dark_theme(theme_source),
-        )
+        apply_opaque_fullscreen_theme(self, resolve_is_dark_theme(theme_source))
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
@@ -517,13 +515,13 @@ class MediaPreviewPanel(QFrame):
             self.release_media()
         short_runner = getattr(self, "_short_task_runner", None)
         if short_runner is not None:
-            short_runner.cancel_all(timeout_ms=5000)
+            short_runner.cancel_all(timeout_ms=0)
         playback_position_runner = getattr(self, "_playback_position_task_runner", None)
         if playback_position_runner is not None:
-            playback_position_runner.cancel_all(timeout_ms=5000)
+            playback_position_runner.cancel_all(timeout_ms=0)
         long_runner = getattr(self, "_long_task_runner", None)
         if long_runner is not None:
-            long_runner.cancel_all(timeout_ms=10000)
+            long_runner.cancel_all(timeout_ms=0)
         repair_lock = getattr(self, "_repair_lock", None)
         if repair_lock is not None:
             with repair_lock:

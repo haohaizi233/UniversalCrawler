@@ -126,12 +126,7 @@ class TopBarWidget(QFrame):
             label = tr(option["label"], self._language)
             self.combo_video_count.addItem(self._compact_quantity_label(label), value)
             self.combo_video_count.setItemData(self.combo_video_count.count() - 1, label, Qt.ItemDataRole.ToolTipRole)
-        index = self.combo_video_count.findData(default)
-        if index < 0 and normalized:
-            normalized_values = [int(option["value"]) for option in normalized]
-            closest = min(normalized_values, key=lambda preset: abs(preset - int(default)))
-            index = self.combo_video_count.findData(closest)
-        self.combo_video_count.setCurrentIndex(index if index >= 0 else 0)
+        self._select_quantity_value(int(default))
         self.combo_video_count.setMaxVisibleItems(max(1, self.combo_video_count.count()))
         self._refresh_quantity_combo_layout()
         self.combo_video_count.blockSignals(blocked)
@@ -155,19 +150,24 @@ class TopBarWidget(QFrame):
         polish_combo_popup(self.combo_video_count, visible_rows=self.combo_video_count.count(), row_height=32)
 
     def current_video_count(self) -> int:
-        return int(self.combo_video_count.currentData() or 20)
+        data = self.combo_video_count.currentData()
+        if data is None:
+            raise ValueError("数量未选择")
+        return int(data)
+
+    def _select_quantity_value(self, value: int) -> None:
+        """档位里没有该数量时保留原值，不改成最近档。"""
+        retained = int(value)
+        index = self.combo_video_count.findData(retained)
+        if index < 0:
+            self.combo_video_count.addItem(self._compact_quantity_label(str(retained)), retained)
+            index = self.combo_video_count.findData(retained)
+        if index >= 0:
+            self.combo_video_count.setCurrentIndex(index)
 
     def set_video_count(self, value: int) -> None:
         value = max(1, min(int(value), MAX_QUANTITY))
-        index = self.combo_video_count.findData(value)
-        if index < 0:
-            closest = min(
-                (self.combo_video_count.itemData(i) for i in range(self.combo_video_count.count())),
-                key=lambda preset: abs(int(preset or 0) - value),
-            )
-            index = self.combo_video_count.findData(closest)
-        if index >= 0:
-            self.combo_video_count.setCurrentIndex(index)
+        self._select_quantity_value(value)
 
     def configure_for_platform(
         self,
@@ -217,8 +217,11 @@ class TopBarWidget(QFrame):
         self._apply_search_placeholder()
         self.video_count_label.setText(tr(COUNT_LABELS.get(self._quantity_mode, "视频数:"), self._language))
         self.quantity_unit_label.hide()
-        current_value = self.current_video_count()
-        if self._quantity_options:
+        try:
+            current_value = self.current_video_count()
+        except (TypeError, ValueError):
+            current_value = None
+        if self._quantity_options and current_value is not None:
             self._populate_quantity_options(self._quantity_options, default=current_value)
         set_label = getattr(self.btn_start, "set_label", None)
         if callable(set_label):

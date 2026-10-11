@@ -14,6 +14,7 @@ class ToolboxSnapshot:
     recent_items: tuple[Mapping[str, Any], ...]
     projections: Mapping[str, Mapping[str, Any]]
     selected_tool_id: str = ""
+    selection_from_snapshot: bool = False
 
 
 def mapping_list(value: object) -> list[dict[str, Any]]:
@@ -150,15 +151,16 @@ def normalize_toolbox_snapshot(
     items = mapping_list(raw["toolbox_items"]) if "toolbox_items" in raw else [dict(item) for item in previous.items]
     recent = mapping_list(raw["toolbox_recent_items"]) if "toolbox_recent_items" in raw else [dict(item) for item in previous.recent_items]
     projections = {tool_id: dict(projection) for tool_id, projection in previous.projections.items()}
-    selected = str(raw.get("toolbox_selected_tool_id") or previous.selected_tool_id)
+    explicit_tool_id = str(raw.get("toolbox_selected_tool_id") or "")
+    selection_from_snapshot = "toolbox_selected_tool_id" in raw and bool(explicit_tool_id)
+    selected = explicit_tool_id if selection_from_snapshot else previous.selected_tool_id
     for key in ("toolbox_display_projection", "toolbox_projection", "toolbox_display"):
         projection = raw.get(key)
         if isinstance(projection, Mapping):
-            selected = _store_projection(projections, projection, selected) or selected
+            _store_projection(projections, projection, selected)
     for key in ("toolbox_display_batch", "toolbox_projection_batch", "toolbox_batch"):
         batch = raw.get(key)
         if isinstance(batch, Mapping):
-            selected = str(batch.get("selected_tool_id") or selected)
             if "history" in batch:
                 recent = mapping_list(batch.get("history"))
             candidates = batch.get("projections") or batch.get("updates") or ()
@@ -175,11 +177,23 @@ def normalize_toolbox_snapshot(
     for projection in projections.values():
         if "history" in projection:
             recent = mapping_list(projection.get("history"))
+    latest_history_tool_id = ""
+    if recent:
+        latest_history_tool_id = str(recent[0].get("tool_id") or recent[0].get("id") or "")
+    if (
+        selection_from_snapshot
+        and explicit_tool_id == latest_history_tool_id
+        and previous.selected_tool_id
+        and previous.selected_tool_id != explicit_tool_id
+    ):
+        selected = previous.selected_tool_id
+        selection_from_snapshot = False
     return ToolboxSnapshot(
         tuple(MappingProxyType(item) for item in items),
         tuple(MappingProxyType(item) for item in recent),
         MappingProxyType({key: MappingProxyType(value) for key, value in projections.items()}),
         selected,
+        selection_from_snapshot,
     )
 
 

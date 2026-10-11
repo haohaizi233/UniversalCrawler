@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from PyQt6.QtCore import QAbstractTableModel, QModelIndex, QRect, Qt, pyqtSignal
+from PyQt6.QtCore import QModelIndex, QRect, Qt, pyqtSignal
 from PyQt6.QtGui import QColor, QPainter, QPainterPath, QPalette, QPen
 from PyQt6.QtWidgets import (
     QAbstractItemView,
@@ -29,9 +29,10 @@ from app.config.settings import download_concurrency_options, normalize_download
 from app.services.icon_registry import ui_icon_path
 from shared.icon_contract import action_icon_file, platform_icon_file
 from app.ui.components.combo_popup import ThemedComboBox
-from shared.localization import is_translation_of, normalize_language, platform_display_name, source_text_for_translation, tr
+from shared.localization import normalize_language, platform_display_name, tr
 from app.ui.components.smart_wrap_label import SmartWrapLabel
 from app.ui.pages.common import PageFrame
+from app.ui.pages.active_downloads_model import ActiveDownloadsModel
 from app.ui.viewmodels.active_download_projection import prepare_active_item_for_display
 from app.ui.viewmodels.list_page_worker import (
     ListPageRequest,
@@ -74,175 +75,6 @@ TEXT = {
     "trace_id": "Trace ID",
     "delete": "\u5220\u9664",
 }
-
-class ActiveDownloadsModel(QAbstractTableModel):
-    HEADERS = ["\u6807\u9898", "\u5e73\u53f0", "\u8fdb\u5ea6", "\u901f\u5ea6", "\u5269\u4f59\u65f6\u95f4", "\u64cd\u4f5c"]
-    COLUMNS = ["title", "platform", "progress", "speed", "remaining_time", "actions"]
-    PROGRESS_COLUMN = 2
-    ACTION_COLUMN = 5
-    ROW_ROLE = Qt.ItemDataRole.UserRole
-
-    def __init__(self, parent: QWidget | None = None) -> None:
-        super().__init__(parent)
-        self._rows: list[dict[str, Any]] = []
-        self._row_signatures: list[tuple] = []
-        self._language = "zh-CN"
-        self._headers = list(self.HEADERS)
-
-    def rowCount(self, _parent: QModelIndex = QModelIndex()) -> int:  # noqa: B008 - Qt 重写签名
-        return len(self._rows)
-
-    def columnCount(self, _parent: QModelIndex = QModelIndex()) -> int:  # noqa: B008 - Qt 重写签名
-        return len(self.COLUMNS)
-
-    def headerData(self, section: int, orientation: Qt.Orientation, role: int = Qt.ItemDataRole.DisplayRole):
-        if orientation == Qt.Orientation.Horizontal and role == Qt.ItemDataRole.DisplayRole:
-            return tr(self._headers[section], self._language)
-        return super().headerData(section, orientation, role)
-
-    def set_headers(self, headers: list[str]) -> None:
-        if len(headers) != len(self._headers):
-            return
-        headers = self._source_headers_from_display(headers)
-        if headers == self._headers:
-            return
-        self._headers = headers
-        self.headerDataChanged.emit(Qt.Orientation.Horizontal, 0, len(self._headers) - 1)
-
-    def _source_headers_from_display(self, headers: list[str]) -> list[str]:
-        normalized: list[str] = []
-        for index, header in enumerate(headers):
-            text = str(header or "")
-            current_source = self._headers[index] if index < len(self._headers) else ""
-            if current_source and is_translation_of(text, current_source):
-                normalized.append(current_source)
-            else:
-                normalized.append(source_text_for_translation(text))
-        return normalized
-
-    def data(self, index: QModelIndex, role: int = Qt.ItemDataRole.DisplayRole):
-        if not index.isValid() or index.row() >= len(self._rows):
-            return None
-        row = self._rows[index.row()]
-        column = self.COLUMNS[index.column()]
-        if role == self.ROW_ROLE:
-            return row
-        if role == Qt.ItemDataRole.TextAlignmentRole:
-            align = Qt.AlignmentFlag.AlignLeft if index.column() == 0 else Qt.AlignmentFlag.AlignCenter
-            return Qt.AlignmentFlag.AlignVCenter | align
-        if role == Qt.ItemDataRole.ToolTipRole:
-            return str(row.get(column, ""))
-        if role != Qt.ItemDataRole.DisplayRole:
-            return None
-        if index.column() == self.PROGRESS_COLUMN:
-            return int(row.get("progress") or 0)
-        if index.column() == self.ACTION_COLUMN:
-            return tr(TEXT["delete"], self._language)
-        if column == "platform":
-            return platform_display_name(row.get("platform_id"), self._language, fallback=row.get(column, ""))
-        return str(row.get(column, ""))
-
-    def set_language(self, language: str | None) -> None:
-        normalized = normalize_language(language)
-        if normalized == self._language:
-            return
-        self._language = normalized
-        if self._headers:
-            self.headerDataChanged.emit(Qt.Orientation.Horizontal, 0, len(self._headers) - 1)
-        if self._rows:
-            self.dataChanged.emit(
-                self.index(0, 0),
-                self.index(len(self._rows) - 1, max(0, self.columnCount() - 1)),
-                [Qt.ItemDataRole.DisplayRole, Qt.ItemDataRole.ToolTipRole],
-            )
-
-    def set_rows(self, rows: list[dict[str, Any]]) -> bool:
-        rows = list(rows)
-        signatures = [self._row_signature(row) for row in rows]
-        if signatures == self._row_signatures:
-            return False
-        new_ids = [signature[0] for signature in signatures]
-        old_ids = [signature[0] for signature in self._row_signatures]
-        same_shape = new_ids == old_ids
-        if same_shape and len(rows) == len(self._rows):
-            self._replace_existing_rows(rows, signatures)
-        elif len(rows) > len(self._rows) and new_ids[: len(old_ids)] == old_ids:
-            self._replace_existing_rows(rows[: len(self._rows)], signatures[: len(self._rows)])
-            first = len(self._rows)
-            last = len(rows) - 1
-            self.beginInsertRows(QModelIndex(), first, last)
-            self._rows.extend(rows[first:])
-            self._row_signatures.extend(signatures[first:])
-            self.endInsertRows()
-            return True
-        elif len(rows) < len(self._rows) and old_ids[: len(new_ids)] == new_ids:
-            self._replace_existing_rows(rows, signatures)
-            first = len(rows)
-            last = len(self._rows) - 1
-            self.beginRemoveRows(QModelIndex(), first, last)
-            del self._rows[first:]
-            del self._row_signatures[first:]
-            self.endRemoveRows()
-            return True
-        elif self._has_same_unique_ids(old_ids, new_ids):
-            self.layoutAboutToBeChanged.emit()
-            self._rows = rows
-            self._row_signatures = signatures
-            self.layoutChanged.emit()
-        else:
-            self.beginResetModel()
-            self._rows = rows
-            self._row_signatures = signatures
-            self.endResetModel()
-        return True
-
-    def _replace_existing_rows(self, rows: list[dict[str, Any]], signatures: list[tuple]) -> None:
-        changed_roles = [Qt.ItemDataRole.DisplayRole, Qt.ItemDataRole.ToolTipRole, self.ROW_ROLE]
-        for row_index, (row, signature) in enumerate(zip(rows, signatures, strict=False)):
-            if row_index >= len(self._rows):
-                return
-            old = self._row_signatures[row_index]
-            self._rows[row_index] = row
-            self._row_signatures[row_index] = signature
-            if old == signature:
-                continue
-            start = self.index(row_index, 0)
-            end = self.index(row_index, self.columnCount() - 1)
-            self.dataChanged.emit(start, end, changed_roles)
-
-    def row_at(self, row: int) -> dict[str, Any] | None:
-        if 0 <= row < len(self._rows):
-            return self._rows[row]
-        return None
-
-    def item_id_at(self, row: int) -> str:
-        item = self.row_at(row)
-        return str((item or {}).get("id") or "")
-
-    def row_for_id(self, item_id: str) -> int:
-        for row, item in enumerate(self._rows):
-            if item.get("id") == item_id:
-                return row
-        return -1
-
-    @staticmethod
-    def _row_signature(row: dict[str, Any]) -> tuple:
-        return (
-            row.get("id", ""),
-            str(row.get("title", "")),
-            str(row.get("platform", "")),
-            int(row.get("progress") or 0),
-            str(row.get("speed", "")),
-            str(row.get("remaining_time", "")),
-        )
-
-    @staticmethod
-    def _has_same_unique_ids(old_ids: list[Any], new_ids: list[Any]) -> bool:
-        if len(old_ids) != len(new_ids) or not old_ids:
-            return False
-        if any(not item_id for item_id in old_ids) or any(not item_id for item_id in new_ids):
-            return False
-        return len(set(old_ids)) == len(old_ids) and set(old_ids) == set(new_ids)
 
 class ActiveDownloadsDelegate(QStyledItemDelegate):
     def __init__(self, parent: QWidget | None = None) -> None:
@@ -372,7 +204,14 @@ class ActiveDownloadsTable(QTableView):
         super().mouseReleaseEvent(event)
 
     def set_rows(self, rows: list[dict[str, Any]]) -> bool:
-        return self.model().set_rows(rows)
+        scrollbar = self.verticalScrollBar()
+        scroll_value = scrollbar.value()
+        changed = self.model().set_rows(rows)
+        scrollbar.setValue(min(scroll_value, scrollbar.maximum()))
+        return changed
+
+    def update_progress_rows(self, rows: list[dict[str, Any]]) -> None:
+        self.model().update_progress_rows(rows)
 
     def selected_id(self) -> str | None:
         indexes = self.selectionModel().selectedRows()
@@ -889,9 +728,18 @@ class ActiveDownloadsPage(PageFrame):
             self._render_selected_detail(force=True)
 
     def render(self, snapshot: dict) -> None:
+        if str(snapshot.get("active_downloads_update_kind") or "") == "progress":
+            self.apply_progress_update(snapshot)
+            return
         self._sync_download_options(snapshot)
         selected_id = self.table.selected_id()
         self._submit_items_request(snapshot.get("active_downloads") or [], selected_id=selected_id or "")
+
+    def apply_progress_update(self, snapshot: dict) -> None:
+        items = snapshot.get("active_downloads") or []
+        if not isinstance(items, list | tuple):
+            items = []
+        self.table.update_progress_rows([item for item in items if isinstance(item, dict)])
 
     def _submit_items_request(self, items: object, *, selected_id: str = "") -> None:
         self._items_sequence += 1

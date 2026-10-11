@@ -213,7 +213,7 @@ class MainWindowTests(unittest.TestCase):
         window.sig_start_crawl.emit.assert_called_once_with(
             "测试关键词",
             "douyin",
-            {"max_pages": 5, "max_items": 20},
+            {"max_pages": 5},
         )
         window.set_crawl_running_state.assert_not_called()
 
@@ -233,9 +233,9 @@ class MainWindowTests(unittest.TestCase):
         window.sig_start_crawl.emit.assert_called_once_with(
             "BV19nRWBtEnF",
             "bilibili",
-            {"max_pages": 5, "max_items": 9999},
+            {"max_pages": 2},
         )
-        window.top_bar.current_video_count.assert_called_once()
+        window.top_bar.current_video_count.assert_not_called()
 
     def test_start_click_rejects_empty_keyword(self):
         """验证 `test_start_click_rejects_empty_keyword` 对应场景是否符合预期，供 `MainWindowTests` 使用。"""
@@ -2821,7 +2821,8 @@ class MainWindowTests(unittest.TestCase):
         window.sig_theme_changed.emit.assert_not_called()
         self.assertEqual(window._frontend_action_worker.requests, [])
 
-        mock_single_shot.call_args.args[1]()
+        self.assertIs(mock_single_shot.call_args.args[1], window)
+        mock_single_shot.call_args.args[-1]()
 
         self.assertFalse(window.is_dark_theme)
         mock_apply_theme.assert_called_once_with(False)
@@ -2872,7 +2873,8 @@ class MainWindowTests(unittest.TestCase):
         self.assertEqual(window._frontend_action_worker.requests, [])
         window.top_bar.set_theme_icon.assert_not_called()
 
-        mock_single_shot.call_args.args[1]()
+        self.assertIs(mock_single_shot.call_args.args[1], window)
+        mock_single_shot.call_args.args[-1]()
 
         self.assertFalse(window.is_dark_theme)
         mock_apply_theme.assert_called_once_with(False)
@@ -2908,7 +2910,8 @@ class MainWindowTests(unittest.TestCase):
 
         window.toggle_theme()
         window.toggle_theme()
-        mock_single_shot.call_args.args[1]()
+        self.assertIs(mock_single_shot.call_args.args[1], window)
+        mock_single_shot.call_args.args[-1]()
 
         self.assertTrue(window.is_dark_theme)
         mock_apply_theme.assert_not_called()
@@ -3094,6 +3097,151 @@ class MainWindowTests(unittest.TestCase):
             sync_settings_theme=False,
         )
         window.setPalette.assert_called_once()
+
+    def test_stopped_theme_callback_does_not_restyle_or_log(self):
+        window = self._make_window()
+        window.is_dark_theme = True
+        window._last_applied_theme_is_dark = True
+        window._theme_transition_in_progress = False
+        window._queued_theme_is_dark = None
+        window._theme_transition_target_is_dark = None
+        window._theme_transition_sequence = 0
+        window.top_bar = Mock()
+        window.setPalette = Mock()
+        window.sig_theme_changed = Mock()
+        window._frontend_state_service = Mock()
+        window.refresh_frontend_state = Mock()
+        window._frontend_action_worker = self.CapturingActionWorker()
+        window._frontend_action_sequence = 0
+
+        with (
+            patch("app.ui.main_window.QTimer.singleShot") as mock_single_shot,
+            patch("app.ui.main_window.apply_application_theme") as mock_apply_theme,
+            patch("app.ui.main_window.debug_logger.log_exception") as mock_log,
+        ):
+            window.toggle_theme()
+            window._stop_theme_sequence()
+            mock_single_shot.call_args.args[-1]()
+
+        mock_apply_theme.assert_not_called()
+        mock_log.assert_not_called()
+        window.append_log.assert_not_called()
+        window.top_bar.set_theme_preview_icon.assert_not_called()
+        window.sig_theme_changed.emit.assert_not_called()
+
+    def test_show_selection_dialog_open_failure_is_distinct_from_cancel(self):
+        from PyQt6.QtCore import Qt
+        from PyQt6.QtWidgets import QDialog
+
+        window = self._make_window()
+        window._current_ui_language = lambda: "zh-CN"
+        window._active_selection_dialog = None
+        window.btn_stop = Mock()
+        window.dismiss_selection_dialog = Mock()
+
+        with patch("app.ui.main_window.SelectionDialog", side_effect=RuntimeError("boom")):
+            failed = MainWindow.show_selection_dialog(window, [{"id": "1", "title": "任务"}])
+
+        self.assertIsInstance(failed, SimpleNamespace)
+        self.assertEqual(failed.reason, "open_failed")
+        self.assertIsInstance(failed.error, RuntimeError)
+        self.assertIsNone(failed.selected)
+
+        dialog = Mock()
+        dialog.exec.return_value = QDialog.DialogCode.Rejected
+        dialog.selected_indices = [0]
+        with patch("app.ui.main_window.SelectionDialog", return_value=dialog):
+            cancelled = MainWindow.show_selection_dialog(window, [{"id": "1", "title": "任务"}])
+
+        self.assertIsNone(cancelled)
+        dialog.setModal.assert_called_with(False)
+        dialog.setWindowModality.assert_called_with(Qt.WindowModality.NonModal)
+        window.btn_stop.clicked.connect.assert_called_with(window.dismiss_selection_dialog)
+        dialog.stop_requested.connect.assert_called_once()
+        self.assertEqual(MainWindow.show_selection_dialog(window, []), [])
+
+    def test_save_dir_updates_on_submit_and_rolls_back_on_failure(self):
+        window = self._make_window()
+        window.sig_change_dir = Mock()
+        window.refresh_frontend_state = Mock()
+        window.__dict__["_save_dir_lock"] = threading.RLock()
+        window.__dict__["_current_save_dir"] = "D:/old"
+        window._submit_frontend_action = Mock(return_value=False)
+
+        MainWindow.set_current_save_dir(window, "D:/new", persist=True)
+
+        self.assertEqual(window.current_save_dir, "D:/old")
+        window.sig_change_dir.emit.assert_not_called()
+
+        window._submit_frontend_action.return_value = True
+        MainWindow.set_current_save_dir(window, "D:/new", persist=True)
+
+        self.assertEqual(window.current_save_dir, "D:/new")
+        window.sig_change_dir.emit.assert_called_once()
+        MainWindow._finish_setting_update(
+            window,
+            {"key": "download_directory", "value": "D:/new"},
+            {"status": "error", "message": "rejected"},
+        )
+        self.assertEqual(window.current_save_dir, "D:/old")
+
+    def test_start_click_bilibili_does_not_overwrite_saved_max_items(self):
+        window = self._make_window()
+        plugin = Mock()
+        plugin.id = "bilibili"
+        window.current_plugin = plugin
+        window.plugin_widget = object()
+        window.inp_search.text.return_value = "BV19nRWBtEnF"
+        window.top_bar = Mock()
+        window.top_bar.current_video_count.return_value = 5
+
+        with patch("app.ui.main_window.read_plugin_run_options", return_value={"max_items": 12}):
+            window.on_btn_start_clicked()
+
+        window.sig_start_crawl.emit.assert_called_once_with(
+            "BV19nRWBtEnF",
+            "bilibili",
+            {"max_items": 12, "max_pages": 5},
+        )
+
+    def test_start_click_quantity_read_failure_does_not_fall_back_to_20(self):
+        window = self._make_window()
+        plugin = Mock()
+        plugin.id = "douyin"
+        window.current_plugin = plugin
+        window.plugin_widget = object()
+        window.inp_search.text.return_value = "关键词"
+        window.top_bar = Mock()
+        window.top_bar.current_video_count.side_effect = ValueError("unset")
+
+        with patch("app.ui.main_window.read_plugin_run_options", return_value={"timeout": 45}):
+            window.on_btn_start_clicked()
+
+        window.sig_start_crawl.emit.assert_called_once_with(
+            "关键词",
+            "douyin",
+            {"timeout": 45},
+        )
+
+    def test_start_click_keeps_persisted_runtime_fields(self):
+        window = self._make_window()
+        plugin = Mock()
+        plugin.id = "douyin"
+        window.current_plugin = plugin
+        window.plugin_widget = None
+        window.inp_search.text.return_value = "关键词"
+
+        with patch(
+            "app.config.get_platform_runtime_defaults",
+            return_value={"max_items": 12, "timeout": 45},
+        ):
+            window.on_btn_start_clicked()
+
+        window.sig_start_crawl.emit.assert_called_once_with(
+            "关键词",
+            "douyin",
+            {"max_items": 12, "timeout": 45},
+        )
 
 
 if __name__ == "__main__":

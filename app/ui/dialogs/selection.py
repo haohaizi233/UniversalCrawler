@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from PyQt6.QtCore import QEvent, QModelIndex, Qt
+from PyQt6.QtCore import QEvent, QModelIndex, Qt, pyqtSignal
 from PyQt6.QtGui import QColor, QKeySequence, QShortcut
 from PyQt6.QtWidgets import (
     QAbstractItemView,
@@ -73,6 +73,8 @@ def exec_selection_dialog(
 
 class SelectionDialog(ChromedDialog):
     """让用户选择哪些扫描结果进入下载队列。"""
+
+    stop_requested = pyqtSignal()
 
     def __init__(self, parent, title="任务清单确认", items=None, *, language: str = "zh-CN"):
         self._language = normalize_language(language)
@@ -146,6 +148,13 @@ class SelectionDialog(ChromedDialog):
         btn_layout.addWidget(self.btn_invert)
         btn_layout.addStretch()
 
+        self.btn_stop = QPushButton(self._tr("停止"))
+        self.btn_stop.setObjectName("StopTaskBtn")
+        self.btn_stop.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._fit_action_button(self.btn_stop, min_width=96, height=40)
+        self.btn_stop.setAutoDefault(False)
+        self.btn_stop.clicked.connect(self._emit_stop_requested)
+
         self.btn_cancel = QPushButton(self._tr("取消任务"))
         self.btn_cancel.setObjectName("DangerBtn")
         self.btn_cancel.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -160,6 +169,7 @@ class SelectionDialog(ChromedDialog):
         self.btn_confirm.setDefault(True)
         self.btn_confirm.setAutoDefault(True)
         self.btn_confirm.clicked.connect(self.confirm_selection)
+        btn_layout.addWidget(self.btn_stop)
         btn_layout.addWidget(self.btn_cancel)
         btn_layout.addWidget(self.btn_confirm)
         layout.addWidget(btn_box)
@@ -177,6 +187,7 @@ class SelectionDialog(ChromedDialog):
         for button, min_width, height in (
             (self.btn_all, 96, 34),
             (self.btn_invert, 96, 34),
+            (self.btn_stop, 96, 40),
             (self.btn_cancel, 128, 40),
             (self.btn_confirm, 148, 40),
         ):
@@ -188,6 +199,10 @@ class SelectionDialog(ChromedDialog):
         width = max(min_width, button.sizeHint().width(), text_width + _BUTTON_HORIZONTAL_PADDING)
         button.setMinimumSize(width, height)
         button.setSizePolicy(QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed)
+
+    def _emit_stop_requested(self) -> None:
+        self.stop_requested.emit()
+        self.reject()
 
     def _tr(self, text: str) -> str:
         return tr(text, self._language)

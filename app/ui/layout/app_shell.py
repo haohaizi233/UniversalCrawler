@@ -1,10 +1,8 @@
 from __future__ import annotations
 
-from PyQt6 import sip
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import (
     QAbstractButton,
-    QApplication,
     QComboBox,
     QHBoxLayout,
     QLabel,
@@ -18,9 +16,20 @@ from PyQt6.QtWidgets import (
 )
 
 from app.core.media_filter import IMAGE_CONTENT_TYPES, IMAGE_EXTENSIONS
-from app.ui.components.combo_popup import fit_combo_width_to_contents, refresh_themed_combo_boxes
+from app.ui.components.combo_popup import refresh_themed_combo_boxes
+from app.ui.layout.app_shell_translation import (
+    apply_language_to_widget_tree,
+    close_combo_popups,
+    safe_find_children,
+    translate_combo,
+    translate_placeholder,
+    translate_table_headers,
+    translate_table_view_headers,
+    translate_text_widget,
+    translate_tooltip,
+)
 from app.ui.layout.island import IslandCard
-from shared.localization import is_translation_of, normalize_language, source_text_for_translation, tr
+from shared.localization import normalize_language
 from app.ui.layout.sidebar import SidebarWidget
 from app.ui.layout.status_bar import StatusBarWidget
 from app.ui.layout.top_bar import TopBarWidget
@@ -138,7 +147,7 @@ class AppShell(QWidget):
 
     def apply_theme(self, is_dark: bool) -> None:
         self.is_dark_theme = bool(is_dark)
-        self._close_combo_popups(self)
+        close_combo_popups(self, self)
         palette = build_palette(is_dark)
         self.setPalette(palette)
         self.setAutoFillBackground(True)
@@ -204,7 +213,7 @@ class AppShell(QWidget):
         page = self.pages.get(page_id)
         if page is None:
             return
-        self._close_combo_popups(self)
+        close_combo_popups(self, self)
         already_current = self.current_page_id == page_id and self.stack.currentWidget() is page
         if already_current:
             self.sidebar.set_active(page_id)
@@ -311,6 +320,12 @@ class AppShell(QWidget):
         if language_changed and self.current_page_id == "settings":
             page_needs_render = True
 
+        progress_only = str(snapshot.get("active_downloads_update_kind") or "") == "progress"
+        if progress_only:
+            self._apply_active_download_progress(snapshot)
+            if self.current_page_id == "active":
+                page_needs_render = False
+
         if page_needs_render:
             self._render_page(self.current_page_id)
 
@@ -322,7 +337,7 @@ class AppShell(QWidget):
         if full_refresh or "settings_snapshot" in changed_sections:
             self._sync_top_quantity_from_settings(snapshot.get("settings_snapshot") or {})
 
-        if full_refresh or "app_status" in changed_sections:
+        if progress_only or full_refresh or "app_status" in changed_sections:
             self.status_bar.render(snapshot.get("app_status") or {})
 
         count_sections = set(self._PAGE_SECTION_KEYS.values())
@@ -423,7 +438,7 @@ class AppShell(QWidget):
         changed = normalized != self._language
         if not changed:
             return False
-        self._close_combo_popups(self)
+        close_combo_popups(self, self)
         updates_enabled = self.updatesEnabled()
         self.setUpdatesEnabled(False)
         try:
@@ -440,6 +455,12 @@ class AppShell(QWidget):
             if updates_enabled:
                 self.update()
         return changed
+
+    def _apply_active_download_progress(self, snapshot: dict) -> None:
+        page = self.pages.get("active")
+        updater = getattr(page, "apply_progress_update", None)
+        if callable(updater):
+            updater(snapshot)
 
     def _render_page(self, page_id: str) -> None:
         snapshot = self._last_snapshot
@@ -463,240 +484,44 @@ class AppShell(QWidget):
         page = self.pages.get(page_id)
         if page is None:
             return
-        self._apply_language_to_widget_tree(page, self._language)
-        for label in self._safe_find_children(page, QLabel):
+        apply_language_to_widget_tree(page, self._language)
+        for label in safe_find_children(page, QLabel):
             try:
                 if label.property("i18nSkipText") != "true":
-                    self._translate_text_widget(label, label.text, label.setText)
-                self._translate_tooltip(label)
+                    translate_text_widget(label, label.text, label.setText, self._language)
+                translate_tooltip(label, self._language)
             except RuntimeError:
                 continue
-        for button in self._safe_find_children(page, QAbstractButton):
+        for button in safe_find_children(page, QAbstractButton):
             try:
                 if button.property("i18nSkipText") != "true" and button.text():
-                    self._translate_text_widget(button, button.text, button.setText)
-                self._translate_tooltip(button)
+                    translate_text_widget(button, button.text, button.setText, self._language)
+                translate_tooltip(button, self._language)
             except RuntimeError:
                 continue
-        for line_edit in self._safe_find_children(page, QLineEdit):
+        for line_edit in safe_find_children(page, QLineEdit):
             try:
-                self._translate_placeholder(line_edit)
-                self._translate_tooltip(line_edit)
+                translate_placeholder(line_edit, self._language)
+                translate_tooltip(line_edit, self._language)
             except RuntimeError:
                 continue
-        for combo in self._safe_find_children(page, QComboBox):
+        for combo in safe_find_children(page, QComboBox):
             try:
-                self._translate_combo(combo)
-                self._translate_tooltip(combo)
+                translate_combo(combo, self._language)
+                translate_tooltip(combo, self._language)
             except RuntimeError:
                 continue
-        for table in self._safe_find_children(page, QTableWidget):
+        for table in safe_find_children(page, QTableWidget):
             try:
-                self._translate_table_headers(table)
+                translate_table_headers(table, self._language)
             except RuntimeError:
                 continue
-        for table in self._safe_find_children(page, QTableView):
+        for table in safe_find_children(page, QTableView):
             if not isinstance(table, QTableWidget):
                 try:
-                    self._translate_table_view_headers(table)
+                    translate_table_view_headers(table, self._language)
                 except RuntimeError:
                     continue
-
-    def _apply_language_to_widget_tree(self, root: QWidget, language: str) -> None:
-        seen: set[int] = set()
-        for widget in (root, *self._safe_find_children(root, QWidget)):
-            if not self._qt_widget_alive(widget):
-                continue
-            marker = id(widget)
-            if marker in seen:
-                continue
-            seen.add(marker)
-            setter = getattr(widget, "set_language", None)
-            if callable(setter):
-                try:
-                    setter(language)
-                except RuntimeError:
-                    continue
-
-    def _safe_find_children(self, root: QWidget, widget_type):
-        if not self._qt_widget_alive(root):
-            return []
-        try:
-            return [child for child in root.findChildren(widget_type) if self._qt_widget_alive(child)]
-        except RuntimeError:
-            return []
-
-    @staticmethod
-    def _qt_widget_alive(widget: QWidget | None) -> bool:
-        if widget is None:
-            return False
-        try:
-            return not sip.isdeleted(widget)
-        except (AttributeError, RuntimeError, TypeError):
-            return False
-
-    def _close_combo_popups(self, root: QWidget | None) -> None:
-        if root is None:
-            return
-        for combo in self._safe_find_children(root, QComboBox):
-            try:
-                view = combo.view()
-                if view is not None and (view.isVisible() or view.window().isVisible()):
-                    combo.hidePopup()
-                combo.setProperty("popupOpen", "false")
-            except RuntimeError:
-                continue
-        for popup in QApplication.topLevelWidgets():
-            try:
-                if popup is self.window():
-                    continue
-                if popup.objectName() == "PolishedComboPopupWindow":
-                    popup.hide()
-                    popup.setProperty("popupOpen", "false")
-            except RuntimeError:
-                continue
-
-    def _translate_text_widget(self, widget: QWidget, getter, setter) -> None:
-        text = str(getter() or "")
-        if not text:
-            return
-        source = widget.property("_i18n_source_text")
-        if source is None:
-            source = source_text_for_translation(text)
-            widget.setProperty("_i18n_source_text", source)
-        elif not is_translation_of(text, str(source)):
-            source = source_text_for_translation(text)
-            widget.setProperty("_i18n_source_text", source)
-        translated = tr(str(source), self._language)
-        if translated != text:
-            setter(translated)
-
-    def _translate_tooltip(self, widget: QWidget) -> None:
-        text = str(widget.toolTip() or "")
-        if not text:
-            return
-        source = widget.property("_i18n_source_tooltip")
-        if source is None:
-            source = source_text_for_translation(text)
-            widget.setProperty("_i18n_source_tooltip", source)
-        elif not is_translation_of(text, str(source)):
-            source = source_text_for_translation(text)
-            widget.setProperty("_i18n_source_tooltip", source)
-        translated = tr(str(source), self._language)
-        if translated != text:
-            widget.setToolTip(translated)
-
-    def _translate_placeholder(self, line_edit: QLineEdit) -> None:
-        text = str(line_edit.placeholderText() or "")
-        if not text:
-            return
-        source = line_edit.property("_i18n_source_placeholder")
-        if source is None:
-            source = source_text_for_translation(text)
-            line_edit.setProperty("_i18n_source_placeholder", source)
-        elif not is_translation_of(text, str(source)):
-            source = source_text_for_translation(text)
-            line_edit.setProperty("_i18n_source_placeholder", source)
-        translated = tr(str(source), self._language)
-        if translated != text:
-            line_edit.setPlaceholderText(translated)
-
-    def _translate_combo(self, combo: QComboBox) -> None:
-        try:
-            view = combo.view()
-            if view is not None and (view.isVisible() or view.window().isVisible()):
-                combo.hidePopup()
-                combo.setProperty("popupOpen", "false")
-        except RuntimeError:
-            return
-        source_role = int(Qt.ItemDataRole.UserRole) + 77
-        try:
-            blocked = combo.blockSignals(True)
-        except RuntimeError:
-            return
-        try:
-            for index in range(combo.count()):
-                source = combo.itemData(index, source_role)
-                if source is None:
-                    source = source_text_for_translation(combo.itemText(index))
-                    combo.setItemData(index, source, source_role)
-                elif not is_translation_of(combo.itemText(index), str(source)):
-                    source = source_text_for_translation(combo.itemText(index))
-                    combo.setItemData(index, source, source_role)
-                translated = tr(str(source), self._language)
-                if translated != combo.itemText(index):
-                    combo.setItemText(index, translated)
-        except RuntimeError:
-            return
-        finally:
-            try:
-                combo.blockSignals(blocked)
-            except RuntimeError:
-                return
-        padding = combo.property("contentWidthPadding")
-        if padding is not None:
-            try:
-                extra = int(padding)
-                min_width = int(combo.property("contentMinWidth") or 0)
-                max_width = int(combo.property("contentMaxWidth") or 16777215)
-            except (TypeError, ValueError):
-                return
-            if max_width > 0:
-                try:
-                    fit_combo_width_to_contents(
-                        combo,
-                        min_width=min_width,
-                        max_width=max_width,
-                        horizontal_padding=extra,
-                    )
-                    refresh_themed_combo_boxes(combo)
-                except RuntimeError:
-                    return
-
-    def _translate_table_headers(self, table: QTableWidget) -> None:
-        source_role = int(Qt.ItemDataRole.UserRole) + 78
-        for index in range(table.columnCount()):
-            item = table.horizontalHeaderItem(index)
-            if item is None:
-                continue
-            source = item.data(source_role)
-            if source is None:
-                source = source_text_for_translation(item.text())
-                item.setData(source_role, source)
-            elif not is_translation_of(item.text(), str(source)):
-                source = source_text_for_translation(item.text())
-                item.setData(source_role, source)
-            item.setText(tr(str(source), self._language))
-
-    def _translate_table_view_headers(self, table: QTableView) -> None:
-        model = table.model()
-        if model is None:
-            return
-        set_language = getattr(model, "set_language", None)
-        if callable(set_language):
-            set_language(self._language)
-            return
-        column_count = model.columnCount()
-        current = [
-            str(model.headerData(index, Qt.Orientation.Horizontal, Qt.ItemDataRole.DisplayRole) or "")
-            for index in range(column_count)
-        ]
-        source = table.property("_i18n_source_headers")
-        if not isinstance(source, list) or len(source) != column_count:
-            source = [source_text_for_translation(value) for value in current]
-            table.setProperty("_i18n_source_headers", source)
-        else:
-            translated_source = [tr(str(value), self._language) for value in source]
-            if current != translated_source and not all(
-                is_translation_of(text, str(source_value))
-                for text, source_value in zip(current, source, strict=True)
-            ):
-                source = [source_text_for_translation(value) for value in current]
-                table.setProperty("_i18n_source_headers", source)
-        translated = [tr(str(value), self._language) for value in source]
-        set_headers = getattr(model, "set_headers", None)
-        if callable(set_headers):
-            set_headers(translated)
 
     def selected_video_id(self) -> str | None:
         page = self.pages.get(self.current_page_id)

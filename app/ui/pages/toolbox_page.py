@@ -251,12 +251,36 @@ class ToolboxPage(PageFrame):
         self.items = [dict(item) for item in snapshot.items]
         self.recent_items = [dict(item) for item in snapshot.recent_items]
         self._display_projections = {key: dict(value) for key, value in snapshot.projections.items()}
+        target = self._preferred_tool_id(snapshot)
         if render_cards:
-            self._render_tool_cards(preferred_tool_id=snapshot.selected_tool_id)
-        elif snapshot.selected_tool_id and self._has_tool(snapshot.selected_tool_id):
-            self._select_tool(snapshot.selected_tool_id)
-        else:
-            self._render_workspace()
+            self._render_tool_cards(preferred_tool_id=target)
+            return
+        if target and target != self.current_tool_id and self._has_tool(target):
+            self._select_tool(target)
+            return
+        self._render_workspace()
+
+    @staticmethod
+    def _history_tool_id(snapshot: ToolboxSnapshot) -> str:
+        if not snapshot.recent_items:
+            return ""
+        latest = snapshot.recent_items[0]
+        return str(latest.get("tool_id") or latest.get("id") or "")
+
+    def _preferred_tool_id(self, snapshot: ToolboxSnapshot) -> str:
+        history_tool_id = self._history_tool_id(snapshot)
+        explicit_id = snapshot.selected_tool_id if snapshot.selection_from_snapshot else ""
+        if explicit_id and explicit_id != history_tool_id and self._has_tool(explicit_id):
+            return explicit_id
+        if self.current_tool_id and self._has_tool(self.current_tool_id):
+            return self.current_tool_id
+        if (
+            snapshot.selected_tool_id
+            and snapshot.selected_tool_id != history_tool_id
+            and self._has_tool(snapshot.selected_tool_id)
+        ):
+            return snapshot.selected_tool_id
+        return ""
 
     def _render_tool_cards(self, *, preferred_tool_id: str = "") -> None:
         previous_tool_id = self.current_tool_id
@@ -298,6 +322,15 @@ class ToolboxPage(PageFrame):
     def _select_tool(self, tool_id: str) -> None:
         normalized = tool_id if self._has_tool(tool_id) else ""
         self.current_tool_id = normalized
+        if normalized:
+            current = self._snapshot
+            self._snapshot = ToolboxSnapshot(
+                current.items,
+                current.recent_items,
+                current.projections,
+                normalized,
+                False,
+            )
         for key, button in self._tool_buttons.items():
             button.setChecked(key == normalized)
         self._render_workspace()

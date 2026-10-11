@@ -169,6 +169,28 @@ def test_shell_shutdown_failure_runs_media_fallback_and_later_cleanup() -> None:
     event.accept.assert_called_once_with()
 
 
+def test_shutdown_cancels_live_update_download_without_joining() -> None:
+    window = _window()
+    window._update_download_thread.is_alive.return_value = True
+    event = Mock()
+
+    with (
+        patch(
+            "app.ui.main_window_shutdown.window_state_persistence.capture_window_state",
+            return_value={},
+        ),
+        patch(
+            "app.ui.main_window_shutdown.window_state_persistence.start_window_state_persistence"
+        ),
+    ):
+        failure = shutdown_main_window(window, event)
+
+    assert failure is None
+    window._update_download_cancel_event.set.assert_called_once_with()
+    window._update_download_thread.join.assert_not_called()
+    event.accept.assert_called_once_with()
+
+
 def test_inactive_update_thread_does_not_resolve_join_attribute() -> None:
     class InactiveWorker:
         def is_alive(self) -> bool:

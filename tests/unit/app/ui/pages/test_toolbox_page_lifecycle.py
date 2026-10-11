@@ -301,6 +301,59 @@ class ToolboxPageLifecycleTests(unittest.TestCase):
         )
         self.assertNotIn("RAW_EVENT_MUST_NOT_RENDER", visible_text)
 
+    def test_refresh_keeps_current_tool_instead_of_history_tool(self) -> None:
+        self.page.render(_toolbox_snapshot())
+        self.page._select_tool("link_parser")
+
+        snapshot = _toolbox_snapshot()
+        snapshot["toolbox_display_projection"] = {
+            "tool_id": "file_verify",
+            "state": "running",
+            "progress": {"value": 12, "text": "12%"},
+        }
+        snapshot["toolbox_recent_items"] = [{"id": "history-file", "tool_id": "file_verify", "title": "文件校验"}]
+        self.page.render(snapshot)
+
+        self.assertEqual(self.page.current_tool_id, "link_parser")
+        self.assertTrue(self.page._tool_buttons["link_parser"].isChecked())
+
+    def test_progress_projection_does_not_switch_to_another_tool(self) -> None:
+        self.page.render(_toolbox_snapshot())
+        card = self.page._tool_buttons["file_verify"]
+        source = self.page.parameter_editors["source"]
+
+        self.page.apply_display_projection(
+            {
+                "tool_id": "link_parser",
+                "state": "running",
+                "progress": {"value": 40, "text": "40%"},
+            }
+        )
+
+        self.assertEqual(self.page.current_tool_id, "file_verify")
+        self.assertIs(self.page._tool_buttons["file_verify"], card)
+        self.assertIs(self.page.parameter_editors["source"], source)
+
+    def test_refresh_keeps_current_tool_when_selected_id_is_latest_history(self) -> None:
+        self.page.render(_toolbox_snapshot())
+        self.page._select_tool("link_parser")
+
+        snapshot = _toolbox_snapshot()
+        snapshot["toolbox_selected_tool_id"] = "file_verify"
+        snapshot["toolbox_recent_items"] = [{"id": "history-file", "tool_id": "file_verify", "title": "文件校验"}]
+        self.page.render(snapshot)
+
+        self.assertEqual(self.page.current_tool_id, "link_parser")
+        self.assertTrue(self.page._tool_buttons["link_parser"].isChecked())
+
+    def test_snapshot_selected_tool_id_switches_selection(self) -> None:
+        self.page.render(_toolbox_snapshot())
+        snapshot = _toolbox_snapshot()
+        snapshot["toolbox_selected_tool_id"] = "link_parser"
+        self.page.render(snapshot)
+
+        self.assertEqual(self.page.current_tool_id, "link_parser")
+
 
 if __name__ == "__main__":
     unittest.main()

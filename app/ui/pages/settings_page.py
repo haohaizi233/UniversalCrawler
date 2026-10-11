@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 from app.debug_logger import debug_logger
 
@@ -27,6 +28,7 @@ from app.ui.components.combo_popup import apply_themed_combo_box, polish_combo_p
 from app.ui.components.settings_controls import SettingsComboBox, SegmentedControl, UiSwitch
 from app.ui.components.settings_form import SettingsFormBuilder
 from app.ui.components.settings_path_picker import SettingsPathPicker
+from app.ui.dialogs.file_paths import resolve_existing_directory
 from app.ui.components.settings_platform_controls import (
     build_platform_count_combo,
     build_platform_proxy_widget,
@@ -903,10 +905,12 @@ class SettingsPage(PageFrame):
         self._open_download_directory_dialog(editor, setting_key=setting_key)
 
     def _open_download_directory_dialog(self, editor: QLineEdit, *, setting_key: str = "") -> None:
+        window = self.window()
+        current_save_dir = str(getattr(window, "current_save_dir", "") or "") if window is not None else ""
         directory = QFileDialog.getExistingDirectory(
             self,
             self._t("选择下载目录"),
-            editor.text() or "",
+            resolve_existing_directory(editor.text() or "", current_save_dir, str(Path.home())),
             QFileDialog.Option.ShowDirsOnly,
         )
         self._apply_browsed_download_directory(editor, directory, setting_key=setting_key)

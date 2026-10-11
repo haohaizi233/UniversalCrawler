@@ -43,12 +43,11 @@ class SequentialRequestWorker(Generic[RequestT, ResultT]):
             return True
 
     def shutdown(self) -> None:
+        """只通知线程退出，不在 GUI 线程上 join。线程是 daemon，进程退出时回收。"""
         with self._condition:
             self._shutdown = True
             self._pending.clear()
             self._condition.notify()
-        if self._thread.is_alive():
-            self._thread.join(timeout=1.0)
 
     def _run(self) -> None:
         while True:

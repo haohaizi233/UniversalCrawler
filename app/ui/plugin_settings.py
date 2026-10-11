@@ -7,8 +7,7 @@ import sys
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import QCheckBox, QComboBox, QHBoxLayout, QLabel, QWidget
 
-from app.config import cfg, get_platform_default_values, get_platform_runtime_defaults, proxy_app_options, request_timeout_options
-from app.core.plugins.run_options import build_missav_proxy_url
+from app.config import cfg, get_platform_runtime_defaults
 from app.ui.components.combo_popup import ThemedComboBox
 
 class PageLimitSettingsWidget(QWidget):
@@ -52,14 +51,11 @@ class PageLimitSettingsWidget(QWidget):
         return int(self.combo_pages.currentData() or 1)
 
     def set_current_value(self, value: int, max_pages: int) -> None:
-        if value >= max_pages:
-            index = self.combo_pages.findData(max_pages)
-        else:
+        del max_pages
+        index = self.combo_pages.findData(value)
+        if index == -1:
+            self.combo_pages.addItem(str(value), value)
             index = self.combo_pages.findData(value)
-            if index == -1:
-                index = self.combo_pages.findData(1)
-            if index == -1:
-                index = self.combo_pages.findData(20)
         self.combo_pages.setCurrentIndex(max(index, 0))
 
 class MissAVSettingsWidget(QWidget):
@@ -76,151 +72,103 @@ class MissAVSettingsWidget(QWidget):
         layout.addWidget(self.chk_individual)
 
         self.combo_priority = ThemedComboBox(row_height=32)
-        self.combo_priority.addItems(["中文字幕优先", "无码流出优先"])
         saved_priority = cfg.get("missav", "priority", "中文字幕优先")
         if saved_priority == "默认排序":
             saved_priority = "中文字幕优先"
-        self.combo_priority.setCurrentText(saved_priority)
+        self._fill_choice_combo(self.combo_priority, "priority", saved_priority)
         layout.addWidget(self.combo_priority)
 
         layout.addWidget(QLabel("超时:"))
         self.combo_timeout = ThemedComboBox(row_height=32)
-        for option in request_timeout_options():
-            self.combo_timeout.addItem(str(option.get("label") or option.get("value")), int(option.get("value") or 60))
         timeout_value = int(get_platform_runtime_defaults("missav").get("timeout", 60))
-        timeout_index = self.combo_timeout.findData(timeout_value)
-        self.combo_timeout.setCurrentIndex(max(timeout_index, 0))
+        self._fill_choice_combo(self.combo_timeout, "timeout", timeout_value)
         self.combo_timeout.setMinimumWidth(92)
         layout.addWidget(self.combo_timeout)
 
         layout.addWidget(QLabel("代理:"))
         self.combo_proxy = ThemedComboBox(row_height=32)
-        self.combo_proxy.addItems([str(option.get("label") or option.get("value")) for option in proxy_app_options()])
         self.combo_proxy.setEditable(True)
-        self.combo_proxy.setCurrentText(cfg.get("missav", "proxy_app", "Clash (7890)"))
+        for choice in _interactive_choices("missav", "proxy"):
+            label = str(getattr(choice, "label", "") or getattr(choice, "value", "") or "")
+            if label:
+                self.combo_proxy.addItem(label, getattr(choice, "value", label))
+        saved_proxy = str(cfg.get("missav", "proxy_app", "Clash (7890)"))
+        proxy_index = self.combo_proxy.findText(saved_proxy)
+        if proxy_index < 0:
+            proxy_index = self.combo_proxy.findData(saved_proxy)
+        if proxy_index < 0:
+            self.combo_proxy.addItem(saved_proxy, saved_proxy)
+            proxy_index = self.combo_proxy.findText(saved_proxy)
+        if proxy_index >= 0:
+            self.combo_proxy.setCurrentIndex(proxy_index)
+        else:
+            self.combo_proxy.setCurrentText(saved_proxy)
         self.combo_proxy.setMinimumWidth(220)
         layout.addWidget(self.combo_proxy)
 
-def build_bilibili_settings_widget(parent=None) -> PageLimitSettingsWidget:
-    defaults = get_platform_runtime_defaults("bilibili")
-    return PageLimitSettingsWidget(
-        parent,
-        label_text="页数:",
-        max_pages=9999,
-        default_pages=int(defaults.get("max_pages", 1)),
-        tooltip="搜索或列表扫描页数，可选 1/2/3/5/max。",
-        preset_values=[1, 2, 3, 5, 9999],
-    )
+    @staticmethod
+    def _fill_choice_combo(combo: ThemedComboBox, field_key: str, current) -> None:
+        for choice in _interactive_choices("missav", field_key):
+            value = getattr(choice, "value", None)
+            if value is None:
+                continue
+            label = str(getattr(choice, "label", "") or value)
+            combo.addItem(label, value)
+        index = combo.findData(current)
+        if index < 0:
+            index = combo.findText(str(current))
+        if index < 0:
+            combo.addItem(str(current), current)
+            index = combo.findData(current)
+        combo.setCurrentIndex(max(index, 0))
 
-def read_bilibili_run_options(widget: QWidget | None) -> dict[str, int]:
-    if not isinstance(widget, PageLimitSettingsWidget):
-        defaults = get_platform_default_values("bilibili")
-        return {"max_pages": int(defaults.get("max_pages", 1)), "max_items": 9999}
-    pages = widget.current_value()
-    return {"max_pages": pages, "max_items": 9999}
+def build_bilibili_settings_widget(parent=None) -> PageLimitSettingsWidget:
+    from app.core.plugins.settings_builders import build_bilibili_settings_widget as build_widget
+
+    return build_widget(parent)
+
+def read_bilibili_run_options(widget: QWidget | None) -> dict:
+    from app.core.plugins.settings_builders import read_bilibili_run_options as read_runtime
+
+    return read_runtime(widget)
 
 def build_douyin_settings_widget(parent=None) -> PageLimitSettingsWidget:
-    defaults = get_platform_runtime_defaults("douyin")
-    return PageLimitSettingsWidget(
-        parent,
-        label_text="视频数:",
-        max_pages=9999,
-        default_pages=int(defaults.get("max_items", 20)),
-        tooltip="抖音单次最多处理的视频数量，可选 10/20/30/50/max。",
-        preset_values=[10, 20, 30, 50, 9999],
-    )
+    from app.core.plugins.settings_builders import build_douyin_settings_widget as build_widget
 
-def read_douyin_run_options(widget: QWidget | None) -> dict[str, int]:
-    if not isinstance(widget, PageLimitSettingsWidget):
-        defaults = get_platform_default_values("douyin")
-        return {
-            "max_items": int(defaults.get("max_items", 20)),
-            "timeout": int(defaults.get("timeout", 10)),
-        }
-    max_items = widget.current_value()
-    defaults = get_platform_runtime_defaults("douyin")
-    return {"max_items": max_items, "timeout": int(defaults.get("timeout", 10))}
+    return build_widget(parent)
+
+def read_douyin_run_options(widget: QWidget | None) -> dict:
+    from app.core.plugins.settings_builders import read_douyin_run_options as read_runtime
+
+    return read_runtime(widget)
 
 def build_xiaohongshu_settings_widget(parent=None) -> PageLimitSettingsWidget:
-    defaults = get_platform_runtime_defaults("xiaohongshu")
-    return PageLimitSettingsWidget(
-        parent,
-        label_text="笔记数:",
-        max_pages=9999,
-        default_pages=int(defaults.get("max_items", 20)),
-        tooltip="小红书单次最多处理的笔记数量，可选 10/20/30/50/max。",
-        preset_values=[10, 20, 30, 50, 9999],
-    )
+    from app.core.plugins.settings_builders import build_xiaohongshu_settings_widget as build_widget
 
-def read_xiaohongshu_run_options(widget: QWidget | None) -> dict[str, int | float]:
-    defaults = get_platform_runtime_defaults("xiaohongshu")
-    if not isinstance(widget, PageLimitSettingsWidget):
-        defaults = get_platform_default_values("xiaohongshu")
-        return {
-            "max_items": int(defaults.get("max_items", 20)),
-            "search_max_pages": int(defaults.get("search_max_pages", 5)),
-            "timeout": int(defaults.get("timeout", 30)),
-            "request_interval": float(defaults.get("request_interval", 1.5)),
-            "detail_request_interval": float(defaults.get("detail_request_interval", 0.5)),
-        }
-    max_items = widget.current_value()
-    return {
-        "max_items": max_items,
-        "search_max_pages": int(defaults.get("search_max_pages", 5)),
-        "timeout": int(defaults.get("timeout", 30)),
-        "request_interval": float(defaults.get("request_interval", 1.5)),
-        "detail_request_interval": float(defaults.get("detail_request_interval", 0.5)),
-    }
+    return build_widget(parent)
+
+def read_xiaohongshu_run_options(widget: QWidget | None) -> dict:
+    from app.core.plugins.settings_builders import read_xiaohongshu_run_options as read_runtime
+
+    return read_runtime(widget)
 
 def build_kuaishou_settings_widget(parent=None) -> PageLimitSettingsWidget:
-    defaults = get_platform_runtime_defaults("kuaishou")
-    return PageLimitSettingsWidget(
-        parent,
-        label_text="视频数:",
-        max_pages=9999,
-        default_pages=int(defaults.get("max_items", 20)),
-        tooltip="快手单次最多扫描的视频数量，可选 10/20/30/50/max。",
-        preset_values=[10, 20, 30, 50, 9999],
-    )
+    from app.core.plugins.settings_builders import build_kuaishou_settings_widget as build_widget
 
-def read_kuaishou_run_options(widget: QWidget | None) -> dict[str, int]:
-    if not isinstance(widget, PageLimitSettingsWidget):
-        defaults = get_platform_default_values("kuaishou")
-        return {
-            "max_items": int(defaults.get("max_items", 20)),
-            "timeout": int(defaults.get("timeout", 10)),
-        }
-    max_items = widget.current_value()
-    defaults = get_platform_runtime_defaults("kuaishou")
-    return {"max_items": max_items, "timeout": int(defaults.get("timeout", 10))}
+    return build_widget(parent)
+
+def read_kuaishou_run_options(widget: QWidget | None) -> dict:
+    from app.core.plugins.settings_builders import read_kuaishou_run_options as read_runtime
+
+    return read_runtime(widget)
 
 def build_missav_settings_widget(parent=None) -> MissAVSettingsWidget:
     return MissAVSettingsWidget(parent)
 
-def read_missav_run_options(widget: QWidget | None) -> dict[str, str | bool | int]:
-    if not isinstance(widget, MissAVSettingsWidget):
-        # 新版主窗口由配置中心统一管理平台参数，不再挂载旧的行内设置控件。
-        # 此分支必须读取持久化运行值，否则每次启动都会悄悄退回 7890 等出厂默认值。
-        defaults = get_platform_runtime_defaults("missav")
-        return {
-            "individual_only": bool(defaults.get("individual_only", False)),
-            "priority": str(defaults.get("priority", "中文字幕优先")),
-            "timeout": int(defaults.get("timeout", 60)),
-            "proxy": str(defaults.get("proxy", "http://127.0.0.1:7890")),
-        }
+def read_missav_run_options(widget: QWidget | None) -> dict:
+    from app.core.plugins.settings_builders import read_missav_run_options as read_runtime
 
-    is_individual = widget.chk_individual.isChecked()
-    priority = widget.combo_priority.currentText()
-    timeout = int(widget.combo_timeout.currentData() or 60)
-    proxy_str = widget.combo_proxy.currentText()
-    proxy_url = build_missav_proxy_url(proxy_str)
-
-    return {
-        "individual_only": is_individual,
-        "priority": priority,
-        "timeout": timeout,
-        "proxy": proxy_url,
-    }
+    return read_runtime(widget)
 
 def _iter_plugin_settings_functions():
     """为注册表中的每个插件产出 (plugin_id, builder_fn, reader_fn)。
@@ -247,8 +195,23 @@ def build_plugin_settings_widget(plugin_id: str, parent=None) -> QWidget | None:
     return None
 
 def read_plugin_run_options(plugin_id: str, widget: QWidget | None) -> dict:
-    """从 *plugin_id* 的设置控件读取运行参数。"""
-    for pid, _builder, reader in _iter_plugin_settings_functions():
-        if pid == plugin_id and reader is not None:
-            return reader(widget)
-    return {}
+    """从 *plugin_id* 的设置控件读取运行参数；无控件时返回全部持久化运行字段。"""
+    from app.config import get_platform_runtime_defaults
+    from app.core.plugins import settings_builders
+
+    reader = getattr(settings_builders, f"read_{plugin_id}_run_options", None)
+    if callable(reader):
+        return reader(widget)
+    return dict(get_platform_runtime_defaults(plugin_id))
+
+
+def _interactive_choices(plugin_id: str, field_key: str):
+    from app.core.plugin_registry import registry
+
+    plugin = registry.get_plugin(plugin_id)
+    if plugin is None:
+        return ()
+    for field in plugin.get_interactive_spec().fields:
+        if field.key == field_key:
+            return field.choices
+    return ()

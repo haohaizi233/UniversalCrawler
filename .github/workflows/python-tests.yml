@@ -183,7 +183,7 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force artifacts | Out-Null
           python -m coverage erase
-          python -m coverage run --branch --source=app,cli,entry,shared --omit="app/core/lib/*" -m pytest tests/unit tests/integration tests/architecture tests/release tests/testkit -q --junitxml=artifacts/core-tests.xml
+          python -m coverage run --branch --source=app,cli,entry,shared --omit="app/core/lib/douyin/encrypt/aBogus.py,app/core/lib/douyin/encrypt/verifyFp.py,app/core/lib/douyin/encrypt/xBogus.py,app/core/lib/douyin/encrypt/xGnarly.py" -m pytest tests/unit tests/integration tests/architecture tests/release tests/testkit -q --junitxml=artifacts/core-tests.xml
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
           $contractFiles = @(
@@ -204,7 +204,7 @@ jobs:
             $last = [Math]::Min($offset + $contractChunkSize - 1, $contractNodes.Count - 1)
             [string[]] $chunk = $contractNodes[$offset..$last]
             $chunkNumber = [int]($offset / $contractChunkSize) + 1
-            python -m coverage run --append --branch --source=app,cli,entry,shared --omit="app/core/lib/*" -m pytest $chunk -q --junitxml="artifacts/contract-$chunkNumber.xml"
+            python -m coverage run --append --branch --source=app,cli,entry,shared --omit="app/core/lib/douyin/encrypt/aBogus.py,app/core/lib/douyin/encrypt/verifyFp.py,app/core/lib/douyin/encrypt/xBogus.py,app/core/lib/douyin/encrypt/xGnarly.py" -m pytest $chunk -q --junitxml="artifacts/contract-$chunkNumber.xml"
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           }
 

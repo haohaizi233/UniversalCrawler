@@ -1,11 +1,36 @@
 from __future__ import annotations
 
 import builtins
+import shlex
 import unittest
 from unittest import mock
 
 from tests.support.paths import PROJECT_ROOT
 from tests.support.toml_compat import loads
+
+
+def _parse_bandit_command(command: str) -> tuple[list[str], list[str], bool]:
+    argv = shlex.split(command)
+    if argv[:3] != ["python", "-m", "bandit"]:
+        raise AssertionError(f"not a bandit command: {command}")
+    recursive = False
+    excludes: list[str] = []
+    targets: list[str] = []
+    tokens = argv[3:]
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if token in {"-r", "--recursive"}:
+            recursive = True
+        elif token in {"-x", "--exclude"}:
+            index += 1
+            excludes.extend(part for part in tokens[index].split(",") if part)
+        elif token.startswith("--exclude="):
+            excludes.extend(part for part in token.split("=", 1)[1].split(",") if part)
+        elif not token.startswith("-"):
+            targets.append(token)
+        index += 1
+    return targets, excludes, recursive
 
 
 class GitHubActionsWorkflowTests(unittest.TestCase):
@@ -87,8 +112,38 @@ class GitHubActionsWorkflowTests(unittest.TestCase):
         workflow = PROJECT_ROOT / ".github" / "workflows" / "python-tests.yml"
         source = workflow.read_text(encoding="utf-8")
         quality_block = source.split("  quality:", 1)[1].split("  compatibility:", 1)[0]
+        raw_command = next(
+            line for line in quality_block.splitlines() if "python -m bandit" in line
+        )
+        command = raw_command[raw_command.index("python -m bandit"):].strip()
+        targets, excludes, recursive = _parse_bandit_command(command)
+        high_risk_packages = (
+            "app",
+            "cli",
+            "entry",
+            "shared",
+            "app/core",
+            "app/core/lib",
+            "app/core/lib/douyin",
+            "app/core/lib/douyin/encrypt",
+            "app/services",
+            "app/services/secure_updater.py",
+            "app/services/updater_package_verification.py",
+            "app/config/update_trust.py",
+        )
 
-        self.assertNotIn("app/core/lib/douyin/encrypt", quality_block)
+        self.assertTrue(recursive)
+        self.assertEqual(targets, ["app", "cli", "entry", "shared"])
+        self.assertEqual(excludes, ["tests"])
+        for excluded in excludes:
+            normalized = excluded.replace("\\", "/").strip("/")
+            for package in high_risk_packages:
+                self.assertFalse(
+                    normalized == package
+                    or normalized.startswith(package + "/")
+                    or package.startswith(normalized + "/"),
+                    f"high-risk package {package} is excluded by {excluded}",
+                )
 
     def test_linux_quality_runs_native_exact_generation_contracts(self) -> None:
         workflow = PROJECT_ROOT / ".github" / "workflows" / "python-tests.yml"

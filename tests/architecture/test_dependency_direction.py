@@ -33,6 +33,14 @@ LEGACY_SHARED_ADAPTERS = (
     "cli/selection_base.py",
 )
 
+SETTINGS_BUILDER_COMPATIBILITY_IMPORTS = {
+    ("app/core/plugins/settings_builders.py", "app.ui.plugin_settings"),
+}
+
+_DYNAMIC_IMPORT_CALLEES = frozenset(
+    {"import_module", "__import__", "spec_from_file_location"}
+)
+
 SHARED_FRONTEND_CONTRACTS = (
     "shared/failed_page_projection.py",
     "shared/frontend_page_definitions.py",
@@ -65,6 +73,38 @@ def _resolve_import_from(path: Path, node: ast.ImportFrom) -> list[str]:
     return [".".join((*base_parts, alias.name)) for alias in node.names]
 
 
+def _callee_name(node: ast.AST) -> str | None:
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        return node.attr
+    return None
+
+
+def _string_literal(node: ast.AST | None) -> str | None:
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    return None
+
+
+def _dynamic_import_literals(tree: ast.AST) -> list[str]:
+    literals: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        if _callee_name(node.func) not in _DYNAMIC_IMPORT_CALLEES:
+            continue
+        literal = _string_literal(node.args[0]) if node.args else None
+        if literal is None:
+            for keyword in node.keywords:
+                if keyword.arg == "name":
+                    literal = _string_literal(keyword.value)
+                    break
+        if literal is not None:
+            literals.append(literal)
+    return literals
+
+
 def _module_imports(path: Path) -> list[str]:
     tree = ast.parse(path.read_text(encoding="utf-8-sig"), filename=str(path))
     imports: list[str] = []
@@ -73,6 +113,7 @@ def _module_imports(path: Path) -> list[str]:
             imports.extend(alias.name for alias in node.names)
         elif isinstance(node, ast.ImportFrom):
             imports.extend(_resolve_import_from(path, node))
+    imports.extend(_dynamic_import_literals(tree))
     return imports
 
 
@@ -349,6 +390,38 @@ class DependencyDirectionArchitectureTests(unittest.TestCase):
                 violations.append((rel, module))
 
         self.assertEqual(violations, [])
+
+    def test_dynamic_import_literals_ignore_comments_and_non_literals(self) -> None:
+        tree = ast.parse(
+            "\n".join(
+                (
+                    "# import_module('app.ui.commented')",
+                    "def load(name):",
+                    "    import_module('app.ui.plugin_settings')",
+                    "    __import__('app.services.cache_service')",
+                    "    spec_from_file_location('entry.dispatcher', name)",
+                    "    import_module(name)",
+                    "    spec_from_file_location(name, 'app/ui/plugin_settings.py')",
+                )
+            )
+        )
+
+        self.assertEqual(
+            _dynamic_import_literals(tree),
+            [
+                "app.ui.plugin_settings",
+                "app.services.cache_service",
+                "entry.dispatcher",
+            ],
+        )
+
+    def test_core_ui_imports_are_limited_to_settings_builder_compatibility(self) -> None:
+        path = PROJECT_ROOT / "app" / "core" / "plugins" / "settings_builders.py"
+        tree = ast.parse(path.read_text(encoding="utf-8-sig"), filename=str(path))
+        violations = _imports_under("app/core", "app.ui")
+
+        self.assertIn("app.ui.plugin_settings", _dynamic_import_literals(tree))
+        self.assertEqual(set(violations), SETTINGS_BUILDER_COMPATIBILITY_IMPORTS)
 
     def test_cli_does_not_add_new_gui_dependencies(self) -> None:
         known_violations = {

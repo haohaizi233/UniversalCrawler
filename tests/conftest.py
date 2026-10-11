@@ -4,12 +4,19 @@ from __future__ import annotations
 
 import functools
 import importlib.util
+import shutil
 import sys
 import tempfile
+from pathlib import Path
 
 import pytest
 
+# 系统临时目录（例如 C:\Windows\Temp）的上级无法取得目录能力。
+# Windows 上把 pytest 临时目录放到仓库 tmp/，目录租约才能打开。
+_REPO_PYTEST_TMP = Path(__file__).resolve().parents[1] / "tmp" / "ucrawl-pytest"
+
 if sys.platform == "win32":
+    _REPO_PYTEST_TMP.mkdir(parents=True, exist_ok=True)
     _TemporaryDirectory = tempfile.TemporaryDirectory
 
     class _WindowsTemporaryDirectory(_TemporaryDirectory):
@@ -17,6 +24,7 @@ if sys.platform == "win32":
 
         def __init__(self, *args, **kwargs):
             kwargs.setdefault("ignore_cleanup_errors", True)
+            kwargs.setdefault("dir", str(_REPO_PYTEST_TMP))
             super().__init__(*args, **kwargs)
 
     tempfile.TemporaryDirectory = _WindowsTemporaryDirectory
@@ -67,8 +75,22 @@ def isolate_runtime_user_data(tmp_path, monkeypatch):
     unless a test explicitly asserts the runtime path policy.
     """
 
-    monkeypatch.setenv("UCRAWL_USER_DATA_ROOT", str(tmp_path / "user_data"))
-    yield
+    if sys.platform == "win32":
+        base = Path(
+            tempfile.mkdtemp(prefix="ucrawl-user-data-", dir=_REPO_PYTEST_TMP)
+        )
+        user_data = base / "user_data"
+    else:
+        base = None
+        user_data = tmp_path / "user_data"
+    # 测试可能把 shutil.rmtree 打桩成失败探针；这里持有原实现，拆除时不被打桩劫持。
+    real_rmtree = shutil.rmtree
+    monkeypatch.setenv("UCRAWL_USER_DATA_ROOT", str(user_data))
+    try:
+        yield
+    finally:
+        if base is not None:
+            real_rmtree(base, ignore_errors=True)
 
 
 @pytest.fixture(autouse=True)

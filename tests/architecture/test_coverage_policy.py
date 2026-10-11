@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -14,6 +15,28 @@ from tests.support.toml_compat import loads
 pytestmark = pytest.mark.architecture
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+COVERAGE_SOURCE = ("app", "cli", "entry", "shared")
+# 只省略本地纯算法/签名实现。网络、Cookie、会话文件必须留在门槛内，名单不能再扩大。
+PURE_LOCAL_ALGORITHM_OMIT = (
+    "app/core/lib/douyin/encrypt/aBogus.py",
+    "app/core/lib/douyin/encrypt/verifyFp.py",
+    "app/core/lib/douyin/encrypt/xBogus.py",
+    "app/core/lib/douyin/encrypt/xGnarly.py",
+)
+MEASURED_NETWORK_COOKIE_OR_SESSION = (
+    "app/core/lib/douyin/encrypt/__init__.py",
+    "app/core/lib/douyin/encrypt/device_id.py",
+    "app/core/lib/douyin/encrypt/msToken.py",
+    "app/core/lib/douyin/encrypt/ttWid.py",
+    "app/core/lib/douyin/encrypt/webID.py",
+    "app/core/lib/douyin/interface/template.py",
+    "app/core/lib/douyin/link/requester.py",
+    "app/core/lib/douyin/tools/session.py",
+)
+_COVERAGE_RUN = re.compile(
+    r"python -m coverage run(?: --append)? --branch "
+    r'--source=(?P<source>\S+) --omit="(?P<omit>[^"]*)"'
+)
 
 
 def _coverage_config() -> dict:
@@ -21,12 +44,29 @@ def _coverage_config() -> dict:
     return pyproject["tool"]["coverage"]
 
 
+def _workflow_coverage_invocations() -> list[re.Match[str]]:
+    workflow = (PROJECT_ROOT / ".github" / "workflows" / "python-tests.yml").read_text(
+        encoding="utf-8"
+    )
+    return list(_COVERAGE_RUN.finditer(workflow))
+
+
 def test_coverage_run_policy_tracks_core_production_packages_and_branches() -> None:
     run = _coverage_config()["run"]
+    omit = tuple(run["omit"])
 
     assert run["branch"] is True
-    assert set(run["source"]) == {"app", "cli", "entry", "shared"}
-    assert "app/core/lib/*" in run["omit"]
+    assert tuple(run["source"]) == COVERAGE_SOURCE
+    assert omit == PURE_LOCAL_ALGORITHM_OMIT
+    assert "app/core/lib/*" not in omit
+    assert not any(set(pattern) & set("*?[]") for pattern in omit)
+    for relative in omit:
+        source = (PROJECT_ROOT / relative).read_text(encoding="utf-8")
+        lowered = source.lower()
+        assert "cookie" not in lowered
+        for marker in ("request_params", "httpx", "urlopen", "requests.", "http.client", "curl_cffi"):
+            assert marker not in lowered
+    assert set(MEASURED_NETWORK_COOKIE_OR_SESSION).isdisjoint(omit)
 
 
 def test_coverage_report_policy_is_visible_and_prevents_regression() -> None:
@@ -41,10 +81,20 @@ def test_ci_uses_the_same_coverage_floor() -> None:
     workflow = (PROJECT_ROOT / ".github" / "workflows" / "python-tests.yml").read_text(
         encoding="utf-8"
     )
+    run = _coverage_config()["run"]
+    invocations = _workflow_coverage_invocations()
 
     assert _coverage_config()["report"]["fail_under"] >= 75
     assert "python -m coverage report" in workflow
     assert "coverage report --fail-under" not in workflow
+    assert len(invocations) == 2
+    expected_source = ",".join(COVERAGE_SOURCE)
+    expected_omit = ",".join(PURE_LOCAL_ALGORITHM_OMIT)
+    assert expected_source == ",".join(run["source"])
+    assert expected_omit == ",".join(run["omit"])
+    for invocation in invocations:
+        assert invocation.group("source") == expected_source
+        assert invocation.group("omit") == expected_omit
 
 
 def test_coverage_policy_imports_when_stdlib_tomllib_is_unavailable() -> None:

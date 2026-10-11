@@ -921,5 +921,85 @@ with manager._exclusive_file_lock():
             self.assertEqual(manager.get("ui", "main_splitter_state"), "0506")
             self.assertEqual(manager.get("ui", "right_splitter_state"), "0708")
 
+    def test_cleanup_old_logs_on_start_defaults_to_false(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "config.json"
+            manager = ConfigManager(str(config_path))
+
+            self.assertIs(manager.get("logging", "cleanup_old_logs_on_start"), False)
+            saved = json.loads(config_path.read_text(encoding="utf-8"))
+            self.assertIs(saved["logging"]["cleanup_old_logs_on_start"], False)
+
+            del saved["logging"]["cleanup_old_logs_on_start"]
+            config_path.write_text(json.dumps(saved), encoding="utf-8")
+            reloaded = ConfigManager(str(config_path))
+
+            self.assertIs(reloaded.get("logging", "cleanup_old_logs_on_start"), False)
+
+    def test_reload_if_changed_pins_signature_to_the_version_that_was_read(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            manager = ConfigManager(f"{temp_dir}/config.json")
+            sig_read = (11, 11, 11)
+            calls = {"n": 0}
+
+            def next_signature():
+                calls["n"] += 1
+                if calls["n"] > 3:
+                    raise AssertionError("signature was sampled after the consistent read")
+                return sig_read
+
+            updated = json.loads(json.dumps(manager.settings.to_dict()))
+            updated["appearance"]["accent"] = "red"
+
+            with mock.patch.object(manager, "_current_disk_signature", side_effect=next_signature):
+                with mock.patch.object(manager, "_read_disk_data_unlocked", return_value=updated):
+                    self.assertTrue(manager.reload_if_changed())
+
+            self.assertEqual(sig_read, manager._disk_signature)
+            self.assertEqual("red", manager.get("appearance", "accent"))
+            self.assertEqual(3, calls["n"])
+
+    def test_reload_if_changed_rereads_inside_file_lock_when_signature_changes(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            manager = ConfigManager(f"{temp_dir}/config.json")
+            sig_before = (21, 21, 21)
+            sig_during = (22, 22, 22)
+            sig_locked = (23, 23, 23)
+            calls = {"n": 0}
+            reads = {"n": 0}
+
+            def next_signature():
+                calls["n"] += 1
+                if calls["n"] == 1 or calls["n"] == 2:
+                    return sig_before
+                if calls["n"] == 3:
+                    return sig_during
+                if calls["n"] in {4, 5}:
+                    return sig_locked
+                raise AssertionError("signature was sampled after the locked read")
+
+            torn = json.loads(json.dumps(manager.settings.to_dict()))
+            torn["common"]["theme"] = "dark"
+            stable = json.loads(json.dumps(manager.settings.to_dict()))
+            stable["appearance"]["accent"] = "red"
+
+            def next_read():
+                reads["n"] += 1
+                if reads["n"] == 1:
+                    return torn
+                if reads["n"] == 2:
+                    return stable
+                raise AssertionError("unexpected extra read")
+
+            with mock.patch.object(manager, "_current_disk_signature", side_effect=next_signature):
+                with mock.patch.object(manager, "_read_disk_data_unlocked", side_effect=next_read):
+                    self.assertTrue(manager.reload_if_changed())
+
+            self.assertEqual(sig_locked, manager._disk_signature)
+            self.assertNotEqual(sig_during, manager._disk_signature)
+            self.assertEqual("light", manager.get("common", "theme"))
+            self.assertEqual("red", manager.get("appearance", "accent"))
+            self.assertEqual(2, reads["n"])
+
 if __name__ == "__main__":
     unittest.main()

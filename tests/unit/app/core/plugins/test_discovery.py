@@ -1,6 +1,5 @@
 """Tests for SPI-based plugin discovery."""
 
-import types
 import unittest
 from unittest.mock import patch
 
@@ -116,33 +115,62 @@ class PluginDiscoveryTests(unittest.TestCase):
 
         self.assertEqual(len(result), 1)
         self.assertIs(result[0], PluginEp)
+        self.assertEqual(result.errors, [])
 
-    def test_external_plugin_discovery(self):
-        """External directory discovery loads .py plugin files."""
+    def test_entry_point_import_failure_is_reported(self):
+        from app.core.plugins.discovery import discover_entry_point_plugins
+
+        class BrokenEntryPoint:
+            name = "broken-ep"
+
+            def load(self):
+                raise ImportError("missing plugin module")
+
+        with patch(
+            "app.core.plugins.discovery.importlib.metadata.entry_points",
+            return_value=[BrokenEntryPoint()],
+        ):
+            result = discover_entry_point_plugins()
+
+        self.assertEqual(list(result.classes), [])
+        self.assertTrue(any("broken-ep" in error and "导入失败" in error for error in result.errors))
+
+    def test_external_plugin_discovery_loads_by_absolute_path(self):
+        """External directory discovery loads .py files without keeping the directory on sys.path."""
+        import os
+        import sys
+        import tempfile
+
         from app.core.plugins.discovery import discover_external_plugins
 
-        MOD_NAME = "ucrawl_ext_plugin_my_plugin"
-        PluginExt = type(
-            "ExtFilePlugin",
-            (BasePlugin,),
-            {"id": "ext_file", "name": "ExtFile", "sort_order": 10, "__module__": MOD_NAME},
+        source = (
+            "from app.core.plugins.base import BasePlugin\n"
+            "class ExtFilePlugin(BasePlugin):\n"
+            "    id = 'ext_file_abs_path'\n"
+            "    name = 'ExtFile'\n"
+            "    sort_order = 10\n"
         )
+        saved = dict(BasePlugin._subclasses)
+        before_path = list(sys.path)
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                plugin_path = os.path.join(temp_dir, "my_plugin.py")
+                with open(plugin_path, "w", encoding="utf-8") as handle:
+                    handle.write(source)
+                dotted = os.path.join(temp_dir, "bad.name.py")
+                with open(dotted, "w", encoding="utf-8") as handle:
+                    handle.write("raise RuntimeError('dotted plugin must not import')\n")
+                result = discover_external_plugins(temp_dir, force=True)
+                self.assertEqual(list(sys.path), before_path)
+                self.assertNotIn(os.path.abspath(temp_dir), sys.path)
+        finally:
+            BasePlugin._subclasses.clear()
+            BasePlugin._subclasses.update(saved)
+            sys.modules.pop("ucrawl_ext_plugin_my_plugin", None)
 
-        def _fake_import(mod_name):
-            m = types.ModuleType(mod_name)
-            m.ExtFilePlugin = PluginExt
-            return m
-
-        with (
-            patch("app.core.plugins.discovery.os.path.isdir", return_value=True),
-            patch("app.core.plugins.discovery.os.listdir", return_value=["my_plugin.py"]),
-            patch("app.core.plugins.discovery.os.path.getmtime", return_value=100.0),
-            patch("app.core.plugins.discovery.importlib.import_module", side_effect=_fake_import),
-        ):
-            result = discover_external_plugins("/fake/plugins", force=True)
-
-        self.assertEqual(len(result), 1)
-        self.assertIs(result[0], PluginExt)
+        self.assertEqual([cls.id for cls in result.classes], ["ext_file_abs_path"])
+        self.assertTrue(any("带点" in error for error in result.errors))
+        self.assertNotIn("ucrawl_ext_plugin_bad.name", sys.modules)
 
 if __name__ == "__main__":
     unittest.main()

@@ -17,27 +17,48 @@ from .metadata import (
 )
 
 
-ITEM_CHOICES = tuple(
-    InteractiveChoice(label, value)
-    for label, value in (
-        ("1", 1),
-        ("2", 2),
-        ("5", 5),
-        ("10", 10),
-        ("20", 20),
-        ("max (9999)", 9999),
-    )
+def _choices(*pairs: tuple[str, int]) -> tuple[InteractiveChoice, ...]:
+    return tuple(InteractiveChoice(label, value) for label, value in pairs)
+
+
+# 与桌面数量控件、配置中心的档位保持同一组取值。
+VIDEO_COUNT_CHOICES = _choices(
+    ("10", 10),
+    ("20", 20),
+    ("30", 30),
+    ("50", 50),
+    ("max (9999)", 9999),
 )
-PAGE_CHOICES = tuple(
-    InteractiveChoice(label, value)
-    for label, value in (
-        ("1", 1),
-        ("2", 2),
-        ("5", 5),
-        ("10", 10),
-        ("20", 20),
-        ("max (500)", 500),
-    )
+NOTE_COUNT_CHOICES = VIDEO_COUNT_CHOICES
+PAGE_CHOICES = _choices(
+    ("1", 1),
+    ("2", 2),
+    ("3", 3),
+    ("5", 5),
+    ("max (9999)", 9999),
+)
+ITEM_CHOICES = VIDEO_COUNT_CHOICES
+
+
+# 与 app.config.settings.PROXY_APP_OPTIONS / REQUEST_TIMEOUT_OPTIONS 同一组取值。
+MISSAV_PROXY_CHOICES = (
+    InteractiveChoice("系统代理", "系统代理"),
+    InteractiveChoice("直连（不使用代理）", "直连"),
+    InteractiveChoice("Clash (7890)", "Clash (7890)"),
+    InteractiveChoice("Clash Verge (7897)", "Clash Verge (7897)"),
+    InteractiveChoice("v2rayN (10809)", "v2rayN (10809)"),
+    InteractiveChoice("V2Ray / Qv2ray (10808)", "V2Ray / Qv2ray (10808)"),
+    InteractiveChoice("sing-box (2080)", "sing-box (2080)"),
+    InteractiveChoice("NekoRay (2080)", "NekoRay (2080)"),
+    InteractiveChoice("自定义 HTTP/SOCKS5 端点", None, custom=True),
+)
+MISSAV_TIMEOUT_CHOICES = _choices(
+    ("30 秒", 30),
+    ("60 秒（推荐）", 60),
+    ("90 秒", 90),
+    ("120 秒", 120),
+    ("180 秒", 180),
+    ("300 秒", 300),
 )
 
 class KuaishouPlugin(BasePlugin):
@@ -133,24 +154,16 @@ class MissAVPlugin(BasePlugin):
                 ),
             ),
             InteractiveField(
+                key="timeout",
+                prompt="超时",
+                summary_label="超时",
+                choices=MISSAV_TIMEOUT_CHOICES,
+            ),
+            InteractiveField(
                 key="proxy",
                 prompt="代理",
                 summary_label="代理",
-                choices=(
-                    InteractiveChoice(
-                        "Clash (7890)",
-                        "Clash (7890)",
-                    ),
-                    InteractiveChoice(
-                        "v2rayN (10809)",
-                        "v2rayN (10809)",
-                    ),
-                    InteractiveChoice(
-                        "自定义",
-                        None,
-                        custom=True,
-                    ),
-                ),
+                choices=MISSAV_PROXY_CHOICES,
                 custom_prompt="代理地址",
             ),
         ),
@@ -303,7 +316,7 @@ class XiaohongshuPlugin(BasePlugin):
                 key="max_items",
                 prompt="笔记数量",
                 summary_label="笔记数",
-                choices=ITEM_CHOICES,
+                choices=NOTE_COUNT_CHOICES,
             ),
         ),
         auth=PlatformAuthSpec(

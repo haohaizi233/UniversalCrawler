@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 from typing import TYPE_CHECKING, Any
 
 from .metadata import (
@@ -37,11 +38,15 @@ class BasePlugin:
     settings_builder: Callable[[], dict[str, Any]] | None = None
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
-        """自动登记每个非抽象插件子类。"""
+        """自动登记每个非抽象插件子类。相同 ID 的不同插件直接失败。"""
         super().__init_subclass__(**kwargs)
         pid = getattr(cls, "id", None)
-        if pid and pid != "base":
-            cls._subclasses[pid] = cls
+        if not pid or pid == "base":
+            return
+        existing = cls._subclasses.get(pid)
+        if existing is not None and existing is not cls and not _is_same_module_reload(existing, cls):
+            raise ValueError(f"重复的插件 ID: {pid}")
+        cls._subclasses[pid] = cls
 
     # 具体插件可覆盖的 SPI 接口
 
@@ -94,6 +99,16 @@ class BasePlugin:
     def get_subclass(cls, plugin_id: str) -> type[BasePlugin] | None:
         """按平台 ID 查询已登记的插件类。"""
         return cls._subclasses.get(plugin_id)
+
+def _is_same_module_reload(existing: type[BasePlugin], cls: type[BasePlugin]) -> bool:
+    """同一模块被重新执行时替换旧类；同一模块里的第二个类仍算冲突。"""
+    if existing.__module__ != cls.__module__:
+        return False
+    module = sys.modules.get(cls.__module__)
+    if module is None:
+        return False
+    return getattr(module, existing.__name__, None) is not existing
+
 
 # 兼容旧调用路径的便捷导出
 __all__ = [

@@ -111,6 +111,6 @@ def test_every_builtin_declares_non_generic_interactive_metadata():
     assert [
         field["key"]
         for field in manifests["missav"]["interactive"]["fields"]
-    ] == ["individual_only", "priority", "proxy"]
+    ] == ["individual_only", "priority", "timeout", "proxy"]
     assert manifests["kuaishou"]["interactive"]["auth"]["mode"] == "cookie"
     assert manifests["missav"]["interactive"]["auth"]["mode"] == "none"

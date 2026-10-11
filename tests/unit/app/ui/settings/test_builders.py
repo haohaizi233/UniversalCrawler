@@ -11,6 +11,7 @@ from app.ui.plugin_settings import (
     read_bilibili_run_options,
     read_douyin_run_options,
     read_missav_run_options,
+    read_plugin_run_options,
     read_xiaohongshu_run_options,
 )
 
@@ -34,8 +35,7 @@ class SettingsBuildersTests(unittest.TestCase):
         self.assertEqual(widget.current_value(), 9999)
         self.assertEqual(widget.combo_pages.currentText(), "max")
 
-    def test_page_limit_widget_falls_back_to_one_for_unknown_small_value(self):
-        """验证 `test_page_limit_widget_falls_back_to_one_for_unknown_small_value` 对应场景是否符合预期，供 `SettingsBuildersTests` 使用。"""
+    def test_page_limit_widget_keeps_unknown_small_value(self):
         widget = PageLimitSettingsWidget(
             label_text="页数:",
             max_pages=20,
@@ -43,9 +43,9 @@ class SettingsBuildersTests(unittest.TestCase):
             tooltip="demo",
         )
 
-        self.assertEqual(widget.current_value(), 1)
+        self.assertEqual(widget.current_value(), 4)
 
-    def test_page_limit_widget_falls_back_to_recommended_count_for_stale_video_value(self):
+    def test_page_limit_widget_keeps_value_missing_from_choices(self):
         widget = PageLimitSettingsWidget(
             label_text="视频数",
             max_pages=9999,
@@ -54,7 +54,7 @@ class SettingsBuildersTests(unittest.TestCase):
             preset_values=[10, 20, 30, 50, 9999],
         )
 
-        self.assertEqual(widget.current_value(), 20)
+        self.assertEqual(widget.current_value(), 100)
 
     @patch("app.ui.plugin_settings.cfg.set")
     def test_read_bilibili_run_options_reads_selected_pages_without_persisting(self, mocked_set):
@@ -70,29 +70,42 @@ class SettingsBuildersTests(unittest.TestCase):
 
         result = read_bilibili_run_options(widget)
 
-        self.assertEqual(result, {"max_pages": 3, "max_items": 9999})
+        self.assertEqual(result["max_pages"], 3)
+        self.assertIn("max_items", result)
+        self.assertIn("timeout", result)
         mocked_set.assert_not_called()
 
-    def test_read_douyin_run_options_returns_defaults_for_invalid_widget(self):
-        """验证 `test_read_douyin_run_options_returns_defaults_for_invalid_widget` 对应场景是否符合预期，供 `SettingsBuildersTests` 使用。"""
+    @patch(
+        "app.config.get_platform_runtime_defaults",
+        return_value={"max_items": 12, "timeout": 45},
+    )
+    def test_read_douyin_run_options_returns_persisted_runtime_without_widget(self, runtime_defaults):
         result = read_douyin_run_options(None)
 
-        self.assertEqual(result, {"max_items": 20, "timeout": 60})
+        self.assertEqual(result, {"max_items": 12, "timeout": 45})
+        runtime_defaults.assert_called_with("douyin")
+        self.assertEqual(read_plugin_run_options("douyin", None), {"max_items": 12, "timeout": 45})
 
-    def test_read_xiaohongshu_run_options_returns_defaults_for_invalid_widget(self):
-        """验证小红书运行参数读取在无控件时使用默认值。"""
+    @patch(
+        "app.config.get_platform_runtime_defaults",
+        return_value={
+            "max_items": 12,
+            "search_max_pages": 2,
+            "timeout": 40,
+            "request_interval": 0.2,
+            "detail_request_interval": 0.1,
+            "sort": "popular",
+            "note_type": "video",
+        },
+    )
+    def test_read_xiaohongshu_run_options_returns_persisted_runtime_without_widget(self, runtime_defaults):
         result = read_xiaohongshu_run_options(None)
 
-        self.assertEqual(
-            result,
-            {
-                "max_items": 20,
-                "search_max_pages": 5,
-                "timeout": 30,
-                "request_interval": 0.15,
-                "detail_request_interval": 0.0,
-            },
-        )
+        self.assertEqual(result["max_items"], 12)
+        self.assertEqual(result["sort"], "popular")
+        self.assertEqual(result["note_type"], "video")
+        self.assertEqual(result["request_interval"], 0.2)
+        runtime_defaults.assert_called_with("xiaohongshu")
 
     @patch("app.ui.plugin_settings.cfg.update_missav_proxy")
     @patch("app.ui.plugin_settings.cfg.set")
@@ -106,39 +119,44 @@ class SettingsBuildersTests(unittest.TestCase):
 
         result = read_missav_run_options(widget)
 
-        self.assertEqual(
-            result,
-            {
-                "individual_only": True,
-                "priority": "无码流出优先",
-                "timeout": 120,
-                "proxy": "http://127.0.0.1:9001",
-            },
-        )
+        self.assertEqual(result["individual_only"], True)
+        self.assertEqual(result["priority"], "无码流出优先")
+        self.assertEqual(result["timeout"], 120)
+        self.assertEqual(result["proxy"], "http://127.0.0.1:9001")
+        self.assertIn("max_items", result)
         mocked_set.assert_not_called()
         mocked_update_proxy.assert_not_called()
 
-    def test_read_missav_run_options_returns_defaults_for_invalid_widget(self):
-        """验证 `test_read_missav_run_options_returns_defaults_for_invalid_widget` 对应场景是否符合预期，供 `SettingsBuildersTests` 使用。"""
-        result = read_missav_run_options(None)
+    @patch(
+        "app.config.get_platform_runtime_defaults",
+        return_value={
+            "individual_only": False,
+            "priority": "中文字幕优先",
+            "timeout": 60,
+            "proxy": "http://127.0.0.1:7890",
+            "max_items": 20,
+            "search_max_pages": 5,
+        },
+    )
+    def test_read_missav_run_options_returns_persisted_runtime_for_invalid_widget(self, runtime_defaults):
+        result = read_missav_run_options(object())
 
-        self.assertEqual(
-            result,
-            {
-                "individual_only": False,
-                "priority": "中文字幕优先",
-                "timeout": 60,
-                "proxy": "http://127.0.0.1:7890",
-            },
-        )
+        self.assertEqual(result["individual_only"], False)
+        self.assertEqual(result["priority"], "中文字幕优先")
+        self.assertEqual(result["timeout"], 60)
+        self.assertEqual(result["proxy"], "http://127.0.0.1:7890")
+        self.assertEqual(result["max_items"], 20)
+        self.assertEqual(result["search_max_pages"], 5)
+        runtime_defaults.assert_called_with("missav")
 
     @patch(
-        "app.ui.plugin_settings.get_platform_runtime_defaults",
+        "app.config.get_platform_runtime_defaults",
         return_value={
             "individual_only": True,
             "priority": "无码流出优先",
             "timeout": 120,
             "proxy": "http://127.0.0.1:7897",
+            "max_items": 30,
         },
     )
     def test_read_missav_run_options_uses_saved_runtime_proxy_without_widget(self, runtime_defaults):

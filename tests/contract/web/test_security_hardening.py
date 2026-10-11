@@ -113,8 +113,12 @@ class WebSecurityHardeningTests(unittest.TestCase):
         context_b = app.state.web_session_registry.get_or_create(
             client_b.cookies.get(cookie_name)
         )
-        context_a.approve_directory("session-a-downloads")
-        context_b.approve_directory("session-b-downloads")
+        root_a = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        root_b = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(root_a.cleanup)
+        self.addCleanup(root_b.cleanup)
+        context_a.approve_directory(root_a.name)
+        context_b.approve_directory(root_b.name)
         observed_profiles = []
 
         def capture_profile(_payload, config, _source, *, execution_profile):

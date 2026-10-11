@@ -3,10 +3,35 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
+import tempfile
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
+
+_AUTHENTICODE_SCRIPT = """param(
+    [Parameter(Mandatory = $true)]
+    [string] $LiteralPath
+)
+$ErrorActionPreference = 'Stop'
+$signature = Get-AuthenticodeSignature -LiteralPath $LiteralPath
+$certificate = $signature.SignerCertificate
+[Console]::OutputEncoding = [Text.Encoding]::UTF8
+if ($null -eq $certificate) {
+    ConvertTo-Json @{Status=[string]$signature.Status; Subject=''; Thumbprint=''; SHA256Fingerprint=''}
+    exit 0
+}
+$sha256 = [System.BitConverter]::ToString(
+    [System.Security.Cryptography.SHA256]::Create().ComputeHash($certificate.RawData)
+).Replace('-', '')
+ConvertTo-Json @{
+    Status = [string]$signature.Status
+    Subject = [string]$certificate.Subject
+    Thumbprint = [string]$certificate.Thumbprint
+    SHA256Fingerprint = $sha256
+}
+"""
 
 
 class PlatformPackageVerifier:
@@ -61,30 +86,42 @@ class PlatformPackageVerifier:
     def _verify_windows(self, path: Path) -> None:
         if not self.trusted_thumbprints:
             raise self._error("Windows updater requires trusted thumbprint allowlist")
-        script = (
-            "$s=Get-AuthenticodeSignature -LiteralPath $args[0];"
-            "$cert=$s.SignerCertificate;"
-            "[Console]::OutputEncoding=[Text.Encoding]::UTF8;"
-            "if ($null -eq $cert) {"
-            "ConvertTo-Json @{Status=[string]$s.Status;Subject='';Thumbprint='';SHA256Fingerprint=''}; exit 0"
-            "};"
-            "$sha256=[System.BitConverter]::ToString("
-            "[System.Security.Cryptography.SHA256]::Create().ComputeHash($cert.RawData)"
-            ").Replace('-','');"
-            "ConvertTo-Json @{"
-            "Status=[string]$s.Status;"
-            "Subject=[string]$cert.Subject;"
-            "Thumbprint=[string]$cert.Thumbprint;"
-            "SHA256Fingerprint=$sha256"
-            "}"
+        script_fd, script_name = tempfile.mkstemp(
+            prefix="ucrawl-authenticode-",
+            suffix=".ps1",
         )
-        result = self._run(
-            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script, str(path)],
-            capture_output=True,
-            text=True,
-            shell=False,
-            timeout=20,
-        )
+        script_path = Path(script_name)
+        try:
+            os.write(script_fd, _AUTHENTICODE_SCRIPT.encode("ascii"))
+            os.close(script_fd)
+            script_fd = -1
+            result = self._run(
+                [
+                    "powershell.exe",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-File",
+                    os.fspath(script_path),
+                    "-LiteralPath",
+                    os.fspath(path),
+                ],
+                capture_output=True,
+                text=True,
+                shell=False,
+                timeout=20,
+            )
+        finally:
+            if script_fd >= 0:
+                try:
+                    os.close(script_fd)
+                except OSError:
+                    pass
+            try:
+                script_path.unlink()
+            except OSError:
+                pass
         if result.returncode != 0:
             raise self._error("Authenticode verification command failed")
         try:

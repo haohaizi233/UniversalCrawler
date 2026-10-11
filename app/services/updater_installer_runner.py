@@ -113,16 +113,18 @@ class InstallerRunnerCore:
                 "restart handoff path and token must be provided together"
             )
         root = approved_root or self._default_staging_dir()
+        leased_descriptors: list[int] = []
         with verified_installer_lease(
             path,
             approved_root=root,
             error_factory=self._verification_error,
             cleanup_error_callback=lambda exc: self._log_event(
                 "update.install.lease_cleanup_failed",
-                "verified installer lease cleanup failed after process creation",
+                "verified installer lease cleanup failed after the installer inherited it",
                 level="ERROR",
                 error_type=type(exc).__name__,
             ),
+            bind_descriptor=leased_descriptors.append,
         ) as leased_path:
             self.package_verifier.verify(leased_path, asset)
             argv = self._install_argv(
@@ -151,7 +153,13 @@ class InstallerRunnerCore:
                 environment = os.environ.copy()
                 environment[RESTART_HANDOFF_TOKEN_ENV] = restart_handoff_token
                 process_kwargs["env"] = environment
-            process = self._popen(argv, **process_kwargs)
+            if not leased_descriptors:
+                raise self._install_error("verified installer lease was not acquired")
+            process = self._spawn_with_inherited_lease(
+                argv,
+                leased_descriptors[0],
+                process_kwargs,
+            )
             self._log_event(
                 "update.install.handoff",
                 "installer process detached from updater helper",
@@ -159,6 +167,32 @@ class InstallerRunnerCore:
                 installer_pid=getattr(process, "pid", 0),
             )
             return process
+
+    def _spawn_with_inherited_lease(
+        self,
+        argv: list[str],
+        descriptor: int,
+        process_kwargs: dict[str, Any],
+    ) -> subprocess.Popen:
+        """Inherit the deny-delete lease so it outlives CreateProcess.
+
+        The parent descriptor is closed when the lease context exits. The
+        installer keeps its inherited duplicate until that process exits, so
+        the verified package cannot be replaced after CreateProcess returns.
+        """
+
+        import msvcrt
+
+        os.set_inheritable(descriptor, True)
+        try:
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.lpAttributeList = {
+                "handle_list": [int(msvcrt.get_osfhandle(descriptor))],
+            }
+            process_kwargs["startupinfo"] = startupinfo
+            return self._popen(argv, **process_kwargs)
+        finally:
+            os.set_inheritable(descriptor, False)
 
     def _install_argv(
         self,

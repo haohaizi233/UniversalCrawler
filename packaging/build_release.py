@@ -79,11 +79,13 @@ from release_tool.runner import (  # noqa: E402
     run_release_request,
 )
 from release_tool.versioning import (  # noqa: E402
+    VERSION_PROJECTION_PATHS,
     apply_version_update,
     format_release_tag,
     normalize_version,
     plan_version_update,
     read_project_version,
+    verify_version_contract,
 )
 from shared.release_identity import ReleaseIdentity  # noqa: E402
 
@@ -616,6 +618,48 @@ def _new_release_requires_clean_baseline(request: BuildRequest) -> bool:
     )
 
 
+_VERSION_COMMIT_FILES = frozenset(
+    {
+        "shared/version.py",
+        *(path.as_posix() for path in VERSION_PROJECTION_PATHS),
+    }
+)
+
+
+def _reuse_verified_version_head(target_version: str) -> str:
+    """Return HEAD only when that commit itself is the target version commit."""
+
+    _validate_release_baseline_clean()
+    issues = verify_version_contract(PROJECT_ROOT, target_version)
+    if issues:
+        raise SystemExit(
+            "clean HEAD version projection does not match the target release: "
+            + "; ".join(issues)
+        )
+    commit = _run_git(["rev-parse", "HEAD"])
+    committed = _git_path_set(
+        ["diff-tree", "--no-commit-id", "--name-only", "-r", commit]
+    )
+    if committed != _VERSION_COMMIT_FILES:
+        raise SystemExit(
+            "clean HEAD is not the version commit; refusing to tag a later commit as this release"
+        )
+    return commit
+
+
+def _validated_clean_head() -> str:
+    """Return HEAD when the worktree is clean, without requiring a release tag."""
+
+    status = _run_git(["status", "--porcelain", "--untracked-files=all"])
+    head = _run_git(["rev-parse", "HEAD"])
+    if status:
+        preview = "\n".join(status.splitlines()[:12])
+        raise SystemExit(f"Git 工作树存在未提交改动，拒绝构建正式发布资产：\n{preview}")
+    if not re.fullmatch(r"[0-9a-fA-F]{40}", head):
+        raise SystemExit(f"无法解析当前 HEAD commit：{head}")
+    return head.lower()
+
+
 def _validate_version_commit(paths: tuple[str, ...], commit: str) -> None:
     expected = set(paths)
     committed = _git_path_set(["diff-tree", "--no-commit-id", "--name-only", "-r", commit])
@@ -812,6 +856,7 @@ def _prepare_release_assets(
     output_root: Path = RELEASE_ASSETS_ROOT,
     notes: str = "",
     project_root: Path,
+    require_bound_tag: bool = True,
 ) -> Path:
     """在临时目录完成签名与回验，成功后一次性发布三项本地资产。"""
 
@@ -890,7 +935,8 @@ def _prepare_release_assets(
             source_commit=source_commit,
             project_root=project_root,
         )
-        _validate_final_publish_window(tag, source_commit)
+        if require_bound_tag:
+            _validate_final_publish_window(tag, source_commit)
         staging.replace(destination)
         return destination
     finally:
@@ -1298,10 +1344,10 @@ def _build_pipeline_hooks(
         source_commit = state["source_commit"]
         if isinstance(snapshot_root, Path) and isinstance(source_commit, str) and source_commit:
             return snapshot_root, source_commit
-        source_commit = _validate_git_release_state(tag)
+        source_commit = _validated_clean_head()
         lock_token = ensure_lock()
-        if _validate_git_release_state(tag) != source_commit:
-            raise SystemExit("HEAD or release tag changed while waiting for the release build lock")
+        if _validated_clean_head() != source_commit:
+            raise SystemExit("HEAD changed while waiting for the release build lock")
         snapshot_root = resources.enter_context(
             _source_snapshot(source_commit, repository_root=PROJECT_ROOT)
         )
@@ -1371,6 +1417,7 @@ def _build_pipeline_hooks(
             output_root=Path(request.output_root) if request.output_root else RELEASE_ASSETS_ROOT,
             notes=notes,
             project_root=snapshot_root,
+            require_bound_tag=not request.create_or_reuse_tag,
         )
         assets = tuple(sorted(release_dir.iterdir()))
         state["assets"] = assets
@@ -1389,7 +1436,7 @@ def _build_pipeline_hooks(
             if not cached and not unstaged:
                 # 重试发布时版本投影已经是目标版本，原子重写不会产生 Git diff。
                 _validate_release_baseline_clean()
-                return _run_git(["rev-parse", "HEAD"])
+                return _reuse_verified_version_head(request.target_version)
             if cached or unstaged != set(relative_paths):
                 raise SystemExit("version update has unexpected Git changes")
             _run_git(["add", "--", *relative_paths])
@@ -1408,7 +1455,7 @@ def _build_pipeline_hooks(
             commit = _run_git(["rev-parse", "HEAD"])
             _validate_version_commit(relative_paths, commit)
             return commit
-        return _run_git(["rev-parse", "HEAD"])
+        return _reuse_verified_version_head(request.target_version)
 
     def push_main(_request: BuildRequest, commit: str) -> None:
         verified_commit = str(commit or _run_git(["rev-parse", "HEAD"])).strip().lower()
@@ -1468,6 +1515,8 @@ def _build_pipeline_hooks(
             if _remote_ref_commit(f"refs/tags/{tag}") != source_commit.lower():
                 raise SystemExit(f"failed to publish release tag {tag}") from exc
         publisher.ensure_tag(tag, source_commit)
+        if formal_build:
+            _validate_final_publish_window(tag, source_commit.lower())
 
     def ensure_release(_request: BuildRequest) -> None:
         _child_environment, publisher = resolve_release_context()

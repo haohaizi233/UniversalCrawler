@@ -713,6 +713,62 @@ def _bounded_response_body(
     return callback_body or raw_body
 
 
+def _address_identity(addresses: Sequence[str]) -> frozenset[str]:
+    identity: set[str] = set()
+    for raw_address in addresses:
+        if type(raw_address) is not str:
+            raise DomainPolicyViolation("resolved address is invalid")
+        try:
+            address = ipaddress.ip_address(raw_address)
+        except ValueError as exc:
+            raise DomainPolicyViolation("resolved address is invalid") from exc
+        identity.add(address.compressed.lower())
+    return frozenset(identity)
+
+
+def _continue_after_redirect(
+    *,
+    target: CanonicalRequestTarget,
+    next_target: CanonicalRequestTarget,
+    current_addresses: Sequence[str],
+    next_addresses: Sequence[str],
+    status_code: int,
+    method: str,
+    body: bytes | None,
+    headers: Mapping[str, str],
+) -> tuple[str, bytes | None, dict[str, str], bool]:
+    """Strip credentials when the next hop is no longer the same origin.
+
+    A same-origin Location that resolves to a different address is treated as
+    a cross-origin hop. Cross-origin hops drop the request body for every
+    redirect status, including 307 and 308.
+    """
+
+    origin_changed = (target.scheme, target.host, target.port) != (
+        next_target.scheme,
+        next_target.host,
+        next_target.port,
+    ) or _address_identity(current_addresses) != _address_identity(next_addresses)
+    continued = {
+        key: value
+        for key, value in headers.items()
+        if not origin_changed or key.lower() not in _SENSITIVE_REDIRECT_HEADERS
+    }
+    rewrite_to_get = (status_code == 303 and method != "HEAD") or (
+        status_code in {301, 302} and method == "POST"
+    )
+    if rewrite_to_get:
+        method = "GET"
+    if rewrite_to_get or status_code == 303 or origin_changed:
+        body = None
+        continued = {
+            key: value
+            for key, value in continued.items()
+            if key.lower() not in _REDIRECT_BODY_AND_FRAMING_HEADERS
+        }
+    return method, body, continued, origin_changed
+
+
 class PinnedTransport:
     """Perform one operation in one private curl session with pinned DNS."""
 
@@ -791,19 +847,24 @@ class PinnedTransport:
         current_body = body
         response: Any | None = None
         primary_error: BaseException | None = None
+        prepared_addresses: tuple[str, ...] | None = None
         try:
             for redirect_count in range(max_redirects + 1):
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise TimeoutError("public request deadline exceeded")
-                try:
-                    addresses = self._policy.resolve_public_addresses(target.url)
-                except DomainPolicyViolation:
-                    raise
-                except OSError as exc:
-                    raise PinnedTransportNetworkError(
-                        "public name resolution failed"
-                    ) from exc
+                if prepared_addresses is None:
+                    try:
+                        addresses = self._policy.resolve_public_addresses(target.url)
+                    except DomainPolicyViolation:
+                        raise
+                    except OSError as exc:
+                        raise PinnedTransportNetworkError(
+                            "public name resolution failed"
+                        ) from exc
+                else:
+                    addresses = prepared_addresses
+                    prepared_addresses = None
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise TimeoutError("public request deadline exceeded")
@@ -907,29 +968,35 @@ class PinnedTransport:
                     raise DomainPolicyViolation("public redirect limit exceeded")
 
                 next_target = canonicalize_request_target(urljoin(target.url, location))
-                origin_changed = (target.scheme, target.host, target.port) != (
-                    next_target.scheme,
-                    next_target.host,
-                    next_target.port,
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("public request deadline exceeded")
+                try:
+                    next_addresses = self._policy.resolve_public_addresses(
+                        next_target.url
+                    )
+                except DomainPolicyViolation:
+                    raise
+                except OSError as exc:
+                    raise PinnedTransportNetworkError(
+                        "public name resolution failed"
+                    ) from exc
+                (
+                    current_method,
+                    current_body,
+                    request_headers,
+                    origin_changed,
+                ) = _continue_after_redirect(
+                    target=target,
+                    next_target=next_target,
+                    current_addresses=addresses,
+                    next_addresses=next_addresses,
+                    status_code=status_code,
+                    method=current_method,
+                    body=current_body,
+                    headers=request_headers,
                 )
-                if origin_changed:
-                    request_headers = {
-                        key: value
-                        for key, value in request_headers.items()
-                        if key.lower() not in _SENSITIVE_REDIRECT_HEADERS
-                    }
-                rewrite_to_get = (status_code == 303 and current_method != "HEAD") or (
-                    status_code in {301, 302} and current_method == "POST"
-                )
-                if rewrite_to_get:
-                    current_method = "GET"
-                if rewrite_to_get or status_code == 303:
-                    current_body = None
-                    request_headers = {
-                        key: value
-                        for key, value in request_headers.items()
-                        if key.lower() not in _REDIRECT_BODY_AND_FRAMING_HEADERS
-                    }
+                prepared_addresses = next_addresses
                 redirect_response = response
                 response = None
                 try:
@@ -1053,20 +1120,25 @@ class PinnedTransport:
         primary_error: BaseException | None = None
         total_response_bytes = 0
         bytes_written = 0
+        prepared_addresses: tuple[str, ...] | None = None
 
         try:
             for redirect_count in range(max_redirects + 1):
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise PinnedTransportNetworkError("public request deadline exceeded")
-                try:
-                    addresses = self._policy.resolve_public_addresses(target.url)
-                except DomainPolicyViolation:
-                    raise
-                except OSError as exc:
-                    raise PinnedTransportNetworkError(
-                        "public name resolution failed"
-                    ) from exc
+                if prepared_addresses is None:
+                    try:
+                        addresses = self._policy.resolve_public_addresses(target.url)
+                    except DomainPolicyViolation:
+                        raise
+                    except OSError as exc:
+                        raise PinnedTransportNetworkError(
+                            "public name resolution failed"
+                        ) from exc
+                else:
+                    addresses = prepared_addresses
+                    prepared_addresses = None
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise PinnedTransportNetworkError("public request deadline exceeded")
@@ -1260,29 +1332,35 @@ class PinnedTransport:
                     raise DomainPolicyViolation("public redirect limit exceeded")
 
                 next_target = canonicalize_request_target(urljoin(target.url, location))
-                origin_changed = (target.scheme, target.host, target.port) != (
-                    next_target.scheme,
-                    next_target.host,
-                    next_target.port,
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise PinnedTransportNetworkError("public request deadline exceeded")
+                try:
+                    next_addresses = self._policy.resolve_public_addresses(
+                        next_target.url
+                    )
+                except DomainPolicyViolation:
+                    raise
+                except OSError as exc:
+                    raise PinnedTransportNetworkError(
+                        "public name resolution failed"
+                    ) from exc
+                (
+                    current_method,
+                    current_body,
+                    request_headers,
+                    origin_changed,
+                ) = _continue_after_redirect(
+                    target=target,
+                    next_target=next_target,
+                    current_addresses=addresses,
+                    next_addresses=next_addresses,
+                    status_code=status_code,
+                    method=current_method,
+                    body=current_body,
+                    headers=request_headers,
                 )
-                if origin_changed:
-                    request_headers = {
-                        key: value
-                        for key, value in request_headers.items()
-                        if key.lower() not in _SENSITIVE_REDIRECT_HEADERS
-                    }
-                rewrite_to_get = (status_code == 303 and current_method != "HEAD") or (
-                    status_code in {301, 302} and current_method == "POST"
-                )
-                if rewrite_to_get:
-                    current_method = "GET"
-                if rewrite_to_get or status_code == 303:
-                    current_body = None
-                    request_headers = {
-                        key: value
-                        for key, value in request_headers.items()
-                        if key.lower() not in _REDIRECT_BODY_AND_FRAMING_HEADERS
-                    }
+                prepared_addresses = next_addresses
                 redirect_response = response
                 response = None
                 try:

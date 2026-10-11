@@ -316,8 +316,8 @@ def run_release_request(
             )
             if request.apply_version:
                 run_stage(ReleaseStage.VERSION_SYNC, lambda: hooks.apply_version(request.target_version))
+            commit = ""
             if _needs_source_identity_stage(request):
-                commit = ""
 
                 def establish_source_identity() -> None:
                     nonlocal commit
@@ -334,13 +334,9 @@ def run_release_request(
                         )
                     cancel_token.raise_if_cancelled()
                     if (
-                        (
-                            signing_material is not None
-                            and signing_material.trust_anchor_changed
-                        )
-                        or request.push_main
-                        or request.create_or_reuse_tag
-                    ):
+                        signing_material is not None
+                        and signing_material.trust_anchor_changed
+                    ) or request.push_main:
                         begin_irreversible_once()
                     if (
                         signing_material is not None
@@ -349,8 +345,6 @@ def run_release_request(
                         commit_signing_transaction()
                     if request.push_main:
                         hooks.push_main(request, commit)
-                    if request.create_or_reuse_tag:
-                        hooks.ensure_tag(request, commit)
 
                 run_stage(ReleaseStage.SOURCE_IDENTITY, establish_source_identity)
             if request.build_portable:
@@ -358,10 +352,15 @@ def run_release_request(
             if request.build_installer:
                 run_stage(ReleaseStage.BUILDING_INSTALLER, hooks.build_installer)
             if request.sign_manifest:
-                artifacts = run_stage(
-                    ReleaseStage.SIGNING,
-                    lambda: hooks.sign_manifest(request),
-                )
+
+                def sign_and_bind_tag() -> tuple[Path, ...]:
+                    signed_artifacts = hooks.sign_manifest(request)
+                    if request.create_or_reuse_tag:
+                        begin_irreversible_once()
+                        hooks.ensure_tag(request, commit)
+                    return signed_artifacts
+
+                artifacts = run_stage(ReleaseStage.SIGNING, sign_and_bind_tag)
             if request.run_smoke_tests:
                 run_stage(ReleaseStage.SMOKE_TESTING, hooks.run_smoke_tests)
             if request.create_or_update_release:
@@ -590,6 +589,7 @@ def _load_remote(value: object) -> RemoteReleaseInfo:
             "release_tags",
             "occupied_tags",
             "resumable_tags",
+            "blocked_tags",
             "error",
         }
     )
@@ -601,6 +601,7 @@ def _load_remote(value: object) -> RemoteReleaseInfo:
     release_tags = value.get("release_tags", ())
     occupied_tags = value.get("occupied_tags", ())
     resumable_tags = value.get("resumable_tags", ())
+    blocked_tags = value.get("blocked_tags", ())
     if not isinstance(version, str) or not isinstance(error, str):
         raise ValueError("release request remote version and error must be strings")
     if isinstance(release_revision, bool) or not isinstance(release_revision, int):
@@ -609,6 +610,7 @@ def _load_remote(value: object) -> RemoteReleaseInfo:
         ("release", release_tags),
         ("occupied", occupied_tags),
         ("resumable", resumable_tags),
+        ("blocked", blocked_tags),
     ):
         if not isinstance(tags, (list, tuple)) or not all(
             isinstance(tag, str) for tag in tags
@@ -625,6 +627,7 @@ def _load_remote(value: object) -> RemoteReleaseInfo:
             release_tags=tuple(release_tags),
             occupied_tags=tuple(occupied_tags),
             resumable_tags=tuple(resumable_tags),
+            blocked_tags=tuple(blocked_tags),
         )
     if error:
         return RemoteReleaseInfo.unavailable(error)

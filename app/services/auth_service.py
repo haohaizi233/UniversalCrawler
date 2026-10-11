@@ -15,6 +15,160 @@ from app.exceptions import CookieLoadError, CookieSaveError
 
 _COOKIE_NAME_PATTERN = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")
 _COOKIE_FIELD_UNSET = object()
+_WINDOWS_DACL_SECURITY_INFORMATION = 0x4
+_WINDOWS_PROTECTED_DACL_SECURITY_INFORMATION = 0x80000000
+_WINDOWS_SE_FILE_OBJECT = 1
+
+
+def _restrict_owner_access(path: str) -> None:
+    """让已存在的文件仅当前用户可读写。"""
+    if os.name == "nt":
+        _restrict_windows_owner_acl(path)
+        return
+    os.chmod(path, 0o600)
+
+
+def _restrict_windows_owner_acl(path: str) -> None:
+    import ctypes
+    from ctypes import wintypes
+
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    sid = _current_windows_user_sid(advapi32, kernel32)
+    descriptor = ctypes.c_void_p()
+    advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(wintypes.ULONG),
+    ]
+    advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW.restype = wintypes.BOOL
+    if not advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW(
+        f"D:P(A;;FA;;;{sid})",
+        1,
+        ctypes.byref(descriptor),
+        None,
+    ):
+        raise OSError(ctypes.get_last_error(), "无法创建仅当前用户可访问的安全描述符")
+    try:
+        present = wintypes.BOOL()
+        defaulted = wintypes.BOOL()
+        dacl = ctypes.c_void_p()
+        advapi32.GetSecurityDescriptorDacl.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(wintypes.BOOL),
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.POINTER(wintypes.BOOL),
+        ]
+        advapi32.GetSecurityDescriptorDacl.restype = wintypes.BOOL
+        if not advapi32.GetSecurityDescriptorDacl(
+            descriptor,
+            ctypes.byref(present),
+            ctypes.byref(dacl),
+            ctypes.byref(defaulted),
+        ):
+            raise OSError(ctypes.get_last_error(), "无法读取登录态文件 DACL")
+        if not present.value or not dacl.value:
+            raise OSError("登录态安全描述符缺少 DACL")
+        advapi32.SetNamedSecurityInfoW.argtypes = [
+            wintypes.LPWSTR,
+            ctypes.c_int,
+            wintypes.DWORD,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+        ]
+        advapi32.SetNamedSecurityInfoW.restype = wintypes.DWORD
+        status = advapi32.SetNamedSecurityInfoW(
+            os.path.abspath(path),
+            _WINDOWS_SE_FILE_OBJECT,
+            _WINDOWS_DACL_SECURITY_INFORMATION
+            | _WINDOWS_PROTECTED_DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            dacl,
+            None,
+        )
+        if status != 0:
+            raise OSError(status, "无法将登录态文件限制为当前用户")
+    finally:
+        kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+        kernel32.LocalFree.restype = ctypes.c_void_p
+        kernel32.LocalFree(descriptor)
+
+
+def _current_windows_user_sid(advapi32, kernel32) -> str:
+    import ctypes
+    from ctypes import wintypes
+
+    class _SidAndAttributes(ctypes.Structure):
+        _fields_ = [("Sid", ctypes.c_void_p), ("Attributes", wintypes.DWORD)]
+
+    class _TokenUser(ctypes.Structure):
+        _fields_ = [("User", _SidAndAttributes)]
+
+    advapi32.OpenProcessToken.argtypes = [
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.HANDLE),
+    ]
+    advapi32.OpenProcessToken.restype = wintypes.BOOL
+    kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+    token = wintypes.HANDLE()
+    if not advapi32.OpenProcessToken(
+        kernel32.GetCurrentProcess(),
+        0x0008,
+        ctypes.byref(token),
+    ):
+        raise OSError(ctypes.get_last_error(), "OpenProcessToken failed")
+    try:
+        advapi32.GetTokenInformation.argtypes = [
+            wintypes.HANDLE,
+            ctypes.c_uint,
+            ctypes.c_void_p,
+            wintypes.DWORD,
+            ctypes.POINTER(wintypes.DWORD),
+        ]
+        advapi32.GetTokenInformation.restype = wintypes.BOOL
+        required = wintypes.DWORD(0)
+        advapi32.GetTokenInformation(token, 1, None, 0, ctypes.byref(required))
+        if ctypes.get_last_error() != 122:
+            raise OSError(ctypes.get_last_error(), "GetTokenInformation size query failed")
+        buffer = ctypes.create_string_buffer(required.value)
+        if not advapi32.GetTokenInformation(
+            token,
+            1,
+            buffer,
+            required.value,
+            ctypes.byref(required),
+        ):
+            raise OSError(ctypes.get_last_error(), "GetTokenInformation failed")
+        token_user = ctypes.cast(buffer, ctypes.POINTER(_TokenUser)).contents
+        sid_pointer = ctypes.c_void_p()
+        advapi32.ConvertSidToStringSidW.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_void_p),
+        ]
+        advapi32.ConvertSidToStringSidW.restype = wintypes.BOOL
+        if not advapi32.ConvertSidToStringSidW(
+            token_user.User.Sid,
+            ctypes.byref(sid_pointer),
+        ):
+            raise OSError(ctypes.get_last_error(), "ConvertSidToStringSidW failed")
+        try:
+            sid = ctypes.cast(sid_pointer, ctypes.c_wchar_p).value
+            if not sid:
+                raise OSError("当前用户 SID 为空")
+            return sid
+        finally:
+            kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+            kernel32.LocalFree.restype = ctypes.c_void_p
+            kernel32.LocalFree(sid_pointer)
+    finally:
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        kernel32.CloseHandle(token)
 
 
 def _cookie_value_is_safe(value: str) -> bool:
@@ -31,8 +185,8 @@ def _cookie_value_is_safe(value: str) -> bool:
 class AuthService:
     """统一处理 Cookie JSON 格式，并把文件 IO/JSON 异常收敛为领域异常。
 
-    Cookie 以明文 JSON 保存；``file_path``/``save_path`` 必须来自受信配置，目录权限
-    由部署方负责。本服务不执行路径授权，也不加密 Cookie 内容。
+    Cookie 以明文 JSON 保存；``file_path``/``save_path`` 必须来自受信配置。
+    临时文件和最终文件都限制为仅当前用户可读写，本服务不加密 Cookie 内容。
     """
 
     @staticmethod
@@ -53,7 +207,11 @@ class AuthService:
             raise CookieLoadError(str(exc)) from exc
 
     def save_json_file(self, file_path: str, payload: Any) -> None:
-        """先在目标目录写入并 fsync 临时文件，再用 os.replace 发布完整 JSON。"""
+        """先在目标目录写入并 fsync 临时文件，再用 os.replace 发布完整 JSON。
+
+        Unix 将临时文件和最终文件设为 ``0o600``。Windows 写入前就套上仅含
+        当前用户的保护 DACL，发布后再次套用，避免替换把宽松 ACL 留在目标上。
+        """
         temp_path: str | None = None
         try:
             serialized = json.dumps(payload, indent=4, ensure_ascii=False)
@@ -69,11 +227,13 @@ class AuthService:
                 delete=False,
             ) as fp:
                 temp_path = fp.name
+                _restrict_owner_access(temp_path)
                 fp.write(serialized)
                 fp.flush()
                 os.fsync(fp.fileno())
             os.replace(temp_path, destination)
             temp_path = None
+            _restrict_owner_access(destination)
         except (OSError, TypeError, ValueError) as exc:
             if temp_path is not None:
                 try:

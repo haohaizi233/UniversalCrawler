@@ -1,5 +1,7 @@
 """认证服务的凭据读取、校验与持久化测试。"""
 
+import os
+import stat
 import tempfile
 import unittest
 from pathlib import Path
@@ -353,6 +355,175 @@ class AuthServiceTests(unittest.TestCase):
 
             self.assertEqual(file_path.read_text(encoding="utf-8"), original)
             self.assertEqual(list(file_path.parent.iterdir()), [file_path])
+
+    def test_save_json_file_restricts_temp_and_destination_to_current_user(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            file_path = os.path.join(temp_dir, "auth.json")
+            real_replace = os.replace
+            seen: list[str] = []
+
+            def spy(src, dst):
+                seen.append(src)
+                self.assertTrue(_is_owner_only(src))
+                real_replace(src, dst)
+
+            with patch("app.services.auth_service.os.replace", side_effect=spy):
+                self.service.save_json_file(
+                    file_path,
+                    {"cookies": [{"name": "userId", "value": "1"}]},
+                )
+            self.assertTrue(seen)
+            self.assertTrue(_is_owner_only(file_path))
+            self.service.save_json_file(
+                file_path,
+                {"cookies": [{"name": "userId", "value": "2"}]},
+            )
+            self.assertEqual(
+                self.service.load_json_file(file_path)["cookies"][0]["value"],
+                "2",
+            )
+            self.assertTrue(_is_owner_only(file_path))
+
+
+def _is_owner_only(path: str) -> bool:
+    if os.name != "nt":
+        return stat.S_IMODE(os.stat(path).st_mode) == 0o600
+    return _windows_dacl_is_current_user_only(path)
+
+
+def _windows_dacl_is_current_user_only(path: str) -> bool:
+    import ctypes
+    from ctypes import wintypes
+
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+    class AclSizeInformation(ctypes.Structure):
+        _fields_ = [
+            ("AceCount", wintypes.DWORD),
+            ("AclBytesInUse", wintypes.DWORD),
+            ("AclBytesFree", wintypes.DWORD),
+        ]
+
+    class AceHeader(ctypes.Structure):
+        _fields_ = [
+            ("AceType", ctypes.c_byte),
+            ("AceFlags", ctypes.c_byte),
+            ("AceSize", wintypes.WORD),
+        ]
+
+    class AccessAllowedAce(ctypes.Structure):
+        _fields_ = [
+            ("Header", AceHeader),
+            ("Mask", wintypes.DWORD),
+            ("SidStart", wintypes.DWORD),
+        ]
+
+    class SidAndAttributes(ctypes.Structure):
+        _fields_ = [("Sid", ctypes.c_void_p), ("Attributes", wintypes.DWORD)]
+
+    class TokenUser(ctypes.Structure):
+        _fields_ = [("User", SidAndAttributes)]
+
+    descriptor = ctypes.c_void_p()
+    dacl = ctypes.c_void_p()
+    advapi32.GetNamedSecurityInfoW.argtypes = [
+        wintypes.LPCWSTR,
+        ctypes.c_int,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_void_p),
+    ]
+    advapi32.GetNamedSecurityInfoW.restype = wintypes.DWORD
+    status = advapi32.GetNamedSecurityInfoW(
+        os.path.abspath(path),
+        1,
+        0x4,
+        None,
+        None,
+        ctypes.byref(dacl),
+        None,
+        ctypes.byref(descriptor),
+    )
+    if status != 0 or not dacl.value:
+        return False
+    try:
+        info = AclSizeInformation()
+        advapi32.GetAclInformation.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            wintypes.DWORD,
+            ctypes.c_int,
+        ]
+        advapi32.GetAclInformation.restype = wintypes.BOOL
+        if not advapi32.GetAclInformation(
+            dacl,
+            ctypes.byref(info),
+            ctypes.sizeof(info),
+            2,
+        ):
+            return False
+        if info.AceCount != 1:
+            return False
+        ace_pointer = ctypes.c_void_p()
+        advapi32.GetAce.argtypes = [
+            ctypes.c_void_p,
+            wintypes.DWORD,
+            ctypes.POINTER(ctypes.c_void_p),
+        ]
+        advapi32.GetAce.restype = wintypes.BOOL
+        if not advapi32.GetAce(dacl, 0, ctypes.byref(ace_pointer)):
+            return False
+        ace = ctypes.cast(ace_pointer, ctypes.POINTER(AccessAllowedAce)).contents
+        if ace.Header.AceType != 0:
+            return False
+        sid = ctypes.c_void_p(ace_pointer.value + AccessAllowedAce.SidStart.offset)
+        token = wintypes.HANDLE()
+        advapi32.OpenProcessToken.argtypes = [
+            wintypes.HANDLE,
+            wintypes.DWORD,
+            ctypes.POINTER(wintypes.HANDLE),
+        ]
+        advapi32.OpenProcessToken.restype = wintypes.BOOL
+        kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+        if not advapi32.OpenProcessToken(kernel32.GetCurrentProcess(), 0x0008, ctypes.byref(token)):
+            return False
+        try:
+            required = wintypes.DWORD(0)
+            advapi32.GetTokenInformation.argtypes = [
+                wintypes.HANDLE,
+                ctypes.c_uint,
+                ctypes.c_void_p,
+                wintypes.DWORD,
+                ctypes.POINTER(wintypes.DWORD),
+            ]
+            advapi32.GetTokenInformation.restype = wintypes.BOOL
+            advapi32.GetTokenInformation(token, 1, None, 0, ctypes.byref(required))
+            buffer = ctypes.create_string_buffer(required.value)
+            if not advapi32.GetTokenInformation(
+                token,
+                1,
+                buffer,
+                required.value,
+                ctypes.byref(required),
+            ):
+                return False
+            user_sid = ctypes.cast(buffer, ctypes.POINTER(TokenUser)).contents.User.Sid
+            advapi32.EqualSid.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+            advapi32.EqualSid.restype = wintypes.BOOL
+            return bool(advapi32.EqualSid(user_sid, sid))
+        finally:
+            kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+            kernel32.CloseHandle.restype = wintypes.BOOL
+            kernel32.CloseHandle(token)
+    finally:
+        kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+        kernel32.LocalFree.restype = ctypes.c_void_p
+        kernel32.LocalFree(descriptor)
+
 
 if __name__ == "__main__":
     unittest.main()

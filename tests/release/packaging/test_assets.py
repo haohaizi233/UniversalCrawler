@@ -409,13 +409,21 @@ class SpecHiddenImportsTests(unittest.TestCase):
             self.assertIn(mod, h, f"missing hiddenimport: {mod}")
 
     def test_hiddenimports_includes_pyqt6(self):
-        """PyQt6 必须显式列出（修复 web/dialog 弹窗不显示）。"""
+        """只列入实际使用的 Qt 模块和真实动态导入，不收集整个 PyQt6。"""
         h = self._spec_globals["hiddenimports"]
-        self.assertIn("PyQt6", h)
-        # 必须有具体子模块（collect_submodules('PyQt6')）
-        qt_submodules = [m for m in h if m.startswith("PyQt6.")]
-        self.assertGreater(len(qt_submodules), 5,
-                          "should have many PyQt6.* submodules from collect_submodules")
+        source = SPEC_FILE.read_text(encoding="utf-8")
+        self.assertNotIn('collect_submodules("PyQt6")', source)
+        self.assertEqual(
+            [m for m in h if m == "PyQt6" or m.startswith("PyQt6.")],
+            [
+                "PyQt6.QtCore",
+                "PyQt6.QtGui",
+                "PyQt6.QtMultimedia",
+                "PyQt6.QtMultimediaWidgets",
+                "PyQt6.QtWidgets",
+                "PyQt6.sip",
+            ],
+        )
 
     def test_hiddenimports_includes_uvicorn_protocols(self):
         """uvicorn 协议模块必须显式列出。"""
@@ -1130,7 +1138,14 @@ class LauncherTemplateTests(unittest.TestCase):
         )[0]
         installer_source = INSTALLER_FILE.read_text(encoding="utf-8")
 
+        helper_scripts = spec_source.split("updater_helper_scripts = []", 1)[1].split(
+            "updater_helper_exe = EXE(",
+            1,
+        )[0]
         self.assertIn("console=False", helper_block)
+        self.assertIn("updater_helper_scripts", helper_block)
+        self.assertIn("for name, path, typecode in a.scripts:", helper_scripts)
+        self.assertIn("updater_helper_script", helper_scripts)
         self.assertIn("UCrawlRestartHandoff", installer_source)
         self.assertIn("--complete-install", installer_source)
         self.assertIn("GetEnv('UCRAWL_RESTART_HANDOFF_TOKEN')", installer_source)

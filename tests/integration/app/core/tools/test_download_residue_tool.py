@@ -386,7 +386,7 @@ def test_default_ledger_probe_does_not_create_the_user_data_root(
     assert not absent_user_data.exists()
 
 
-def test_cleanup_uses_the_fixed_internal_ledger_without_caller_path_authority(
+def test_cleanup_does_not_write_default_ledger_outside_approved_roots(
     tmp_path: Path,
     tool: types.ModuleType,
     contracts: types.SimpleNamespace,
@@ -398,6 +398,7 @@ def test_cleanup_uses_the_fixed_internal_ledger_without_caller_path_authority(
     user_data = tmp_path / "internal-user-data"
     ledger = user_data / "cache" / "download_recovery.sqlite3"
     _create_recovery_ledger(ledger, pending=((workspace, "gen-pending"),))
+    before = _ledger_counts(ledger)
     monkeypatch.setenv("UCRAWL_USER_DATA_ROOT", str(user_data))
     context = _context(
         contracts,
@@ -408,10 +409,71 @@ def test_cleanup_uses_the_fixed_internal_ledger_without_caller_path_authority(
 
     result = tool.run(context)
 
-    assert _status(result) == "success"
-    assert not residue.exists()
-    assert _ledger_counts(ledger) == (0, 0, 0)
+    assert _status(result) == "error"
+    assert residue.exists()
+    assert _ledger_counts(ledger) == before
+    assert "gen-pending" not in repr(result.data)
     assert _changed_paths(result) == ()
+
+
+def test_empty_approved_roots_do_not_read_the_user_data_ledger(
+    tmp_path: Path,
+    tool: types.ModuleType,
+    contracts: types.SimpleNamespace,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    user_data = tmp_path / "user-data"
+    ledger = user_data / "cache" / "download_recovery.sqlite3"
+    _create_recovery_ledger(
+        ledger,
+        active=(("secret-task", tmp_path / "private-save", "secret-generation"),),
+    )
+    monkeypatch.setenv("UCRAWL_USER_DATA_ROOT", str(user_data))
+    connections: list[object] = []
+    real_connect = tool.sqlite3.connect
+
+    def spy_connect(*args: object, **kwargs: object) -> object:
+        connections.append(args)
+        return real_connect(*args, **kwargs)
+
+    monkeypatch.setattr(tool.sqlite3, "connect", spy_connect)
+    profile = local_execution_profile(
+        host_surface="test",
+        owner_id="test:empty-roots",
+        approved_roots=(),
+        tool_permissions=("read_file",),
+        allow_external_plugins=False,
+    )
+    context = contracts.ToolContext(parameters={}, execution_profile=profile)
+
+    result = tool.run(context)
+
+    assert connections == []
+    assert "secret-task" not in repr(result.data)
+    assert str(ledger) not in repr(result.data)
+
+
+def test_default_ledger_inside_approved_roots_is_read(
+    tmp_path: Path,
+    tool: types.ModuleType,
+    contracts: types.SimpleNamespace,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "downloads"
+    workspace.mkdir()
+    user_data = workspace / "user-data"
+    ledger = user_data / "cache" / "download_recovery.sqlite3"
+    _create_recovery_ledger(
+        ledger,
+        active=(("visible-task", workspace, "visible-generation"),),
+    )
+    monkeypatch.setenv("UCRAWL_USER_DATA_ROOT", str(user_data))
+    context = _context(contracts, workspace, allowed_paths=(workspace,))
+
+    result = tool.run(context)
+
+    assert _status(result) == "success"
+    assert "visible-task" in repr(result.data)
 
 
 def test_scan_stops_after_two_owner_directory_levels_and_skips_symlinks(
@@ -430,7 +492,7 @@ def test_scan_stops_after_two_owner_directory_levels_and_skips_symlinks(
     try:
         symlink.symlink_to(outside, target_is_directory=True)
     except (NotImplementedError, OSError):
-        pytest.skip("directory symlinks are unavailable on this host")
+        pytest.fail("directory symlinks are unavailable on this host; enable Developer Mode or run elevated - symlink attack coverage must not be silently skipped")
 
     context = _context(contracts, workspace)
 
@@ -461,7 +523,7 @@ def test_scan_does_not_follow_a_junction_outside_the_approved_root(
         text=True,
     )
     if created.returncode != 0:
-        pytest.skip("directory junctions are unavailable on this host")
+        pytest.fail("directory junctions are unavailable on this host - junction attack coverage must not be silently skipped")
     junction_probe = getattr(junction, "is_junction", None)
     assert junction_probe() if callable(junction_probe) else junction.is_dir()
     context = _context(
@@ -496,7 +558,7 @@ def test_scan_does_not_follow_a_junction_within_the_approved_root(
         text=True,
     )
     if created.returncode != 0:
-        pytest.skip("directory junctions are unavailable on this host")
+        pytest.fail("directory junctions are unavailable on this host - junction attack coverage must not be silently skipped")
     junction_probe = getattr(junction, "is_junction", None)
     assert junction_probe() if callable(junction_probe) else junction.is_dir()
     context = _context(
@@ -802,7 +864,7 @@ def test_cleanup_rejects_a_symlink_scan_root_even_when_the_link_is_authorized(
     try:
         linked_root.symlink_to(target, target_is_directory=True)
     except (NotImplementedError, OSError):
-        pytest.skip("directory symlinks are unavailable on this host")
+        pytest.fail("directory symlinks are unavailable on this host; enable Developer Mode or run elevated - symlink attack coverage must not be silently skipped")
     context = _context(
         contracts,
         tmp_path,
@@ -1487,7 +1549,7 @@ def test_stage_recheck_rejects_an_artifact_replaced_by_a_junction(
             text=True,
         )
         if created.returncode != 0:
-            pytest.skip("directory junctions are unavailable on this host")
+            pytest.fail("directory junctions are unavailable on this host - junction attack coverage must not be silently skipped")
         return snapshot
 
     monkeypatch.setattr(tool, "_read_ledger", read_then_replace_with_junction)

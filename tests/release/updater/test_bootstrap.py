@@ -463,6 +463,65 @@ def test_extract_windows_trust_parses_and_normalizes_powershell_json(tmp_path):
     assert info.sha1_thumbprint == "AABBCC"
     assert info.sha256_fingerprint == "DDEEFF"
     assert calls[0]["kwargs"]["shell"] is False
+    assert "-Command" not in calls[0]["argv"]
+    assert calls[0]["argv"][calls[0]["argv"].index("-LiteralPath") + 1] == str(installer)
+
+
+def test_windows_trust_and_cert_discovery_pass_values_outside_the_script(tmp_path):
+    installer = tmp_path / "a b; $(calc).exe"
+    installer.write_bytes(b"installer")
+    subject = "CN=Injected $(calc) ';whoami"
+    captured = []
+
+    def fake_run(argv, **kwargs):
+        script_path = Path(argv[argv.index("-File") + 1])
+        captured.append(
+            {
+                "argv": list(argv),
+                "script": script_path.read_text(encoding="utf-8"),
+                "kwargs": kwargs,
+            }
+        )
+        return subprocess.CompletedProcess(
+            argv,
+            0,
+            stdout=json.dumps(
+                {
+                    "Status": "Valid",
+                    "Subject": "CN=UCrawl",
+                    "Issuer": "CN=Issuer",
+                    "SHA1Thumbprint": "AABBCC",
+                    "SHA256Fingerprint": "DDEEFF",
+                    "subject": "CN=UCrawl",
+                    "sha1_thumbprint": "AABBCC",
+                    "sha256_fingerprint": "DDEEFF",
+                }
+            ),
+            stderr="",
+        )
+
+    bootstrap.extract_windows_trust(installer=installer, run_func=fake_run)
+    bootstrap.discover_windows_cert(
+        cert_sha1="aa bb cc",
+        cert_subject=subject,
+        run_func=fake_run,
+    )
+
+    trust_call, discovery_call = captured
+    trust_argv = trust_call["argv"]
+    discovery_argv = discovery_call["argv"]
+    assert trust_call["kwargs"]["shell"] is False
+    assert discovery_call["kwargs"]["shell"] is False
+    assert "-Command" not in trust_argv
+    assert "-Command" not in discovery_argv
+    assert trust_argv[trust_argv.index("-File") + 1].endswith(".ps1")
+    assert trust_argv[trust_argv.index("-LiteralPath") + 1] == str(installer)
+    assert str(installer) not in trust_call["script"]
+    assert "Get-AuthenticodeSignature -LiteralPath $LiteralPath" in trust_call["script"]
+    assert discovery_argv[discovery_argv.index("-Sha1") + 1] == "AABBCC"
+    assert discovery_argv[discovery_argv.index("-Subject") + 1] == subject
+    assert subject not in discovery_call["script"]
+    assert "$args" not in discovery_call["script"]
 
 
 def test_sign_windows_installer_uses_argv_lists_and_shell_false(tmp_path, monkeypatch):

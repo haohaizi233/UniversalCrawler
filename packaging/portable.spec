@@ -91,10 +91,16 @@ hiddenimports = sorted(
         + collect_submodules("fastapi")
         + collect_submodules("starlette")
         + collect_submodules("pydantic")
-# Web 托盘与 dispatcher 的 Qt 后备路径采用动态导入，PyInstaller 静态扫描
-# 可能漏掉 QSystemTrayIcon、QInputDialog、QApplication、QMessageBox 和 QDialog，
-# 因此必须显式列出 PyQt6 子模块。
-        + collect_submodules("PyQt6")
+# 只列入实际使用的 Qt 模块，以及源码里真实的动态导入。
+# 不收集整个 PyQt6，避免把未使用的 Qt 子模块打进便携包。
+        + [
+            "PyQt6.QtCore",
+            "PyQt6.QtGui",
+            "PyQt6.QtWidgets",
+            "PyQt6.QtMultimedia",
+            "PyQt6.QtMultimediaWidgets",
+            "PyQt6.sip",
+        ]
         # entry 动态加载的具体 entry 模块（保险起见显式列）
         + ["count_project", "entry.cli_entry", "entry.code_report_entry", "entry.gui_entry", "entry.web_entry", "entry.interactive_entry", "entry.dispatcher", "entry.updater_helper"]
         # cli 动态加载的子命令模块（保险起见显式列）
@@ -107,7 +113,6 @@ hiddenimports = sorted(
             "shared.selection_runtime",
         ]
         + ["uvicorn.logging", "uvicorn.loops", "uvicorn.loops.auto", "uvicorn.protocols", "uvicorn.protocols.http", "uvicorn.protocols.http.auto", "uvicorn.protocols.websockets", "uvicorn.protocols.websockets.auto", "uvicorn.lifespan", "uvicorn.lifespan.on"]
-        + ["PyQt6"]
     )
 )
 
@@ -242,9 +247,17 @@ webui_exe = EXE(
     icon=str(webui_icon) if webui_icon.exists() else (str(icon_file) if icon_file.exists() else None),
 )
 
+# 与 GUI/Web 入口一样，从 Analysis 脚本表替换主入口，从而保留 runtime hooks。
+updater_helper_scripts = []
+for name, path, typecode in a.scripts:
+    if str(typecode).startswith("PYSOURCE") and str(main_script) in str(path):
+        updater_helper_scripts.append((UPDATER_HELPER_NAME, str(updater_helper_script), typecode))
+    else:
+        updater_helper_scripts.append((name, path, typecode))
+
 updater_helper_exe = EXE(
     pyz,
-    [(UPDATER_HELPER_NAME, str(updater_helper_script), "PYSOURCE")],
+    updater_helper_scripts,
     [],
     exclude_binaries=True,
     name=UPDATER_HELPER_NAME,

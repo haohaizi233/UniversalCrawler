@@ -55,6 +55,44 @@ def test_context_authorizes_only_paths_inside_approved_roots(tmp_path: Path) -> 
         context.authorize_path(outside)
 
 
+def test_authorize_path_rejects_a_symlink_root_instead_of_following_it(
+    tmp_path: Path,
+) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    secret = outside / "secret.txt"
+    secret.write_text("secret", encoding="utf-8")
+    link = tmp_path / "approved-link"
+    try:
+        link.symlink_to(outside, target_is_directory=True)
+    except (NotImplementedError, OSError) as exc:
+        pytest.skip(f"symbolic links are unavailable on this host: {exc}")
+    context = ToolContext(parameters={}, approved_roots=(str(link),))
+
+    with pytest.raises(PermissionError, match="symlink"):
+        context.authorize_path(link / "secret.txt")
+    with pytest.raises(PermissionError, match="symlink"):
+        context.authorize_path(secret)
+
+
+def test_authorize_path_rejects_a_symlink_child_inside_a_real_root(tmp_path: Path) -> None:
+    approved = tmp_path / "approved"
+    approved.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    secret = outside / "secret.txt"
+    secret.write_text("secret", encoding="utf-8")
+    link = approved / "escape"
+    try:
+        link.symlink_to(secret)
+    except (NotImplementedError, OSError) as exc:
+        pytest.skip(f"symbolic links are unavailable on this host: {exc}")
+    context = ToolContext(parameters={}, approved_roots=(str(approved),))
+
+    with pytest.raises(PermissionError):
+        context.authorize_path(link)
+
+
 def test_path_authorization_rejects_empty_host_roots(tmp_path: Path) -> None:
     profile = local_execution_profile(
         host_surface="test",

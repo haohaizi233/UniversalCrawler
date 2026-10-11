@@ -884,10 +884,10 @@ def test_new_release_defers_remote_release_until_after_signed_smoke():
         "apply_version",
         "commit_version_changes",
         "push_main",
-        "ensure_tag",
         "build_portable",
         "build_installer",
         "sign_manifest",
+        "ensure_tag",
         "smoke_test",
         "ensure_release",
         "upload_assets",
@@ -1214,6 +1214,7 @@ def test_trust_anchor_commit_and_remote_identity_are_after_linearization():
         remote=RemoteReleaseInfo.available("3.6.21"),
         generate_manifest_key=True,
         rotate_trust_anchor=True,
+        sign_manifest=True,
         build_portable=False,
         build_installer=True,
         run_smoke_tests=False,
@@ -1232,7 +1233,7 @@ def test_trust_anchor_commit_and_remote_identity_are_after_linearization():
     assert result.succeeded
     assert transaction_calls == ["commit"]
     assert hooks.calls.index("commit_version_changes") < hooks.calls.index("push_main")
-    assert hooks.calls.index("push_main") < hooks.calls.index("ensure_tag")
+    assert hooks.calls.index("sign_manifest") < hooks.calls.index("ensure_tag")
 
 
 def test_no_release_signing_commit_is_after_linearization():
@@ -1595,6 +1596,7 @@ def test_rotated_signing_material_is_resolved_before_commit_and_build():
         remote=RemoteReleaseInfo.available("3.6.21"),
         generate_manifest_key=True,
         rotate_trust_anchor=True,
+        sign_manifest=True,
         commit_version_changes=True,
         push_main=True,
         create_or_reuse_tag=True,
@@ -1624,7 +1626,7 @@ def test_rotated_signing_material_is_resolved_before_commit_and_build():
         "build_portable"
     )
     assert hooks.calls.index("push_main") < hooks.calls.index("build_portable")
-    assert hooks.calls.index("ensure_tag") < hooks.calls.index("build_portable")
+    assert hooks.calls.index("sign_manifest") < hooks.calls.index("ensure_tag")
 
 
 def test_rotated_signing_material_rolls_back_when_version_application_fails():
@@ -1901,7 +1903,41 @@ def test_new_release_smoke_failure_does_not_create_a_remote_release():
     result = run_release_request(request, hooks.as_pipeline_hooks(), RecordingEmitter(), CancellationToken())
 
     assert result.failed_stage is ReleaseStage.SMOKE_TESTING
+    assert hooks.calls.index("sign_manifest") < hooks.calls.index("ensure_tag")
+    assert hooks.calls.index("ensure_tag") < hooks.calls.index("smoke_test")
     assert "ensure_release" not in hooks.calls
+
+
+def test_signing_failure_does_not_create_the_release_tag():
+    class SigningFailingHooks(RecordingHooks):
+        def sign_manifest(self, request: BuildRequest) -> tuple[Path, ...]:
+            self.calls.append("sign_manifest")
+            raise RuntimeError("manifest signature failed")
+
+    hooks = SigningFailingHooks()
+    request = BuildRequest(
+        target_version="3.6.22",
+        remote=RemoteReleaseInfo.available("3.6.21"),
+        release_notes_path="notes.md",
+        sign_manifest=True,
+        private_key_path="env:RELEASE_PRIVATE_KEY_PATH",
+        commit_version_changes=True,
+        push_main=True,
+        create_or_reuse_tag=True,
+        build_portable=False,
+        build_installer=False,
+        run_smoke_tests=False,
+    )
+
+    result = run_release_request(
+        request,
+        hooks.as_pipeline_hooks(),
+        RecordingEmitter(),
+        CancellationToken(),
+    )
+
+    assert result.failed_stage is ReleaseStage.SIGNING
+    assert "ensure_tag" not in hooks.calls
 
 
 def test_dry_run_plans_version_and_skips_every_side_effect():

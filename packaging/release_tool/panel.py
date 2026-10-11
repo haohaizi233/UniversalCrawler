@@ -514,6 +514,7 @@ class ReleaseBuilderWindow(QWidget):
                 repository,
                 environment=environment,
                 project_root=self._project_root,
+                expected_summary=self._expected_release_summary(),
             )
         )
         self._remote_generation = 0
@@ -811,6 +812,16 @@ class ReleaseBuilderWindow(QWidget):
                 button.setChecked(candidate is intent)
         finally:
             blockers.clear()
+
+    def _expected_release_summary(self) -> str | None:
+        notes_edit = getattr(self, "notes_edit", None)
+        path_text = notes_edit.text().strip() if notes_edit is not None else ""
+        if not path_text:
+            return None
+        try:
+            return Path(path_text).read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            return None
 
     def start_remote_lookup(self) -> None:
         if self.remote_lookup_active or self._shutting_down:

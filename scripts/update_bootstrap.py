@@ -593,11 +593,56 @@ def _windows_required(run_func: RunFunc) -> None:
         raise BootstrapError("Windows signing commands require a Windows release machine")
 
 
+def _run_powershell_file(
+    run_func: RunFunc,
+    script: str,
+    script_args: Sequence[str],
+    *,
+    timeout: int,
+) -> subprocess.CompletedProcess[str]:
+    """Run a script file. Paths stay in argv and are never spliced into -Command."""
+
+    script_fd, script_name = tempfile.mkstemp(prefix="ucrawl-powershell-", suffix=".ps1")
+    script_path = Path(script_name)
+    try:
+        os.write(script_fd, script.encode("utf-8"))
+        os.close(script_fd)
+        script_fd = -1
+        return run_func(
+            [
+                _powershell_exe(),
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                os.fspath(script_path),
+                *script_args,
+            ],
+            capture_output=True,
+            text=True,
+            shell=False,
+            timeout=timeout,
+        )
+    finally:
+        if script_fd >= 0:
+            try:
+                os.close(script_fd)
+            except OSError:
+                pass
+        try:
+            script_path.unlink()
+        except OSError:
+            pass
+
+
 def _powershell_cert_discovery_script() -> str:
     return r"""
+param(
+    [string] $Sha1 = "",
+    [string] $Subject = ""
+)
 $ErrorActionPreference = "Stop"
-$sha1 = $args[0]
-$subjectFilter = $args[1]
 $stores = @(
   @{ Location = "CurrentUser"; Name = "My"; Path = "Cert:\CurrentUser\My" },
   @{ Location = "LocalMachine"; Name = "My"; Path = "Cert:\LocalMachine\My" }
@@ -615,8 +660,8 @@ foreach ($store in $stores) {
     if ($cert.NotAfter -le (Get-Date)) { return }
     if ([string]::IsNullOrWhiteSpace($cert.Subject)) { return }
     $thumb = ([string]$cert.Thumbprint).Replace(" ", "").ToUpperInvariant()
-    if ($sha1 -and $thumb -ne $sha1.Replace(" ", "").ToUpperInvariant()) { return }
-    if ($subjectFilter -and $cert.Subject -notlike "*$subjectFilter*") { return }
+    if ($Sha1 -and $thumb -ne $Sha1.Replace(" ", "").ToUpperInvariant()) { return }
+    if ($Subject -and $cert.Subject -notlike "*$Subject*") { return }
     $sha256 = [System.BitConverter]::ToString(
       [System.Security.Cryptography.SHA256]::Create().ComputeHash($cert.RawData)
     ).Replace("-", "")
@@ -666,11 +711,10 @@ def discover_windows_cert(
     _windows_required(run_func)
     sha1 = normalize_fingerprint(cert_sha1 or os.environ.get("UCRAWL_SIGN_CERT_SHA1") or "")
     subject = cert_subject or os.environ.get("UCRAWL_SIGN_CERT_SUBJECT") or ""
-    result = run_func(
-        [_powershell_exe(), "-NoProfile", "-NonInteractive", "-Command", _powershell_cert_discovery_script(), sha1, subject],
-        capture_output=True,
-        text=True,
-        shell=False,
+    result = _run_powershell_file(
+        run_func,
+        _powershell_cert_discovery_script(),
+        ["-Sha1", sha1, "-Subject", subject],
         timeout=30,
     )
     if result.returncode != 0:
@@ -696,8 +740,12 @@ def discover_windows_cert(
 
 def _powershell_trust_extract_script() -> str:
     return r"""
+param(
+    [Parameter(Mandatory = $true)]
+    [string] $LiteralPath
+)
 $ErrorActionPreference = "Stop"
-$s = Get-AuthenticodeSignature -LiteralPath $args[0]
+$s = Get-AuthenticodeSignature -LiteralPath $LiteralPath
 $cert = $s.SignerCertificate
 if ($null -eq $cert) {
   [Console]::OutputEncoding = [Text.Encoding]::UTF8
@@ -728,11 +776,10 @@ def extract_windows_trust(
     """读取 Authenticode 签名者身份及归一化的 SHA1/SHA256 指纹。"""
 
     _windows_required(run_func)
-    result = run_func(
-        [_powershell_exe(), "-NoProfile", "-NonInteractive", "-Command", _powershell_trust_extract_script(), str(installer)],
-        capture_output=True,
-        text=True,
-        shell=False,
+    result = _run_powershell_file(
+        run_func,
+        _powershell_trust_extract_script(),
+        ["-LiteralPath", str(installer)],
         timeout=30,
     )
     if result.returncode != 0:

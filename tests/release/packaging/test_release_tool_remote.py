@@ -228,6 +228,55 @@ def test_release_inventory_resumes_only_an_unpublished_tag_matching_head(monkeyp
     assert info.target_revision_for("3.6.21") == 1
 
 
+def test_summary_conflict_or_public_release_selects_the_next_revision():
+    conflicting = remote.RemoteReleaseInfo.available(
+        "v3.6.22",
+        release_tags=("v3.6.22",),
+        occupied_tags=("v3.6.22-r1", "v3.6.22"),
+        resumable_tags=("v3.6.22-r1",),
+        blocked_tags=("v3.6.22-r1",),
+    )
+    published = remote.RemoteReleaseInfo.available(
+        "v3.6.22-r1",
+        release_tags=("v3.6.22-r1",),
+        occupied_tags=("v3.6.22-r1",),
+        resumable_tags=("v3.6.22-r1",),
+    )
+
+    assert conflicting.resumable_tags == ()
+    assert conflicting.target_revision_for("3.6.22") == 2
+    assert published.resumable_tags == ()
+    assert published.target_revision_for("3.6.22") == 2
+
+
+def test_draft_revision_is_reused_only_when_assets_are_missing_or_the_summary_matches():
+    blocked = remote._blocked_draft_tags(
+        [
+            {
+                "tag_name": "v3.6.22-r1",
+                "draft": True,
+                "assets": [],
+                "body": "other notes",
+            },
+            {
+                "tag_name": "v3.6.22-r2",
+                "draft": True,
+                "assets": [{"name": "setup.exe"}],
+                "body": "ship notes",
+            },
+            {
+                "tag_name": "v3.6.22-r3",
+                "draft": True,
+                "assets": [{"name": "setup.exe"}],
+                "body": "other notes",
+            },
+        ],
+        "ship notes",
+    )
+
+    assert blocked == ("v3.6.22-r3", "v3.6.22-r1")
+
+
 def test_tag_inventory_keeps_conflicting_or_old_source_tags_immutable():
     occupied, resumable = remote._merge_release_tag_inventory(
         published_tags=("v3.6.21",),

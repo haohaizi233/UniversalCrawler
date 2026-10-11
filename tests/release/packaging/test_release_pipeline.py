@@ -1151,11 +1151,12 @@ def test_new_release_persists_identity_before_snapshot_and_publishes_after_smoke
         result = run_release_request(request, hooks, Mock(), CancellationToken())
 
     assert result.succeeded
-    assert calls.index("git:commit") < calls.index("git:tag")
-    assert calls.index("git:tag") < calls.index("validate_identity")
-    assert calls.index("validate_identity") < calls.index("snapshot")
+    assert calls.index("git:commit") < calls.index("snapshot")
     assert calls.index("snapshot") < calls.index("manifest")
-    assert calls.index("manifest") < calls.index("smoke") < calls.index("remote_release")
+    assert calls.index("manifest") < calls.index("git:tag")
+    assert calls.index("git:tag") < calls.index("validate_identity")
+    assert calls.index("validate_identity") < calls.index("smoke")
+    assert calls.index("smoke") < calls.index("remote_release")
     assert calls.index("remote_release") < calls.index("upload") < calls.index("remote_verify")
     assert calls.index("remote_verify") < calls.index("publish")
     assert [
@@ -1553,6 +1554,7 @@ def test_source_identity_skips_main_push_when_remote_already_matches():
     request = BuildRequest(
         target_version="3.6.21",
         remote=RemoteReleaseInfo.available("3.6.21"),
+        apply_version=False,
         build_portable=False,
         build_installer=False,
         run_smoke_tests=False,
@@ -1576,37 +1578,68 @@ def test_source_identity_skips_main_push_when_remote_already_matches():
     assert not any(call[0] == "push" for call in git_calls)
 
 
-def test_same_release_tag_creation_pushes_tag_without_main_push():
+def test_same_release_tag_is_created_only_after_signing_succeeds(tmp_path):
     tool = _load_tool()
     expected_commit = "a" * 40
     git_calls: list[list[str]] = []
     ensured: list[tuple[str, str]] = []
+    events: list[str] = []
+    tag_ready = False
+    snapshot_root = tmp_path / "snapshot"
+    snapshot_root.mkdir()
+    installer = snapshot_root / "setup.exe"
+    installer.write_bytes(b"installer")
+    private_key = tmp_path / "private.pem"
+    private_key.write_text(
+        ECC.generate(curve="Ed25519").export_key(format="PEM"),
+        encoding="utf-8",
+    )
+    release_dir = tmp_path / "release-assets" / "v3.6.21-r1"
+    release_dir.mkdir(parents=True)
+    (release_dir / "latest.json").write_bytes(b"{}")
 
     class FakePublisher:
         def __init__(self, *_args, **_kwargs):
             pass
 
         def ensure_tag(self, tag: str, commit: str) -> None:
+            events.append("remote_tag")
             ensured.append((tag, commit))
 
     def fake_git(argv):
+        nonlocal tag_ready
         git_calls.append(list(argv))
         if argv[0] == "status":
             return ""
         if argv[:2] == ["rev-parse", "HEAD"]:
             return expected_commit
+        if argv[0] == "tag":
+            tag_ready = True
+            events.append("git_tag")
+            return ""
         if argv[:3] == ["rev-parse", "--verify", "refs/tags/v3.6.21-r1^{commit}"]:
-            raise subprocess.CalledProcessError(1, argv)
+            if not tag_ready:
+                raise subprocess.CalledProcessError(1, argv)
+            return expected_commit
+        if argv[0] == "push" and "refs/tags/" in argv[-1]:
+            events.append("git_push_tag")
         return ""
+
+    def fake_prepare(**_kwargs):
+        events.append("manifest")
+        return release_dir
 
     request = BuildRequest(
         target_version="3.6.21",
         remote=RemoteReleaseInfo.available("3.6.21"),
+        apply_version=False,
         build_portable=False,
         build_installer=False,
         run_smoke_tests=False,
         same_release_repair=True,
         push_main=False,
+        sign_manifest=True,
+        private_key_path=str(private_key),
         create_or_reuse_tag=True,
     )
 
@@ -1614,20 +1647,106 @@ def test_same_release_tag_creation_pushes_tag_without_main_push():
     def fake_lock(_project_root):
         yield "release-token"
 
+    @contextmanager
+    def fake_snapshot(_commit, *, repository_root):
+        assert repository_root == tool.PROJECT_ROOT
+        events.append("snapshot")
+        yield snapshot_root
+
     with (
         patch.object(tool, "GitHubReleasePublisher", FakePublisher),
         patch.object(tool, "_release_build_lock", side_effect=fake_lock),
         patch.object(tool, "_git_tag_exists", return_value=False),
         patch.object(tool, "_run_git", side_effect=fake_git),
+        patch.object(tool, "_source_snapshot", side_effect=fake_snapshot),
+        patch.object(tool, "_validate_windows_release_tools"),
+        patch.object(tool, "_project_release_metadata", return_value=("3.6.21", installer)),
+        patch.object(tool, "_prepare_release_assets", side_effect=fake_prepare),
     ):
         hooks = tool._build_pipeline_hooks(request, {}, emitter=None)
         result = run_release_request(request, hooks, Mock(), CancellationToken())
 
     assert result.failed_stage is None
+    assert events.index("manifest") < events.index("git_tag")
+    assert events.index("git_tag") < events.index("git_push_tag")
+    assert events.index("git_push_tag") < events.index("remote_tag")
     assert ["tag", "v3.6.21-r1", expected_commit] in git_calls
     assert ["push", "origin", "refs/tags/v3.6.21-r1:refs/tags/v3.6.21-r1"] in git_calls
     assert ensured == [("v3.6.21-r1", expected_commit)]
     assert ["push", "origin", f"{expected_commit}:refs/heads/main"] not in git_calls
+
+
+def test_signing_failure_does_not_publish_the_release_tag(tmp_path):
+    tool = _load_tool()
+    expected_commit = "a" * 40
+    git_calls: list[list[str]] = []
+    snapshot_root = tmp_path / "snapshot"
+    snapshot_root.mkdir()
+    installer = snapshot_root / "setup.exe"
+    installer.write_bytes(b"installer")
+    private_key = tmp_path / "private.pem"
+    private_key.write_text(
+        ECC.generate(curve="Ed25519").export_key(format="PEM"),
+        encoding="utf-8",
+    )
+
+    class FakePublisher:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def ensure_tag(self, tag: str, commit: str) -> None:
+            raise AssertionError(f"tag must not be published: {tag} {commit}")
+
+    def fake_git(argv):
+        git_calls.append(list(argv))
+        if argv[0] == "status":
+            return ""
+        if argv[:2] == ["rev-parse", "HEAD"]:
+            return expected_commit
+        if argv[0] in {"tag", "push"}:
+            raise AssertionError(f"git {argv[0]} must not run when signing fails")
+        return ""
+
+    request = BuildRequest(
+        target_version="3.6.21",
+        remote=RemoteReleaseInfo.available("3.6.21"),
+        apply_version=False,
+        build_portable=False,
+        build_installer=False,
+        run_smoke_tests=False,
+        same_release_repair=True,
+        push_main=False,
+        sign_manifest=True,
+        private_key_path=str(private_key),
+        create_or_reuse_tag=True,
+    )
+
+    @contextmanager
+    def fake_lock(_project_root):
+        yield "release-token"
+
+    @contextmanager
+    def fake_snapshot(_commit, *, repository_root):
+        yield snapshot_root
+
+    def fail_prepare(**_kwargs):
+        raise RuntimeError("manifest signature failed")
+
+    with (
+        patch.object(tool, "GitHubReleasePublisher", FakePublisher),
+        patch.object(tool, "_release_build_lock", side_effect=fake_lock),
+        patch.object(tool, "_git_tag_exists", return_value=False),
+        patch.object(tool, "_run_git", side_effect=fake_git),
+        patch.object(tool, "_source_snapshot", side_effect=fake_snapshot),
+        patch.object(tool, "_validate_windows_release_tools"),
+        patch.object(tool, "_project_release_metadata", return_value=("3.6.21", installer)),
+        patch.object(tool, "_prepare_release_assets", side_effect=fail_prepare),
+    ):
+        hooks = tool._build_pipeline_hooks(request, {}, emitter=None)
+        result = run_release_request(request, hooks, Mock(), CancellationToken())
+
+    assert result.failed_stage is tool.ReleaseStage.SIGNING
+    assert not any(call[0] in {"tag", "push"} for call in git_calls)
 
 
 def test_rotated_trust_anchor_is_included_in_exact_release_commit(tmp_path):
@@ -1728,7 +1847,7 @@ def test_rotated_trust_anchor_is_included_in_exact_release_commit(tmp_path):
     assert commit_call[-2:] == list(expected_paths)
 
 
-def test_already_synced_version_projection_reuses_head_without_a_new_commit():
+def test_clean_head_is_reused_only_when_it_is_the_version_commit():
     tool = _load_tool()
     request = BuildRequest(
         target_version="3.6.22",
@@ -1741,25 +1860,49 @@ def test_already_synced_version_projection_reuses_head_without_a_new_commit():
         "3.6.22",
         (tool.PROJECT_ROOT / "shared/version.py",),
     )
-    git_calls: list[list[str]] = []
+    projection_files = "\n".join(sorted(tool._VERSION_COMMIT_FILES))
 
-    def fake_git(argv):
-        git_calls.append(list(argv))
-        if argv[:2] == ["rev-parse", "HEAD"]:
-            return "b" * 40
-        return ""
+    def run_commit(diff_tree: str):
+        git_calls: list[list[str]] = []
 
-    with (
-        patch.object(tool, "plan_version_update", return_value=version_plan),
-        patch.object(tool, "apply_version_update", return_value=version_result),
-        patch.object(tool, "_run_git", side_effect=fake_git),
-    ):
-        hooks = tool._build_pipeline_hooks(request, {}, emitter=None)
-        hooks.apply_version(request.target_version)
-        commit = hooks.commit_version_changes(request)
+        def fake_git(argv):
+            git_calls.append(list(argv))
+            if argv[0] == "status":
+                return ""
+            if argv[:2] == ["rev-parse", "HEAD"]:
+                return "b" * 40
+            if argv[0] == "diff-tree":
+                return diff_tree
+            return ""
+
+        with (
+            patch.object(tool, "plan_version_update", return_value=version_plan),
+            patch.object(tool, "apply_version_update", return_value=version_result),
+            patch.object(tool, "verify_version_contract", return_value=()),
+            patch.object(tool, "_run_git", side_effect=fake_git),
+        ):
+            hooks = tool._build_pipeline_hooks(request, {}, emitter=None)
+            hooks.apply_version(request.target_version)
+            return hooks.commit_version_changes(request), git_calls
+
+    with pytest.raises(SystemExit, match="not the version commit"):
+        run_commit("app/services/example.py")
+    with pytest.raises(SystemExit, match="not the version commit"):
+        run_commit("")
+    with pytest.raises(SystemExit, match="not the version commit"):
+        run_commit("docs/changelog.md")
+    with pytest.raises(SystemExit, match="not the version commit"):
+        run_commit("llms.txt")
+    with pytest.raises(SystemExit, match="not the version commit"):
+        run_commit("docs/changelog.md\nllms.txt")
+    with pytest.raises(SystemExit, match="not the version commit"):
+        run_commit("\n".join(sorted(tool._VERSION_COMMIT_FILES - {"llms.txt"})))
+
+    commit, git_calls = run_commit(projection_files)
 
     assert commit == "b" * 40
     assert not any(call[0] in {"add", "commit"} for call in git_calls)
+    assert any(call[0] == "diff-tree" for call in git_calls)
 
 
 def test_normal_signing_reuses_external_key_without_rotating_trust_anchor(tmp_path):

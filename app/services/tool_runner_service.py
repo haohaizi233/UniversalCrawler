@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import json
 import os
 import threading
 import time
 import uuid
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FutureTimeoutError, wait
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -22,7 +23,6 @@ from app.core.tools.contracts import (
     ToolRequirements,
     ToolRunResult,
     ToolRunStatus,
-    ToolValidationResult,
     freeze_private_data,
 )
 from app.core.tools.registry import ToolRegistry
@@ -36,15 +36,30 @@ from app.services.tool_history_projection import (
 )
 from app.services.tool_history_storage import (
     MAX_HISTORY_BYTES,
-    atomic_write_json as _storage_atomic_write_json,
     bounded_history_snapshot,
+    locked_update_json,
     persist_retry_delay,
     read_history_json,
 )
 from app.utils.runtime_paths import user_cache_root, user_data_root
-from shared.execution_profile import (
-    ExecutionProfile,
-    execution_profile_identity_error,
+from shared.execution_profile import ExecutionProfile
+
+from app.services.tool_runner_helpers import (
+    _atomic_write_json,
+    _coerce_run_status,
+    _deadline,
+    _forbidden_payload,
+    _is_terminal_status,
+    _join_executor_threads,
+    _log_exception_best_effort,
+    _merge_history_rows,
+    _normalize_validation,
+    _owner_mismatch_payload,
+    _preflight_error_payload,
+    _profile_identity_error,
+    _public_snapshot_matches,
+    _record_from_dict,
+    _remaining_seconds,
 )
 
 ToolEventCallback = Callable[[str, dict[str, Any]], None]
@@ -63,6 +78,7 @@ class PrivateToolResult:
     run_id: str
     tool_id: str
     output_paths: tuple[Path, ...]
+    provenance: str = ""
     structured_data: Mapping[str, Any] = field(default_factory=dict, repr=False)
     private_data: Mapping[str, Any] = field(
         default_factory=dict,
@@ -103,6 +119,7 @@ class _RunRecord:
     message: str = ""
     progress_details: dict[str, Any] = field(default_factory=dict)
     result: ToolRunResult | None = None
+    provenance: str = ""
     runtime_private_result: bool = field(default=False, repr=False)
     claimed_candidate_ids: set[str] = field(default_factory=set, repr=False)
 
@@ -179,6 +196,8 @@ class ToolRunnerService:
         self._history_write_lock = threading.Lock()
         self._records: dict[str, _RunRecord] = {}
         self._order: list[str] = []
+        self._owned_run_ids: set[str] = set()
+        self._removed_run_ids: set[str] = set()
         self._tokens: dict[str, CancellationToken] = {}
         self._futures: dict[str, Future[Any]] = {}
         self._worker_state_lock = threading.Lock()
@@ -354,6 +373,7 @@ class ToolRunnerService:
             ),
             host_surface=execution_profile.host_surface,
             owner_id=execution_profile.owner_id,
+            provenance=str(descriptor.provenance or ""),
         )
         with self._lock:
             if self._closed:
@@ -373,6 +393,8 @@ class ToolRunnerService:
                 }
             self._records[run_id] = record
             self._order.append(run_id)
+            self._owned_run_ids.add(run_id)
+            self._removed_run_ids.discard(run_id)
             self._trim_history_locked()
             self._tokens[run_id] = token
             queued_payload = record.to_public_dict()
@@ -532,6 +554,7 @@ class ToolRunnerService:
                     for path in record.result.output_paths
                     if str(path).strip()
                 ),
+                provenance=record.provenance,
                 structured_data=record.result.data,
                 private_data=record.result.private_data,
             )
@@ -644,6 +667,8 @@ class ToolRunnerService:
             ]
             for run_id in removed:
                 self._records.pop(run_id, None)
+                self._owned_run_ids.discard(run_id)
+                self._removed_run_ids.add(run_id)
             removed_ids = set(removed)
             self._order = [run_id for run_id in self._order if run_id not in removed_ids]
         self._schedule_persist()
@@ -754,20 +779,22 @@ class ToolRunnerService:
             drained = not self._futures and self._workers_idle.is_set()
         if wait:
             drained = self.wait_for_idle(timeout=_remaining_seconds(deadline))
+        accepted_pending = self._accepted_workers_pending()
         self._executor.shutdown(wait=False, cancel_futures=True)
         workers_joined = not wait or _join_executor_threads(self._executor, deadline)
 
-        # With a deadline, never let history executor teardown extend the caller budget.
-        # Generation was advanced above, so an in-flight loop will refresh its snapshot.
+        # Snapshot only after accepted workers publish terminal records. A timed-out
+        # caller stays undrained; the non-daemon thread still persists that generation.
         self._io_executor.shutdown(wait=False, cancel_futures=False)
         persist_thread = self._ensure_shutdown_persist_thread()
-        persist_timeout = _remaining_seconds(deadline)
-        if not wait:
-            persist_timeout = _SHUTDOWN_PERSIST_GRACE_SECONDS
-        elif persist_timeout is not None:
-            # A zero worker-drain budget must not silently discard the terminal
-            # cancellation ledger. Keep this durability grace short and bounded.
-            persist_timeout = max(persist_timeout, _SHUTDOWN_PERSIST_GRACE_SECONDS)
+        if accepted_pending:
+            persist_timeout = 0.0 if not wait else _remaining_seconds(deadline)
+        else:
+            persist_timeout = _remaining_seconds(deadline)
+            if not wait:
+                persist_timeout = _SHUTDOWN_PERSIST_GRACE_SECONDS
+            elif persist_timeout is not None:
+                persist_timeout = max(persist_timeout, _SHUTDOWN_PERSIST_GRACE_SECONDS)
         persist_thread.join(persist_timeout)
         with self._lock:
             persisted = (
@@ -1053,6 +1080,9 @@ class ToolRunnerService:
             )
             if candidate is None:
                 break
+            if candidate in self._owned_run_ids:
+                self._owned_run_ids.discard(candidate)
+                self._removed_run_ids.add(candidate)
             self._order.remove(candidate)
             self._records.pop(candidate, None)
 
@@ -1080,13 +1110,30 @@ class ToolRunnerService:
             if not isinstance(raw, list):
                 return
             loaded: dict[str, _RunRecord] = {}
+            nonterminal_ids: set[str] = set()
+            projection_ids: set[str] = set()
             for item in raw:
+                raw_status = (
+                    str(item.get("status") or "").strip().lower()
+                    if isinstance(item, Mapping)
+                    else ""
+                )
                 record = _record_from_dict(item)
                 if record is None:
                     continue
                 existing = loaded.get(record.run_id)
-                if existing is None or record.created_at >= existing.created_at:
-                    loaded[record.run_id] = record
+                if existing is not None and record.created_at < existing.created_at:
+                    continue
+                loaded[record.run_id] = record
+                if raw_status in {"queued", "running", "cancelling"}:
+                    nonterminal_ids.add(record.run_id)
+                    projection_ids.discard(record.run_id)
+                    continue
+                nonterminal_ids.discard(record.run_id)
+                if not _public_snapshot_matches(item, record.to_public_dict()):
+                    projection_ids.add(record.run_id)
+                else:
+                    projection_ids.discard(record.run_id)
             with self._lock:
                 for run_id, record in loaded.items():
                     if run_id not in self._records:
@@ -1099,10 +1146,40 @@ class ToolRunnerService:
                     ),
                 )
                 self._trim_history_locked()
+                process_owners = {
+                    (
+                        self._records[owned_id].host_surface,
+                        self._records[owned_id].owner_id,
+                    )
+                    for owned_id in self._owned_run_ids
+                    if owned_id in self._records
+                }
+                claim_ids = {
+                    run_id for run_id in projection_ids if run_id in self._records
+                }
+                claim_ids.update(
+                    run_id
+                    for run_id in nonterminal_ids
+                    if run_id in self._records
+                    and (
+                        self._records[run_id].host_surface,
+                        self._records[run_id].owner_id,
+                    )
+                    in process_owners
+                )
+                if claim_ids:
+                    self._owned_run_ids.update(claim_ids)
+                    self._removed_run_ids.difference_update(claim_ids)
+                    self._mark_persist_dirty_locked()
         except BaseException as exc:
             _log_exception_best_effort("load_history", exc)
         finally:
+            # Open the barrier before taking _lock. A caller may already hold
+            # that lock while it waits for history, as the cancellation tests do.
             self._history_loaded.set()
+            with self._lock:
+                if self._persisted_generation < 0:
+                    self._persisted_generation = 0
 
     def _schedule_persist(self, *, mark_dirty: bool = True) -> None:
         with self._lock:
@@ -1140,26 +1217,12 @@ class ToolRunnerService:
                     failures = 0
                 try:
                     with self._history_write_lock:
-                        with self._lock:
-                            snapshot = [
-                                self._records[run_id].to_public_dict()
-                                for run_id in self._order
-                                if run_id in self._records
-                            ]
-                        snapshot = bounded_history_snapshot(
-                            snapshot,
-                            max_bytes=MAX_HISTORY_BYTES,
-                        )
-                        _atomic_write_json(
-                            self.history_path,
-                            snapshot,
-                            cache_root=self._history_cache_root,
-                        )
-                        with self._lock:
-                            self._persisted_generation = max(
-                                self._persisted_generation,
-                                generation,
-                            )
+                        mutation = self._capture_history_mutation()
+                        if mutation is None:
+                            continue
+                        generation, rows, removed = mutation
+                        self._write_history_mutation(rows, removed)
+                        self._commit_history_mutation(generation, removed)
                 except OSError as exc:
                     failures += 1
                     _log_exception_best_effort("persist_history", exc)
@@ -1206,30 +1269,12 @@ class ToolRunnerService:
         if not acquired:
             return False
         try:
-            with self._lock:
-                generation = self._persist_generation
-                if self._persisted_generation >= generation:
-                    return True
-                snapshot = [
-                    self._records[run_id].to_public_dict()
-                    for run_id in self._order
-                    if run_id in self._records
-                ]
-            snapshot = bounded_history_snapshot(
-                snapshot,
-                max_bytes=MAX_HISTORY_BYTES,
-            )
-            _atomic_write_json(
-                self.history_path,
-                snapshot,
-                cache_root=self._history_cache_root,
-            )
-            with self._lock:
-                self._persisted_generation = max(
-                    self._persisted_generation,
-                    generation,
-                )
-                return self._persisted_generation >= self._persist_generation
+            mutation = self._capture_history_mutation()
+            if mutation is None:
+                return True
+            generation, rows, removed = mutation
+            self._write_history_mutation(rows, removed)
+            return self._commit_history_mutation(generation, removed)
         except BaseException as exc:
             _log_exception_best_effort("persist_history.shutdown", exc)
             return False
@@ -1254,8 +1299,79 @@ class ToolRunnerService:
             thread.start()
             return thread
 
+    def _accepted_workers_pending(self) -> bool:
+        with self._worker_state_lock:
+            if self._active_workers:
+                return True
+        with self._lock:
+            if any(not future.done() for future in self._futures.values()):
+                return True
+            if not self._workers_idle.is_set():
+                return True
+        return False
+
+    def _wait_for_accepted_terminal_records(self) -> None:
+        while self._accepted_workers_pending():
+            if self._workers_idle.wait(0.05) and self._accepted_workers_pending():
+                time.sleep(0.01)
+
+    def _capture_history_mutation(
+        self,
+    ) -> tuple[int, list[dict[str, Any]], set[str]] | None:
+        with self._lock:
+            generation = self._persist_generation
+            if self._persisted_generation >= generation:
+                return None
+            rows = [
+                self._records[run_id].to_public_dict()
+                for run_id in self._order
+                if run_id in self._records and run_id in self._owned_run_ids
+            ]
+            return generation, rows, set(self._removed_run_ids)
+
+    def _write_history_mutation(
+        self,
+        rows: Sequence[Mapping[str, Any]],
+        removed_ids: set[str],
+    ) -> None:
+        def mutate(current: Any) -> list[dict[str, Any]]:
+            merged = _merge_history_rows(current, rows, removed_ids)
+            return bounded_history_snapshot(merged, max_bytes=MAX_HISTORY_BYTES)
+
+        try:
+            locked_update_json(
+                self.history_path,
+                mutate,
+                cache_root=self._history_cache_root,
+                max_bytes=MAX_HISTORY_BYTES,
+                writer=_atomic_write_json,
+            )
+        except ValueError as exc:
+            if isinstance(exc, (UnicodeError, json.JSONDecodeError)):
+                raise
+            if str(exc).startswith("invalid JSON constant"):
+                raise
+            # A readable-but-rejected snapshot (byte limit or malformed
+            # Unicode) cannot be merged. Parse failures are not replaced:
+            # rewriting the file would discard every other owner's rows.
+            _atomic_write_json(
+                self.history_path,
+                bounded_history_snapshot(
+                    _merge_history_rows(None, rows, removed_ids),
+                    max_bytes=MAX_HISTORY_BYTES,
+                ),
+                cache_root=self._history_cache_root,
+            )
+
+    def _commit_history_mutation(self, generation: int, removed_ids: set[str]) -> bool:
+        with self._lock:
+            self._removed_run_ids -= removed_ids
+            self._persisted_generation = max(self._persisted_generation, generation)
+            return self._persisted_generation >= self._persist_generation
+
     def _persist_shutdown_snapshot(self) -> None:
         try:
+            self._wait_for_accepted_terminal_records()
             result = self._persist_history_now()
         except BaseException as exc:
             _log_exception_best_effort("persist_history.shutdown_worker", exc)
@@ -1285,210 +1401,6 @@ class ToolRunnerService:
             )
         except BaseException:
             pass
-
-
-def _normalize_validation(value: Any, parameters: Mapping[str, Any]) -> ToolValidationResult:
-    if isinstance(value, ToolValidationResult):
-        if value.parameters:
-            return value
-        return ToolValidationResult(value.valid, value.errors, value.warnings, dict(parameters))
-    if isinstance(value, ToolRunResult):
-        valid = _coerce_run_status(value.status) != ToolRunStatus.FAILED
-        return ToolValidationResult(valid, () if valid else (value.message,), value.warnings, dict(parameters))
-    if value is None or value is True:
-        return ToolValidationResult.ok(parameters=parameters)
-    if value is False:
-        return ToolValidationResult.rejected("tool input is invalid")
-    if isinstance(value, str):
-        return ToolValidationResult.rejected(value)
-    if isinstance(value, Mapping):
-        errors = tuple(str(item) for item in value.get("errors", ()) if str(item).strip())
-        warnings = tuple(str(item) for item in value.get("warnings", ()) if str(item).strip())
-        normalized = value.get("parameters")
-        return ToolValidationResult(
-            not errors and bool(value.get("valid", True)),
-            errors,
-            warnings,
-            dict(normalized) if isinstance(normalized, Mapping) else dict(parameters),
-        )
-    if isinstance(value, (list, tuple, set, frozenset)):
-        errors = tuple(str(item) for item in value if str(item).strip())
-        return ToolValidationResult(not errors, errors, (), dict(parameters))
-    return ToolValidationResult.rejected("unsupported validation result")
-
-
-def _is_terminal_status(status: ToolRunStatus) -> bool:
-    return status in {
-        ToolRunStatus.SUCCEEDED,
-        ToolRunStatus.FAILED,
-        ToolRunStatus.CANCELLED,
-    }
-
-
-def _deadline(timeout: float | None) -> float | None:
-    if timeout is None:
-        return None
-    return time.monotonic() + max(0.0, float(timeout))
-
-
-def _remaining_seconds(deadline: float | None) -> float | None:
-    if deadline is None:
-        return None
-    return max(0.0, deadline - time.monotonic())
-
-
-def _join_executor_threads(
-    executor: ThreadPoolExecutor,
-    deadline: float | None,
-) -> bool:
-    """Join CPython 3.10-3.13 executor workers within the shutdown budget.
-
-    ThreadPoolExecutor exposes no public bounded join. Service-owned futures prove
-    work completion but not physical worker exit, so the supported CPython matrix's
-    stable ``_threads`` set is isolated here instead of weakening timeout semantics.
-    """
-
-    current_ident = threading.get_ident()
-    threads = tuple(getattr(executor, "_threads", ()))
-    for thread in threads:
-        if thread.ident == current_ident:
-            return False
-        thread.join(_remaining_seconds(deadline))
-    return all(not thread.is_alive() for thread in threads)
-
-
-def _owner_mismatch_payload(run_id: str) -> dict[str, Any]:
-    return {
-        "status": "forbidden",
-        "code": "tool_owner_mismatch",
-        "message": "tool run belongs to another owner",
-        "run_id": run_id,
-    }
-
-
-def _preflight_error_payload(
-    tool_id: str,
-    *,
-    code: str,
-    message: str,
-) -> dict[str, Any]:
-    return {
-        "status": "error",
-        "valid": False,
-        "code": code,
-        "message": message,
-        "errors": [message],
-        "tool_id": tool_id,
-    }
-
-
-def _log_exception_best_effort(action: str, exc: BaseException) -> None:
-    try:
-        debug_logger.log_exception("ToolRunnerService", action, exc)
-    except BaseException:
-        pass
-
-
-def _record_from_dict(value: Any) -> _RunRecord | None:
-    if not isinstance(value, Mapping):
-        return None
-    try:
-        value = project_history_record(value)
-        run_id = str(value["run_id"]).strip()
-        tool_id = str(value["tool_id"]).strip()
-        host_surface = value.get("host_surface")
-        owner_id = value.get("owner_id")
-        if (
-            not run_id
-            or not tool_id
-            or execution_profile_identity_error(
-                host_surface=host_surface,
-                owner_id=owner_id,
-            )
-            is not None
-        ):
-            return None
-        status = _coerce_run_status(value.get("status"))
-        if status in {ToolRunStatus.QUEUED, ToolRunStatus.RUNNING, ToolRunStatus.CANCELLING}:
-            status = ToolRunStatus.FAILED
-        record = _RunRecord(
-            run_id=run_id,
-            tool_id=tool_id,
-            status=status,
-            parameters=dict(value.get("parameters") or {}),
-            host_surface=host_surface,
-            owner_id=owner_id,
-            created_at=(
-                float(value["created_at"])
-                if value.get("created_at") is not None
-                else time.time()
-            ),
-            started_at=float(value["started_at"]) if value.get("started_at") is not None else None,
-            finished_at=float(value["finished_at"]) if value.get("finished_at") is not None else None,
-            progress=int(value.get("progress") or 0),
-            message=str(value.get("message") or ""),
-            progress_details=dict(value.get("progress_details") or {}),
-        )
-        result = value.get("result")
-        if isinstance(result, Mapping):
-            result_status = _coerce_run_status(result.get("status") or status.value)
-            record.result = ToolRunResult(
-                result_status,
-                str(result.get("message") or ""),
-                {},
-                (),
-                tuple(str(item) for item in result.get("warnings", ()) or ()),
-            )
-        return record
-    except (KeyError, TypeError, ValueError):
-        return None
-
-
-def _forbidden_payload(tool_id: str, grant: ToolGrant) -> dict[str, Any]:
-    return {
-        "status": "forbidden",
-        "code": grant.code,
-        "message": grant.message,
-        "tool_id": str(tool_id),
-    }
-
-
-def _profile_identity_error(
-    execution_profile: object,
-) -> dict[str, Any] | None:
-    if type(execution_profile) is ExecutionProfile:
-        identity_error = execution_profile_identity_error(
-            host_surface=execution_profile.host_surface,
-            owner_id=execution_profile.owner_id,
-        )
-        if identity_error is None:
-            return None
-    return {
-        "status": "forbidden",
-        "code": "tool_profile_identity_required",
-        "message": "tool execution profile identity is required",
-    }
-
-
-def _coerce_run_status(value: Any) -> ToolRunStatus:
-    normalized = str(value or "").strip().lower()
-    aliases = {
-        "ok": ToolRunStatus.SUCCEEDED,
-        "success": ToolRunStatus.SUCCEEDED,
-        "error": ToolRunStatus.FAILED,
-        "canceled": ToolRunStatus.CANCELLED,
-    }
-    if normalized in aliases:
-        return aliases[normalized]
-    try:
-        return ToolRunStatus(normalized)
-    except ValueError:
-        return ToolRunStatus.FAILED
-
-
-def _atomic_write_json(path: Path, value: Any, *, cache_root: Path | None = None) -> None:
-    root = Path(cache_root) if cache_root is not None else Path(user_cache_root())
-    _storage_atomic_write_json(Path(path), value, cache_root=root, max_bytes=MAX_HISTORY_BYTES)
 
 
 __all__ = ["ToolRunnerService"]

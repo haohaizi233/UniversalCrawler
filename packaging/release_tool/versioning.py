@@ -17,6 +17,8 @@ VERSION_PROJECTION_PATHS = (
     Path("README.md"),
     Path("README_EN.md"),
     Path("docs/README.md"),
+    Path("docs/changelog.md"),
+    Path("llms.txt"),
     Path("cli/skill/SKILL.md"),
 )
 
@@ -58,7 +60,9 @@ _VERSION_PROJECTIONS = (
     _VersionProjection("Chinese README", VERSION_PROJECTION_PATHS[0]),
     _VersionProjection("English README", VERSION_PROJECTION_PATHS[1]),
     _VersionProjection("documentation index", VERSION_PROJECTION_PATHS[2]),
-    _VersionProjection("CLI skill manifest", VERSION_PROJECTION_PATHS[3]),
+    _VersionProjection("changelog", VERSION_PROJECTION_PATHS[3]),
+    _VersionProjection("LLM index", VERSION_PROJECTION_PATHS[4]),
+    _VersionProjection("CLI skill manifest", VERSION_PROJECTION_PATHS[5]),
 )
 
 
@@ -224,6 +228,17 @@ def _replace_projection(
     if projection.relative_path == Path("docs/README.md"):
         pattern = re.compile(rf'当前文档基线对应源码版本 `{escaped_previous}`')
         return pattern.subn(f"当前文档基线对应源码版本 `{target_version}`", source)
+
+    if projection.relative_path == Path("docs/changelog.md"):
+        pattern = re.compile(
+            rf"^当前版本号为 \*\*v{escaped_previous}\*\*。$",
+            re.MULTILINE,
+        )
+        return pattern.subn(f"当前版本号为 **v{target_version}**。", source)
+
+    if projection.relative_path == Path("llms.txt"):
+        pattern = re.compile(rf"\(`ucrawl` / v{escaped_previous}\)")
+        return pattern.subn(f"(`ucrawl` / v{target_version})", source)
 
     if projection.relative_path == Path("cli/skill/SKILL.md"):
         pattern = re.compile(rf"^version: {escaped_previous}$", re.MULTILINE)

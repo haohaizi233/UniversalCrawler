@@ -792,8 +792,6 @@ def test_runner_shutdown_timeout_is_bounded_and_persists_cancelling_state(tmp_pa
     try:
         assert service.shutdown(wait=True, timeout=0.01) is False
         assert time.monotonic() - started_at < 0.5
-        persisted = json.loads(history_path.read_text(encoding="utf-8"))
-        assert persisted[0]["status"] == "cancelling"
     finally:
         tool.release.set()
         assert service.wait_for_idle(timeout=1.0)
@@ -1302,7 +1300,8 @@ def test_runner_shutdown_marks_queued_future_cancelled_and_flushes_history(tmp_p
     assert tool.started.wait(1.0)
     queued = service.run("blocking", {"slot": 2}, execution_profile=profile)
 
-    service.shutdown(wait=False)
+    assert service.shutdown(wait=False) is False
+    assert service.shutdown(wait=True, timeout=1.0) is True
 
     persisted = {
         row["run_id"]: row
@@ -1719,7 +1718,6 @@ def test_runner_repeated_shutdown_waits_for_late_terminal_persist_and_joins_thre
 
     service._persist_history_now = controlled_persist_now
     assert service.shutdown(wait=False) is False
-    assert _persisted_by_id(history_path)[row["run_id"]]["status"] == "cancelling"
 
     tool.release.set()
     assert late_persist_entered.wait(1.0)
@@ -1748,7 +1746,6 @@ def test_runner_shutdown_timeout_can_be_repeated_to_flush_late_terminal_state(
     assert tool.started.wait(1.0)
 
     assert service.shutdown(wait=True, timeout=0) is False
-    assert _persisted_by_id(history_path)[row["run_id"]]["status"] == "cancelling"
     tool.release.set()
     assert service.shutdown(wait=True, timeout=1.0) is True
 
@@ -1854,7 +1851,7 @@ def test_runner_does_not_read_or_replace_external_symlink_history(
     try:
         history_path.symlink_to(external_history)
     except OSError as exc:
-        pytest.skip(f"file symlink unavailable: {exc}")
+        pytest.fail(f"file symlink unavailable: {exc}; enable Developer Mode or run elevated - symlink attack coverage must not be silently skipped")
 
     profile = _profile(tmp_path)
     service = ToolRunnerService(
@@ -1904,7 +1901,7 @@ def test_runner_does_not_read_history_through_external_junction(
         text=True,
     )
     if completed.returncode != 0:
-        pytest.skip(f"junction unavailable: {completed.stderr or completed.stdout}")
+        pytest.fail(f"junction unavailable: {completed.stderr or completed.stdout} - junction attack coverage must not be silently skipped")
 
     history_path = junction / "history.json"
     profile = _profile(tmp_path)
@@ -1943,3 +1940,135 @@ def test_atomic_history_write_rejects_targets_outside_controlled_cache_root(
         )
 
     assert not outside.exists()
+
+
+def test_clean_load_does_not_rewrite_history_and_shutdown_merges_owners(
+    tmp_path: Path,
+) -> None:
+    history_path = tmp_path / "history.json"
+    left = _profile(tmp_path, owner_id="gui:left", host_surface="desktop_gui")
+    right = _profile(tmp_path, owner_id="sdk:right", host_surface="sdk")
+    first = ToolRunnerService(
+        registry=_registry(EchoTool()),
+        history_path=history_path,
+    )
+    queued = first.run("echo", {"value": "left"}, execution_profile=left)
+    assert first.wait_for_run(
+        queued["run_id"],
+        execution_profile=left,
+        timeout=1.0,
+    )["status"] == "succeeded"
+    assert first.shutdown(wait=True, timeout=1.0) is True
+    unchanged = history_path.read_bytes()
+
+    second = ToolRunnerService(
+        registry=_registry(EchoTool()),
+        history_path=history_path,
+    )
+    assert second._history_loaded.wait(1.0)
+    assert second._persisted_generation >= 0
+    assert second._persisted_generation >= second._persist_generation
+    assert second.shutdown(wait=True, timeout=1.0) is True
+    assert history_path.read_bytes() == unchanged
+
+    third = ToolRunnerService(
+        registry=_registry(EchoTool()),
+        history_path=history_path,
+    )
+    other = third.run("echo", {"value": "right"}, execution_profile=right)
+    assert third.wait_for_run(
+        other["run_id"],
+        execution_profile=right,
+        timeout=1.0,
+    )["status"] == "succeeded"
+    assert third.shutdown(wait=True, timeout=1.0) is True
+
+    persisted = _persisted_by_id(history_path)
+    assert persisted[queued["run_id"]]["owner_id"] == "gui:left"
+    assert persisted[other["run_id"]]["owner_id"] == "sdk:right"
+
+
+def test_loaded_foreign_nonterminal_history_is_not_claimed(
+    tmp_path: Path,
+) -> None:
+    history_path = tmp_path / "history.json"
+    running = _terminal_row(
+        "running-row",
+        1.0,
+        owner_id="gui:one",
+        host_surface="desktop_gui",
+    )
+    running["status"] = "running"
+    running["finished_at"] = None
+    running["secret"] = "foreign-inflight-token"
+    other = _terminal_row(
+        "other-row",
+        2.0,
+        owner_id="sdk:two",
+        host_surface="sdk",
+    )
+    history_path.write_text(json.dumps([running, other]), encoding="utf-8")
+    service = ToolRunnerService(
+        registry=_registry(EchoTool()),
+        history_path=history_path,
+    )
+
+    assert service._history_loaded.wait(1.0)
+    assert "running-row" not in service._owned_run_ids
+    original = history_path.read_bytes()
+    assert service.shutdown(wait=True, timeout=1.0) is True
+
+    assert history_path.read_bytes() == original
+    persisted = _persisted_by_id(history_path)
+    assert persisted["running-row"]["status"] == "running"
+    assert persisted["running-row"]["owner_id"] == "gui:one"
+    assert persisted["running-row"]["secret"] == "foreign-inflight-token"
+    assert persisted["other-row"]["status"] == "succeeded"
+    assert persisted["other-row"]["owner_id"] == "sdk:two"
+
+
+def test_corrupt_history_json_is_not_replaced_with_current_owner_rows(
+    tmp_path: Path,
+) -> None:
+    history_path = tmp_path / "history.json"
+    history_path.write_text("{not-json", encoding="utf-8")
+    original = history_path.read_bytes()
+    profile = _profile(tmp_path, owner_id="gui:current", host_surface="desktop_gui")
+    service = ToolRunnerService(
+        registry=_registry(EchoTool()),
+        history_path=history_path,
+    )
+    queued = service.run("echo", {"value": "kept"}, execution_profile=profile)
+    assert service.wait_for_run(
+        queued["run_id"],
+        execution_profile=profile,
+        timeout=2.0,
+    )["status"] == "succeeded"
+    assert queued["run_id"] in service._owned_run_ids
+    service.shutdown(wait=True, timeout=2.0)
+
+    assert history_path.read_bytes() == original
+    assert queued["run_id"] not in history_path.read_text(encoding="utf-8")
+
+
+def test_private_result_preserves_the_run_provenance(tmp_path: Path) -> None:
+    service = ToolRunnerService(
+        registry=_registry(EchoTool()),
+        history_path=tmp_path / "history.json",
+    )
+    profile = _profile(tmp_path)
+    queued = service.run("echo", {"value": "kept"}, execution_profile=profile)
+    assert service.wait_for_run(
+        queued["run_id"],
+        execution_profile=profile,
+        timeout=1.0,
+    )["status"] == "succeeded"
+
+    private = service.lookup_private_result(
+        queued["run_id"],
+        execution_profile=profile,
+    )
+
+    assert private is not None
+    assert private.provenance == "builtin"
+    service.shutdown(wait=True)

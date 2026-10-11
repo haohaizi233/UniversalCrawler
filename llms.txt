@@ -1,6 +1,6 @@
 # UniversalCrawlerProplus
 
-> Windows desktop media crawler workstation (`ucrawl` / v3.6.17): PyQt6 GUI, FastAPI Web UI, CLI/SDK/AI Skill, Playwright spiders, and unified download scheduling across Douyin, Xiaohongshu, Bilibili, Kuaishou, and MissAV.
+> Windows desktop media crawler workstation (`ucrawl` / v3.6.22): PyQt6 GUI, FastAPI Web UI, CLI/SDK/AI Skill, Playwright spiders, and unified download scheduling across Douyin, Xiaohongshu, Bilibili, Kuaishou, and MissAV.
 
 Prefer current guides under `docs/guides/` and practices under `docs/engineering/` over dated reports. Shared runtime contracts live in `shared/`; do not reintroduce deleted dual copies such as `cli/runner.py` or `app/controllers/session_mixin.py`. Test placement follows `tests/AGENTS.md` (eight directory-driven suites).
 

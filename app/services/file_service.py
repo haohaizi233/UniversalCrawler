@@ -5,7 +5,6 @@ import errno
 import heapq
 import os
 import re
-import shutil
 import stat
 import sys
 import time
@@ -27,6 +26,14 @@ from app.services.path_policy import (
     PathPolicy,
 )
 from app.utils import sanitize_filename
+from shared.filesystem_directory_capability import is_link_or_reparse
+
+from app.services.file_rename_nofollow import (
+    _checked_regular_identity,
+    _open_nofollow_rename_descriptor,
+    _rename_posix_nofollow,
+    _rename_windows_descriptor,
+)
 
 T = TypeVar("T")
 
@@ -163,8 +170,8 @@ class MediaLibraryService:
     # 下载器会把临时文件显式记录到 meta；删除媒体时优先相信这些“本任务拥有”的路径。
     TEMP_FILE_META_KEYS = ("download_temp_files", "temporary_files")
     BILIBILI_TEMP_SUFFIXES = ("_video.m4s", "_audio.m4s")
-    HLS_TEMP_ROOT_NAME = ".ucp-nm3u8-tmp"
-    HLS_TEMP_DIR_SUFFIXES = ("_curl_cffi_hls", "_playwright_hls")
+    OWNED_TEMP_MARKER_NAME = ".ucp-owned"
+    OWNED_TEMP_MARKER_TEXT = b"universal-crawler-pro\n"
     ORPHAN_SWEEP_MAX_DIRECTORIES = 2048
     ORPHAN_SWEEP_MAX_ENTRIES = 50000
     ORPHAN_SWEEP_TIME_BUDGET_SECONDS = 3.0
@@ -276,21 +283,91 @@ class MediaLibraryService:
         return bool(cls._CHUNK_PART_RE.match(lower_name))
 
     @classmethod
-    def _is_safe_orphan_temp_dir_name(cls, name: str) -> bool:
-        lower_name = str(name or "").lower()
-        return lower_name == cls.HLS_TEMP_ROOT_NAME or lower_name.endswith(cls.HLS_TEMP_DIR_SUFFIXES)
+    def _is_owned_program_temp_directory(cls, path: str) -> bool:
+        """只认带归属标记的本程序临时目录，不按 _curl_cffi_hls/_playwright_hls 后缀删除。"""
+        try:
+            info = os.lstat(path)
+        except OSError:
+            return False
+        if is_link_or_reparse(info) or not stat.S_ISDIR(info.st_mode):
+            return False
+        marker = os.path.join(path, cls.OWNED_TEMP_MARKER_NAME)
+        try:
+            marker_info = os.lstat(marker)
+        except OSError:
+            return False
+        if is_link_or_reparse(marker_info) or not stat.S_ISREG(marker_info.st_mode):
+            return False
+        try:
+            with open(marker, "rb") as handle:
+                return handle.read() == cls.OWNED_TEMP_MARKER_TEXT
+        except OSError:
+            return False
+
+    @staticmethod
+    def _remove_reparse_entry_only(path: str, info: os.stat_result) -> None:
+        """只删除联接或重解析点本身，不进入其目标树。"""
+        mount_point = int(getattr(stat, "IO_REPARSE_TAG_MOUNT_POINT", 0xA0000003))
+        tag = int(getattr(info, "st_reparse_tag", 0) or 0)
+        directory_like = stat.S_ISDIR(info.st_mode) or tag == mount_point
+        removers = (os.rmdir, os.unlink) if directory_like else (os.unlink, os.rmdir)
+        last_error: OSError | None = None
+        for remover in removers:
+            try:
+                remover(path)
+                return
+            except FileNotFoundError:
+                return
+            except OSError as exc:
+                last_error = exc
+        if last_error is not None:
+            raise last_error
+
+    @classmethod
+    def _remove_temp_tree(cls, path: str) -> None:
+        """删除临时树。每个节点先 lstat，重解析点和目录联接只卸掉链接本身。"""
+        info = os.lstat(path)
+        if is_link_or_reparse(info):
+            cls._remove_reparse_entry_only(path, info)
+            return
+        if not stat.S_ISDIR(info.st_mode):
+            os.unlink(path)
+            return
+        with os.scandir(path) as entries:
+            for entry in entries:
+                try:
+                    child_info = entry.stat(follow_symlinks=False)
+                except OSError:
+                    continue
+                try:
+                    if is_link_or_reparse(child_info):
+                        cls._remove_reparse_entry_only(entry.path, child_info)
+                    elif stat.S_ISDIR(child_info.st_mode):
+                        cls._remove_temp_tree(entry.path)
+                    else:
+                        os.unlink(entry.path)
+                except OSError:
+                    continue
+        current = os.lstat(path)
+        if is_link_or_reparse(current):
+            cls._remove_reparse_entry_only(path, current)
+            return
+        os.rmdir(path)
 
     @classmethod
     def _remove_temp_path(cls, path: str | os.PathLike[str]) -> bool:
         """删除已确认安全的临时路径；调用方必须先完成命名白名单判断。"""
+        target = os.fspath(path)
         try:
-            target = Path(path)
-            if target.is_dir():
-                shutil.rmtree(target, ignore_errors=True)
-                return not target.exists()
-            if target.exists():
-                target.unlink()
-                return True
+            cls._remove_temp_tree(target)
+        except FileNotFoundError:
+            return False
+        except OSError:
+            return False
+        try:
+            os.lstat(target)
+        except FileNotFoundError:
+            return True
         except OSError:
             return False
         return False
@@ -431,23 +508,27 @@ class MediaLibraryService:
     def scan_directory(self, directory: str, max_scan_count: int = 1000) -> ScanResult:
         """扫描目录并按最近修改时间返回媒体文件。"""
         try:
-            if not os.path.exists(directory):
+            try:
+                directory_info = os.lstat(directory)
+            except FileNotFoundError:
                 # 启动时如果目录还不存在，直接创建一个空目录，避免首轮扫描报错。
                 os.makedirs(directory, exist_ok=True)
                 return ScanResult(items=[], total_count=0, video_count=0, image_count=0)
+            if is_link_or_reparse(directory_info) or not stat.S_ISDIR(directory_info.st_mode):
+                raise MediaScanError("scan directory must be a regular directory")
 
             media_entries: list[tuple[float, str]] = []
             with os.scandir(directory) as entries:
                 for entry in entries:
-                    if not entry.is_file():
-                        continue
                     if not entry.name.lower().endswith(self.all_media_extensions):
                         continue
                     try:
-                        stat = entry.stat()
+                        file_stat = entry.stat(follow_symlinks=False)
                     except OSError:
                         continue
-                    media_entries.append((stat.st_mtime, entry.name))
+                    if not stat.S_ISREG(file_stat.st_mode) or is_link_or_reparse(file_stat):
+                        continue
+                    media_entries.append((file_stat.st_mtime, entry.name))
 
             original_count = len(media_entries)
             truncated = original_count > max_scan_count
@@ -501,10 +582,13 @@ class MediaLibraryService:
         depth_limit = max(0, min(int(max_depth or 0), 2))
         limit = max(1, int(entry_limit or cls.ORPHAN_SWEEP_MAX_ENTRIES))
         try:
-            current_path = Path(directory).expanduser().resolve(strict=False)
+            current_path = Path(os.path.abspath(os.path.expanduser(os.fspath(directory))))
+            current_info = os.lstat(current_path)
         except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            if isinstance(exc, FileNotFoundError):
+                return OrphanDirectorySweepResult(0, (), 0)
             return OrphanDirectorySweepResult(0, (), 0, error=str(exc))
-        if not current_path.is_dir():
+        if is_link_or_reparse(current_info) or not stat.S_ISDIR(current_info.st_mode):
             return OrphanDirectorySweepResult(0, (), 0)
 
         removed = 0
@@ -519,16 +603,27 @@ class MediaLibraryService:
                         break
                     scanned_entries += 1
                     try:
-                        if entry.is_file(follow_symlinks=False):
+                        entry_info = entry.stat(follow_symlinks=False)
+                    except OSError:
+                        continue
+                    try:
+                        if is_link_or_reparse(entry_info):
                             if (
                                 cls._is_safe_orphan_temp_file_name(entry.name)
                                 and cls._remove_temp_path(entry.path)
                             ):
                                 removed += 1
                             continue
-                        if not entry.is_dir(follow_symlinks=False):
+                        if stat.S_ISREG(entry_info.st_mode):
+                            if (
+                                cls._is_safe_orphan_temp_file_name(entry.name)
+                                and cls._remove_temp_path(entry.path)
+                            ):
+                                removed += 1
                             continue
-                        if cls._is_safe_orphan_temp_dir_name(entry.name):
+                        if not stat.S_ISDIR(entry_info.st_mode):
+                            continue
+                        if cls._is_owned_program_temp_directory(entry.path):
                             if cls._remove_temp_path(entry.path):
                                 removed += 1
                             continue
@@ -569,10 +664,14 @@ class MediaLibraryService:
             if truncated:
                 break
             try:
-                root = Path(raw_dir).expanduser().resolve(strict=False)
+                root = Path(os.path.abspath(os.path.expanduser(os.fspath(raw_dir))))
             except (OSError, RuntimeError, TypeError, ValueError):
                 continue
-            if not root.exists() or not root.is_dir():
+            try:
+                root_info = os.lstat(root)
+            except OSError:
+                continue
+            if is_link_or_reparse(root_info) or not stat.S_ISDIR(root_info.st_mode):
                 continue
             pending: list[tuple[Path, int]] = [(root, 0)]
             while pending:
@@ -837,6 +936,20 @@ class MediaLibraryService:
             raise FileOperationError("重命名文件失败")
         return result
 
+    def _rename_checked_nofollow_handle(
+        self,
+        descriptor: int,
+        source: ApprovedChildPath,
+        target: ApprovedChildPath,
+        *,
+        replace: bool,
+    ) -> None:
+        """用已经打开、且禁止跟随重解析点的句柄改名，不按路径再次 os.rename。"""
+        if os.name == "nt":
+            _rename_windows_descriptor(descriptor, target.absolute_path, replace=replace)
+            return
+        _rename_posix_nofollow(descriptor, source, target, replace=replace)
+
     def rename_media_authorized(
         self,
         video: VideoItem,
@@ -845,7 +958,7 @@ class MediaLibraryService:
         *,
         approved_root_grants: Iterable[ApprovedRootGrant],
     ) -> tuple[str, str]:
-        """Rename the path-linearized source and validate its authoritative target.
+        """Rename the checked file by its no-follow handle and samestat the result.
 
         Ordinary success keeps the legacy two-path tuple.  Any error that may
         follow an OS commit raises :class:`MediaRenameOutcomeError` with a
@@ -865,7 +978,7 @@ class MediaLibraryService:
                     source = stack.enter_context(roots.bind_child(old_path))
                     target = stack.enter_context(roots.bind_child(new_path))
                     source_stat = source.stat()
-                    if not stat.S_ISREG(source_stat.st_mode):
+                    if not stat.S_ISREG(source_stat.st_mode) or is_link_or_reparse(source_stat):
                         raise FileOperationError(
                             "重命名源必须是普通媒体文件，不能是目录或符号链接"
                         )
@@ -885,9 +998,20 @@ class MediaLibraryService:
                         )
                         if not case_only_alias:
                             raise FileOperationError(f"文件名 '{safe_name}' 已存在")
+                    descriptor = _open_nofollow_rename_descriptor(source)
+                    rename_error: BaseException | None = None
+                    try:
+                        opened = os.fstat(descriptor)
+                        if not _checked_regular_identity(opened, source_stat):
+                            raise FileOperationError("重命名源文件在检查后发生变化")
                         roots.assert_bound()
                         try:
-                            os.rename(source.absolute_path, target.absolute_path)
+                            self._rename_checked_nofollow_handle(
+                                descriptor,
+                                source,
+                                target,
+                                replace=target_stat is not None,
+                            )
                         except FileExistsError as exc:
                             raise FileOperationError(
                                 f"文件名 '{safe_name}' 已存在"
@@ -900,28 +1024,24 @@ class MediaLibraryService:
                                 "授权媒体重命名结果不确定，需要状态对账",
                                 cause=exc,
                             )
-                    else:
+                        committed = True
+                        self._postcheck_authorized_rename(
+                            roots,
+                            target,
+                            old_path,
+                            new_path,
+                            source_stat=source_stat,
+                            descriptor=descriptor,
+                        )
+                    except BaseException as exc:
+                        rename_error = exc
+                        raise
+                    finally:
                         try:
-                            source.rename_no_replace(target)
-                        except FileExistsError as exc:
-                            raise FileOperationError(
-                                f"文件名 '{safe_name}' 已存在"
-                            ) from exc
-                        except BaseException as exc:
-                            self._raise_authorized_rename_outcome(
-                                old_path,
-                                new_path,
-                                MediaRenameStatus.OUTCOME_UNCERTAIN,
-                                "授权媒体重命名结果不确定，需要状态对账",
-                                cause=exc,
-                            )
-                    committed = True
-                    self._postcheck_authorized_rename(
-                        roots,
-                        target,
-                        old_path,
-                        new_path,
-                    )
+                            os.close(descriptor)
+                        except BaseException:
+                            if rename_error is None:
+                                raise
             return old_path, new_path
         except MediaRenameOutcomeError:
             raise
@@ -1002,10 +1122,14 @@ class MediaLibraryService:
         target: ApprovedChildPath,
         old_path: str,
         new_path: str,
+        *,
+        source_stat: os.stat_result,
+        descriptor: int,
     ) -> None:
         try:
             roots.assert_bound()
             target_stat = target.stat()
+            handle_stat = os.fstat(descriptor)
             roots.assert_bound()
         except BaseException as exc:
             cls._raise_authorized_rename_outcome(
@@ -1015,14 +1139,16 @@ class MediaLibraryService:
                 "媒体重命名已提交，但目标授权状态无法确认",
                 cause=exc,
             )
-        if not stat.S_ISREG(target_stat.st_mode):
+        if not _checked_regular_identity(target_stat, source_stat) or not _checked_regular_identity(
+            handle_stat, source_stat
+        ):
             receipt = cls._rename_receipt(
                 old_path,
                 new_path,
                 MediaRenameStatus.COMMITTED_TARGET_INVALID,
             )
             raise MediaRenameOutcomeError(
-                "媒体重命名已提交，但权威目标不是普通文件",
+                "媒体重命名已提交，但权威目标不是检查时的那个普通文件",
                 receipt,
             )
 

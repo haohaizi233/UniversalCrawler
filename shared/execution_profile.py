@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import dataclasses
+import os
+import stat
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Iterable, Literal
+
+_FILE_ATTRIBUTE_REPARSE_POINT = 0x400
 
 
 HostSurface = Literal["desktop_gui", "public_web", "cli", "sdk", "test"]
@@ -126,7 +130,9 @@ class ExecutionProfile:
         object.__setattr__(
             self,
             "approved_roots",
-            frozenset(Path(root).resolve() for root in self.approved_roots),
+            frozenset(
+                _lexical_ordinary_directory(root) for root in self.approved_roots
+            ),
         )
 
     def restrict(
@@ -244,7 +250,7 @@ def _restrict_profile(
     roots = (
         profile.approved_roots
         if approved_roots is None
-        else frozenset(Path(root).resolve() for root in approved_roots)
+        else frozenset(_lexical_ordinary_directory(root) for root in approved_roots)
     )
     if not all(
         any(
@@ -277,6 +283,56 @@ def _restrict_profile(
         approved_roots=roots,
         allow_external_plugins=external_plugins,
     )
+
+
+def _lexical_ordinary_directory(root: Path | str) -> Path:
+    """Accept one lexical directory path without following links or junctions.
+
+    ``Path.resolve()`` would replace a symlink or junction with its target and
+    authorize that other tree. A root that is itself a link, or a path that
+    reaches its final component through one, is rejected. Missing directories
+    stay lexical so a not-yet-created ordinary root can still be named.
+    """
+
+    absolute = Path(os.path.abspath(os.fspath(root)))
+    current = Path(absolute.anchor)
+    parts = absolute.parts[1:]
+    if not parts:
+        _require_ordinary_directory(current)
+        return absolute
+    for part in parts:
+        current = current / part
+        try:
+            info = os.lstat(current)
+        except FileNotFoundError:
+            return absolute
+        except OSError as exc:
+            raise ExecutionProfileEscalation(
+                "approved root must be an ordinary directory"
+            ) from exc
+        if _stat_is_reparse(info) or not stat.S_ISDIR(info.st_mode):
+            raise ExecutionProfileEscalation(
+                "approved root must be an ordinary directory"
+            )
+    return absolute
+
+
+def _require_ordinary_directory(path: Path) -> None:
+    try:
+        info = os.lstat(path)
+    except OSError as exc:
+        raise ExecutionProfileEscalation(
+            "approved root must be an ordinary directory"
+        ) from exc
+    if _stat_is_reparse(info) or not stat.S_ISDIR(info.st_mode):
+        raise ExecutionProfileEscalation(
+            "approved root must be an ordinary directory"
+        )
+
+
+def _stat_is_reparse(info: os.stat_result) -> bool:
+    attributes = int(getattr(info, "st_file_attributes", 0) or 0)
+    return stat.S_ISLNK(info.st_mode) or bool(attributes & _FILE_ATTRIBUTE_REPARSE_POINT)
 
 
 def _restrict_capability(

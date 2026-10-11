@@ -49,6 +49,7 @@ def fetch_latest_release(
     *,
     environment: Mapping[str, str],
     timeout_seconds: float = 10.0,
+    expected_summary: str | None = None,
 ) -> RemoteReleaseInfo:
     """Return a bounded snapshot of public protocol-compatible releases."""
 
@@ -57,13 +58,17 @@ def fetch_latest_release(
         timeout = float(timeout_seconds)
         if not math.isfinite(timeout) or timeout <= 0:
             raise ValueError("timeout must be finite and positive")
+        headers = {
+            "Accept": GITHUB_API_ACCEPT,
+            "User-Agent": GITHUB_API_USER_AGENT,
+        }
+        token = _github_token(environment)
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
         request = Request(
             f"https://api.github.com/repos/{owner}/{name}/releases"
             f"?per_page={MAX_RELEASE_RESULTS}&page=1",
-            headers={
-                "Accept": GITHUB_API_ACCEPT,
-                "User-Agent": GITHUB_API_USER_AGENT,
-            },
+            headers=headers,
             method="GET",
         )
         payload = _open_json(
@@ -92,7 +97,11 @@ def fetch_latest_release(
         tags = _public_release_tags(payload)
         if not tags:
             raise ValueError("release response has no protocol-compatible public tag")
-        return RemoteReleaseInfo.available(tags[0], release_tags=tags)
+        return RemoteReleaseInfo.available(
+            tags[0],
+            release_tags=tags,
+            blocked_tags=_blocked_draft_tags(payload, expected_summary),
+        )
     except Exception as error:
         return RemoteReleaseInfo.unavailable(redact_release_text(str(error)))
 
@@ -103,6 +112,7 @@ def fetch_release_inventory(
     environment: Mapping[str, str],
     project_root: str | Path,
     timeout_seconds: float = 10.0,
+    expected_summary: str | None = None,
 ) -> RemoteReleaseInfo:
     """Combine public Releases with local and remote immutable tag refs.
 
@@ -115,6 +125,7 @@ def fetch_release_inventory(
         repository,
         environment=environment,
         timeout_seconds=timeout_seconds,
+        expected_summary=expected_summary,
     )
     if not release_info.is_available:
         return release_info
@@ -134,6 +145,7 @@ def fetch_release_inventory(
         release_tags=release_info.release_tags,
         occupied_tags=occupied,
         resumable_tags=resumable,
+        blocked_tags=release_info.blocked_tags,
     )
 
 
@@ -301,6 +313,59 @@ def _merge_release_tag_inventory(
         tuple(sorted(occupied, key=order, reverse=True)),
         tuple(sorted(resumable, key=order, reverse=True)),
     )
+
+
+def _github_token(environment: Mapping[str, str]) -> str:
+    values = {str(key).casefold(): str(value).strip() for key, value in environment.items()}
+    return values.get("gh_token", "") or values.get("github_token", "")
+
+
+def _normalize_summary(value: str) -> str:
+    return value.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def _blocked_draft_tags(payload: object, expected_summary: str | None) -> tuple[str, ...]:
+    """Drafts that must not be reused on the next attempt.
+
+    A revision tag is reusable only when it still points at the commit and the
+    Release is a draft whose assets are missing or whose summary matches.
+    Summary conflicts and drafts that already carry unverified assets are
+    blocked so a failed retry allocates the next revision.
+    """
+
+    items: list[object]
+    if isinstance(payload, Mapping):
+        items = [payload]
+    elif isinstance(payload, list):
+        items = payload[:MAX_RELEASE_RESULTS]
+    else:
+        return ()
+
+    expected = None if expected_summary is None else _normalize_summary(expected_summary)
+    blocked: set = set()
+    for item in items:
+        if not isinstance(item, Mapping) or item.get("draft") is not True:
+            continue
+        tag = item.get("tag_name")
+        if not isinstance(tag, str):
+            continue
+        try:
+            identity = parse_release_tag(tag.strip())
+        except ValueError:
+            continue
+        assets = item.get("assets")
+        assets_missing = isinstance(assets, list) and len(assets) == 0
+        body = item.get("body") if isinstance(item.get("body"), str) else ""
+        if expected is None:
+            summary_matches = False
+            summary_conflicts = False
+        else:
+            summary_matches = _normalize_summary(body) == expected
+            summary_conflicts = not summary_matches
+        reusable = (not summary_conflicts) and (assets_missing or summary_matches)
+        if not reusable:
+            blocked.add(identity)
+    return tuple(identity.tag for identity in sorted(blocked, reverse=True))
 
 
 def _public_release_tags(payload: object) -> tuple[str, ...]:

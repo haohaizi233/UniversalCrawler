@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import re
+import stat
 import threading
 import unicodedata
 from collections.abc import Callable, Mapping
@@ -293,18 +294,25 @@ class ToolContext:
         callback(normalized, str(message or ""), details)
 
     def authorize_path(self, path: str | os.PathLike[str]) -> Path:
-        """Resolve a path and enforce the approved-root boundary."""
+        """Authorize a lexical path without following an approved root's link."""
 
         profile = self.execution_profile
         source_roots = profile.approved_roots if profile is not None else self.approved_roots
-        roots = tuple(Path(root).expanduser().resolve() for root in source_roots if str(root).strip())
+        roots: list[Path] = []
+        for root in source_roots:
+            if not str(root).strip():
+                continue
+            lexical_root = _lexical_absolute(root)
+            if _path_is_link(lexical_root):
+                raise PermissionError("approved root must not be a symlink")
+            roots.append(lexical_root)
         if not roots:
             raise PermissionError("at least one approved root is required")
         candidate = self.path_authorizer(path) if self.path_authorizer is not None else path
-        resolved = Path(candidate).expanduser().resolve()
-        if not any(_is_relative_to(resolved, root) for root in roots):
+        lexical_candidate = _lexical_absolute(candidate)
+        if not any(_path_is_authorized(lexical_candidate, root) for root in roots):
             raise PermissionError("path is outside approved roots")
-        return resolved
+        return lexical_candidate
 
 
 @dataclass(frozen=True, slots=True)
@@ -431,6 +439,73 @@ def _is_safe_provenance_suffix(value: str) -> bool:
         and value == value.strip()
         and not any(unicodedata.category(character).startswith("C") for character in value)
     )
+
+
+def _lexical_absolute(path: str | os.PathLike[str]) -> Path:
+    return Path(os.path.abspath(os.path.expanduser(os.fspath(path))))
+
+
+def _same_lexical_path(left: Path, right: Path) -> bool:
+    return os.path.normcase(os.fspath(left)) == os.path.normcase(os.fspath(right))
+
+
+def _path_is_link(path: Path) -> bool:
+    try:
+        if path.is_symlink():
+            return True
+        info = path.lstat()
+    except OSError:
+        return False
+    attributes = int(getattr(info, "st_file_attributes", 0) or 0)
+    flag = int(getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
+    return bool(attributes & flag)
+
+
+def _directory_identity(path: Path) -> tuple[int, int] | None:
+    try:
+        info = path.lstat()
+    except OSError:
+        return None
+    if not stat.S_ISDIR(info.st_mode) or _path_is_link(path):
+        return None
+    return int(info.st_dev), int(info.st_ino)
+
+
+def _lexically_within(path: Path, root: Path) -> bool:
+    if _same_lexical_path(path, root):
+        return True
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        folded_path = os.path.normcase(os.fspath(path))
+        folded_root = os.path.normcase(os.fspath(root))
+        try:
+            return os.path.commonpath((folded_path, folded_root)) == folded_root
+        except ValueError:
+            return False
+
+
+def _anchored_to_root_identity(candidate: Path, root: Path) -> bool:
+    """Stay on the lexical root's directory identity and refuse link hops."""
+
+    root_identity = _directory_identity(root)
+    current = candidate
+    while True:
+        if _path_is_link(current):
+            return False
+        if root_identity is not None and _directory_identity(current) == root_identity:
+            return True
+        if _same_lexical_path(current, root):
+            return root_identity is None or _directory_identity(current) == root_identity
+        parent = current.parent
+        if _same_lexical_path(parent, current):
+            return False
+        current = parent
+
+
+def _path_is_authorized(candidate: Path, root: Path) -> bool:
+    return _lexically_within(candidate, root) and _anchored_to_root_identity(candidate, root)
 
 
 def _is_relative_to(path: Path, root: Path) -> bool:

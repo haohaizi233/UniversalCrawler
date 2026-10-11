@@ -885,7 +885,7 @@ def test_shutdown_wakes_retry_backoff_and_serially_takes_over_persistence(
     assert json.loads(history_path.read_text(encoding="utf-8")) == []
 
 
-def test_shutdown_rewrites_recovered_nonterminal_history_without_a_new_event(
+def test_shutdown_does_not_claim_recovered_nonterminal_history(
     tmp_path: Path,
 ) -> None:
     history_path = tmp_path / "recovered-history.json"
@@ -915,9 +915,11 @@ def test_shutdown_rewrites_recovered_nonterminal_history_without_a_new_event(
     )
 
     assert service.history(execution_profile=owner)[0]["status"] == "failed"
+    assert "recovered-run" not in service._owned_run_ids
     assert service.shutdown(wait=True, timeout=2.0)
     persisted = json.loads(history_path.read_text(encoding="utf-8"))
-    assert persisted[0]["status"] == "failed"
+    assert persisted[0]["status"] == "running"
+    assert persisted[0]["owner_id"] == "owner:recovered"
     assert service._persisted_generation == service._persist_generation
 
 

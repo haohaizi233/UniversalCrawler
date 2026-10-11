@@ -767,6 +767,142 @@ def test_same_origin_redirect_keeps_operation_cookie_jar() -> None:
     assert factory.sessions[0].calls[1]["headers"]["Cookie"] == "sid=kept"
 
 
+def test_same_origin_307_keeps_body_and_credentials_when_addresses_match() -> None:
+    factory = _RecordingSessionFactory(
+        [
+            _FakeResponse(307, "https://one.example:443/a", {"Location": "/b"}),
+            _FakeResponse(200, "https://one.example:443/b", {}, b"ok"),
+        ]
+    )
+
+    PinnedTransport(policy=_CapturingPolicy(), session_factory=factory).request(
+        "POST",
+        "https://one.example/a",
+        headers={
+            "Authorization": "Bearer secret",
+            "Cookie": "session=secret",
+            "Content-Type": "text/plain",
+        },
+        body=b"payload",
+    )
+
+    assert len(factory.sessions) == 1
+    followed = factory.sessions[0].calls[1]
+    assert followed["method"] == "POST"
+    assert followed["data"] == b"payload"
+    assert followed["headers"]["Authorization"] == "Bearer secret"
+    assert followed["headers"]["Cookie"] == "session=secret"
+    assert followed["headers"]["Content-Type"] == "text/plain"
+
+
+@pytest.mark.parametrize("status_code", [307, 308])
+def test_cross_origin_redirect_drops_body_even_when_method_is_preserved(
+    status_code: int,
+) -> None:
+    factory = _RecordingSessionFactory(
+        [
+            _FakeResponse(
+                status_code,
+                "https://one.example:443/a",
+                {"Location": "https://two.example/b"},
+            ),
+            _FakeResponse(200, "https://two.example:443/b", {}, b"ok"),
+        ]
+    )
+
+    PinnedTransport(policy=_CapturingPolicy(), session_factory=factory).request(
+        "POST",
+        "https://one.example/a",
+        headers={
+            "Authorization": "Bearer secret",
+            "Cookie": "session=secret",
+            "Proxy-Authorization": "Basic secret",
+            "Content-Type": "text/plain",
+            "X-Public": "kept",
+        },
+        body=b"payload",
+    )
+
+    assert len(factory.sessions) == 2
+    followed = factory.sessions[1].calls[0]
+    assert followed["method"] == "POST"
+    assert followed["data"] is None
+    assert followed["headers"] == {"X-Public": "kept"}
+
+
+def test_same_origin_redirect_to_a_different_address_drops_credentials_and_body() -> None:
+    class RebindingPolicy:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def resolve_public_addresses(self, _url: str) -> tuple[str, ...]:
+            self.calls += 1
+            if self.calls == 1:
+                return ("1.1.1.1",)
+            return ("8.8.8.8",)
+
+    factory = _RecordingSessionFactory(
+        [
+            _FakeResponse(307, "https://one.example:443/a", {"Location": "/b"}),
+            _FakeResponse(200, "https://one.example:443/b", {}, b"ok"),
+        ]
+    )
+
+    PinnedTransport(policy=RebindingPolicy(), session_factory=factory).request(
+        "POST",
+        "https://one.example/a",
+        headers={
+            "Authorization": "Bearer secret",
+            "Cookie": "session=secret",
+            "Content-Type": "text/plain",
+            "X-Public": "kept",
+        },
+        body=b"payload",
+    )
+
+    assert len(factory.sessions) == 2
+    followed = factory.sessions[1].calls[0]
+    assert followed["method"] == "POST"
+    assert followed["data"] is None
+    assert "Authorization" not in followed["headers"]
+    assert "Cookie" not in followed["headers"]
+    assert "Content-Type" not in followed["headers"]
+    assert followed["headers"]["X-Public"] == "kept"
+    assert "8.8.8.8" in followed["curl_options"][CurlOpt.RESOLVE][0]
+
+
+def test_streaming_cross_origin_308_drops_body_and_credentials() -> None:
+    factory = _RecordingSessionFactory(
+        [
+            _FakeResponse(
+                308,
+                "https://one.example:443/a",
+                {"Location": "https://two.example/b"},
+            ),
+            _FakeResponse(200, "https://two.example:443/b", {}, b"ok"),
+        ]
+    )
+
+    PinnedTransport(policy=_CapturingPolicy(), session_factory=factory).request_to_sink(
+        "POST",
+        "https://one.example/a",
+        headers={
+            "Authorization": "Bearer secret",
+            "Cookie": "session=secret",
+            "Content-Type": "text/plain",
+            "X-Public": "kept",
+        },
+        body=b"payload",
+        sink=bytearray().extend,
+        accepted_statuses={200},
+    )
+
+    followed = factory.sessions[1].calls[0]
+    assert followed["method"] == "POST"
+    assert followed["data"] is None
+    assert followed["headers"] == {"X-Public": "kept"}
+
+
 def test_resolver_time_counts_against_total_deadline() -> None:
     class SlowPolicy(_CapturingPolicy):
         def resolve_public_addresses(self, url: str) -> tuple[str, ...]:

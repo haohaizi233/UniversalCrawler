@@ -204,3 +204,52 @@ def test_restrict_rejects_a_symlink_descendant_that_resolves_outside_root(
 
 def test_restrict_returns_self_for_an_identical_profile(local_profile):
     assert local_profile.restrict() is local_profile
+
+
+def test_approved_root_keeps_a_lexical_directory_without_resolving_links(tmp_path):
+    import os
+
+    root = tmp_path / "downloads"
+    root.mkdir()
+    profile = public_web_profile(owner_id="session-a", approved_roots=(root,))
+
+    assert profile.approved_roots == frozenset({root})
+    assert os.path.abspath(root) == os.fspath(next(iter(profile.approved_roots)))
+
+
+def test_approved_root_rejects_a_symlink_directory(tmp_path):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    link = tmp_path / "linked-root"
+    try:
+        link.symlink_to(outside, target_is_directory=True)
+    except (NotImplementedError, OSError) as exc:
+        pytest.skip(f"symbolic links are unavailable on this host: {exc}")
+
+    with pytest.raises(ExecutionProfileEscalation, match="ordinary directory"):
+        public_web_profile(owner_id="session-a", approved_roots=(link,))
+
+
+def test_approved_root_rejects_a_directory_junction(tmp_path):
+    import os
+    import subprocess
+
+    if os.name != "nt":
+        pytest.skip("directory junctions are a Windows path")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    link = tmp_path / "junction-root"
+    created = subprocess.run(
+        ["cmd", "/c", "mklink", "/J", os.fspath(link), os.fspath(outside)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if created.returncode != 0 or not os.path.lexists(link):
+        pytest.skip(f"directory junctions are unavailable: {created.stderr}")
+
+    try:
+        with pytest.raises(ExecutionProfileEscalation, match="ordinary directory"):
+            public_web_profile(owner_id="session-a", approved_roots=(link,))
+    finally:
+        os.rmdir(link)

@@ -2,6 +2,7 @@
 
 import errno
 import os
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -79,6 +80,116 @@ class MediaLibraryServiceTests(unittest.TestCase):
         self.assertTrue(result.truncated)
         self.assertEqual(result.original_count, 3)
 
+    def test_scan_directory_skips_symlink_media(self):
+        base = Path(self.temp_dir.name)
+        real = base / "real.mp4"
+        linked = base / "linked.mp4"
+        real.write_bytes(b"real")
+        try:
+            linked.symlink_to(real)
+        except (NotImplementedError, OSError) as exc:
+            self.fail(f"symbolic links are unavailable on this host: {exc}; enable Developer Mode or run elevated - symlink attack coverage must not be silently skipped")
+
+        result = self.service.scan_directory(os.fspath(base))
+
+        names = {Path(item.local_path).name for item in result.items}
+        self.assertEqual(names, {"real.mp4"})
+        self.assertEqual(result.video_count, 1)
+
+    def test_scan_directory_rejects_a_reparse_root(self):
+        if os.name != "nt":
+            self.skipTest("directory junctions are a Windows reparse point")
+        base = Path(self.temp_dir.name)
+        outside = base / "outside"
+        outside.mkdir()
+        (outside / "secret.mp4").write_bytes(b"secret")
+        junction = base / "library"
+        completed = subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(junction), str(outside)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if completed.returncode != 0:
+            self.fail(f"directory junctions are unavailable: {completed.stderr or completed.stdout} - junction attack coverage must not be silently skipped")
+
+        from app.exceptions import MediaScanError
+
+        with self.assertRaises(MediaScanError):
+            self.service.scan_directory(os.fspath(junction))
+        self.assertTrue((outside / "secret.mp4").exists())
+
+    def test_temp_cleanup_removes_directory_junction_without_following_target(self):
+        if os.name != "nt":
+            self.skipTest("directory junctions are a Windows reparse point")
+        base = Path(self.temp_dir.name)
+        outside = base / "outside-tree"
+        outside.mkdir()
+        kept = outside / "keep.txt"
+        kept.write_bytes(b"keep")
+        junction = base / "clip_curl_cffi_hls"
+        completed = subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(junction), str(outside)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if completed.returncode != 0:
+            self.fail(f"directory junctions are unavailable: {completed.stderr or completed.stdout} - junction attack coverage must not be silently skipped")
+
+        removed = self.service.sweep_orphan_download_temp_artifacts([os.fspath(base)])
+
+        self.assertEqual(removed, 0)
+        self.assertTrue(junction.exists())
+        self.assertTrue(kept.read_bytes() == b"keep")
+        self.assertTrue(outside.is_dir())
+
+    def test_temp_cleanup_does_not_rmtree_a_junction_inside_a_temp_directory(self):
+        if os.name != "nt":
+            self.skipTest("directory junctions are a Windows reparse point")
+        base = Path(self.temp_dir.name)
+        outside = base / "outside-tree"
+        outside.mkdir()
+        kept = outside / "keep.txt"
+        kept.write_bytes(b"keep")
+        temp_dir = base / "clip_curl_cffi_hls"
+        temp_dir.mkdir()
+        (temp_dir / "part.ts").write_bytes(b"part")
+        (temp_dir / ".ucp-owned").write_bytes(b"universal-crawler-pro\n")
+        junction = temp_dir / "linked"
+        completed = subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(junction), str(outside)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if completed.returncode != 0:
+            self.fail(f"directory junctions are unavailable: {completed.stderr or completed.stdout} - junction attack coverage must not be silently skipped")
+
+        removed = self.service.sweep_orphan_download_temp_artifacts([os.fspath(base)])
+
+        self.assertGreaterEqual(removed, 1)
+        self.assertFalse(temp_dir.exists())
+        self.assertFalse(junction.exists())
+        self.assertTrue(kept.read_bytes() == b"keep")
+        self.assertTrue(outside.is_dir())
+
+    def test_temp_cleanup_keeps_unmarked_hls_suffix_directories(self):
+        base = Path(self.temp_dir.name)
+        foreign = base / "标题_curl_cffi_hls"
+        foreign.mkdir()
+        (foreign / "secret.txt").write_text("keep", encoding="utf-8")
+        owned = base / "ucp-task"
+        owned.mkdir()
+        (owned / ".ucp-owned").write_bytes(b"universal-crawler-pro\n")
+        (owned / "segment.ts").write_bytes(b"part")
+
+        removed = self.service.sweep_orphan_download_temp_artifacts([os.fspath(base)])
+
+        self.assertGreaterEqual(removed, 1)
+        self.assertTrue((foreign / "secret.txt").read_text(encoding="utf-8") == "keep")
+        self.assertFalse(owned.exists())
+
     def test_rename_media_rejects_conflicting_name(self):
         """验证 `test_rename_media_rejects_conflicting_name` 对应场景是否符合预期，供 `MediaLibraryServiceTests` 使用。"""
         base = self.temp_dir.name
@@ -155,7 +266,7 @@ class MediaLibraryServiceTests(unittest.TestCase):
         try:
             os.link(source_path, target_path)
         except (NotImplementedError, OSError) as exc:
-            self.skipTest(f"hard links are unavailable on this host: {exc}")
+            self.fail(f"hard links are unavailable on this host: {exc} - hard link attack coverage must not be silently skipped")
         item = VideoItem(url="", title="source", source="local")
         item.local_path = os.fspath(source_path)
 
@@ -175,7 +286,7 @@ class MediaLibraryServiceTests(unittest.TestCase):
         try:
             target_path.symlink_to(missing_path)
         except (NotImplementedError, OSError) as exc:
-            self.skipTest(f"symbolic links are unavailable on this host: {exc}")
+            self.fail(f"symbolic links are unavailable on this host: {exc}; enable Developer Mode or run elevated - symlink attack coverage must not be silently skipped")
         item = VideoItem(url="", title="source", source="local")
         item.local_path = os.fspath(source_path)
 
@@ -195,7 +306,7 @@ class MediaLibraryServiceTests(unittest.TestCase):
         try:
             target_path.symlink_to(source_path)
         except (NotImplementedError, OSError) as exc:
-            self.skipTest(f"symbolic links are unavailable on this host: {exc}")
+            self.fail(f"symbolic links are unavailable on this host: {exc}; enable Developer Mode or run elevated - symlink attack coverage must not be silently skipped")
         item = VideoItem(url="", title="source", source="local")
         item.local_path = os.fspath(source_path)
 
@@ -921,7 +1032,7 @@ class MediaLibraryServiceTests(unittest.TestCase):
         try:
             source_path.symlink_to(real_source)
         except (NotImplementedError, OSError) as exc:
-            self.skipTest(f"symbolic links are unavailable on this host: {exc}")
+            self.fail(f"symbolic links are unavailable on this host: {exc}; enable Developer Mode or run elevated - symlink attack coverage must not be silently skipped")
         item = VideoItem(url="", title="source", source="local")
         item.local_path = os.fspath(source_path)
 
@@ -1157,7 +1268,7 @@ class MediaLibraryServiceTests(unittest.TestCase):
         try:
             link.symlink_to(target, target_is_directory=True)
         except (OSError, NotImplementedError):
-            self.skipTest("directory symlinks are unavailable on this host")
+            self.fail("directory symlinks are unavailable on this host; enable Developer Mode or run elevated - symlink attack coverage must not be silently skipped")
 
         item = VideoItem(url="", title="episode", source="bilibili")
         item.local_path = os.fspath(link / "missing.mp4")

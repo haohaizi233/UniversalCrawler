@@ -63,6 +63,8 @@ def make_version_fixture(tmp_path: Path, *, current: str) -> Path:
         ),
     )
     _write(root / "docs/README.md", f"当前文档基线对应源码版本 `{current}`。\n")
+    _write(root / "docs/changelog.md", f"# 更新日志\n\n当前版本号为 **v{current}**。\n")
+    _write(root / "llms.txt", f"> workstation (`ucrawl` / v{current}): notes\n")
     _write(root / "cli/skill/SKILL.md", f"---\nversion: {current}\n---\n")
     return root
 
@@ -75,6 +77,8 @@ def snapshot_allowlisted_files(root: Path) -> dict[Path, str]:
             root / "README.md",
             root / "README_EN.md",
             root / "docs/README.md",
+            root / "docs/changelog.md",
+            root / "llms.txt",
             root / "cli/skill/SKILL.md",
         )
     }
@@ -111,6 +115,8 @@ def test_version_projection_allowlist_matches_documented_files():
         Path("README.md"),
         Path("README_EN.md"),
         Path("docs/README.md"),
+        Path("docs/changelog.md"),
+        Path("llms.txt"),
         Path("cli/skill/SKILL.md"),
     }
 
@@ -238,6 +244,8 @@ def test_version_update_changes_only_the_allowlisted_current_version_projections
         root / "README.md",
         root / "README_EN.md",
         root / "docs/README.md",
+        root / "docs/changelog.md",
+        root / "llms.txt",
         root / "cli/skill/SKILL.md",
     }
 

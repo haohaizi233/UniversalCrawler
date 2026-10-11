@@ -22,8 +22,14 @@ def verified_installer_lease(
     approved_root: Path,
     error_factory: Callable[[str], BaseException],
     cleanup_error_callback: Callable[[BaseException], object] | None = None,
+    bind_descriptor: Callable[[int], None] | None = None,
 ) -> Iterator[Path]:
-    """Deny writes/deletes until verification and CreateProcess both finish."""
+    """Deny writes and deletes while this lease handle remains open.
+
+    ``launch_verified_installer`` inherits the handle into the installer
+    process. That inherited handle keeps the sharing mode until the
+    installer exits, even after this context closes the parent descriptor.
+    """
 
     with verified_file_lease(
         path,
@@ -31,6 +37,7 @@ def verified_installer_lease(
         error_factory=error_factory,
         cleanup_error_callback=cleanup_error_callback,
         target_label="installer",
+        bind_descriptor=bind_descriptor,
     ) as candidate:
         yield candidate
 
@@ -43,8 +50,9 @@ def verified_file_lease(
     error_factory: Callable[[str], BaseException],
     cleanup_error_callback: Callable[[BaseException], object] | None = None,
     target_label: str = "executable",
+    bind_descriptor: Callable[[int], None] | None = None,
 ) -> Iterator[Path]:
-    """Bind one verified Windows file and its approved directory until launch."""
+    """Bind one verified Windows file and its approved directory."""
 
     root = Path(os.path.abspath(os.fspath(approved_root)))
     candidate = Path(os.path.abspath(os.fspath(path)))
@@ -78,6 +86,7 @@ def verified_file_lease(
                 error_factory=error_factory,
                 cleanup_error_callback=cleanup_error_callback,
                 target_label=target_label,
+                bind_descriptor=bind_descriptor,
             )
             body_succeeded = True
     except BaseException as exc:
@@ -93,9 +102,12 @@ def _yield_leased_file(
     error_factory: Callable[[str], BaseException],
     cleanup_error_callback: Callable[[BaseException], object] | None,
     target_label: str,
+    bind_descriptor: Callable[[int], None] | None,
 ) -> Iterator[Path]:
     primary_error: BaseException | None = None
     try:
+        if bind_descriptor is not None:
+            bind_descriptor(descriptor)
         yield candidate
     except BaseException as exc:
         primary_error = exc
@@ -187,9 +199,6 @@ def _open_windows_read_lease(
         os.set_inheritable(descriptor, False)
         opened = os.fstat(descriptor)
         after = os.lstat(path)
-        # On Windows a FILE_SHARE_READ-only lease also prevents rename/delete of
-        # the leased file and its directory ancestry.  Keeping this handle open
-        # therefore binds the verified argv path until CreateProcess returns.
         opened_identity = (opened.st_dev, opened.st_ino)
         if (
             not stat.S_ISREG(opened.st_mode)
@@ -205,6 +214,10 @@ def _open_windows_read_lease(
             raise error_factory(
                 f"{target_label} changed while its verification lease was acquired"
             )
+        # FILE_SHARE_READ denies delete for every outstanding handle. A parent
+        # that only waits inside this process is protected until it closes the
+        # descriptor. A detached installer must inherit the handle so the
+        # sharing mode survives after the parent descriptor is closed.
         return descriptor
     except BaseException as exc:
         if descriptor >= 0:

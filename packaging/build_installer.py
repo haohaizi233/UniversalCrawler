@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import locale
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -81,6 +82,13 @@ APP_ICON = PROJECT_ROOT / APP_ICON_NAME
 WEBUI_ICON = PROJECT_ROOT / WEBUI_ICON_NAME
 INNO_RESOURCE_RETRY_DELAYS_SECONDS = (1.0, 3.0)
 INSTALLER_PROMOTION_RETRY_DELAYS_SECONDS = (0.25, 0.75, 1.5)
+_DISPLAY_VERSION_RE = re.compile(
+    r"^(?P<version>(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*))"
+    r"(?: \(r(?P<revision>[1-9]\d*)\))?$"
+)
+_FILE_VERSION_RE = re.compile(
+    r"^(?P<version>(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*))\.0$"
+)
 # 安装器直接消费便携版目录；若旧 dist 缺少 GUI/WebUI 共用资源，应在编译前失败。
 REQUIRED_INSTALL_SOURCE_ENTRIES = (
     lambda: DIST_DIR / LAUNCHER_EXE_NAME,
@@ -297,6 +305,39 @@ def _validate_project_root(project_root: str | Path) -> Path:
     return root
 
 
+def installer_version_fields(identity: ReleaseIdentity) -> tuple[str, str]:
+    """Derive display and Windows file versions without hiding the revision in SemVer.
+
+    The display string keeps the product version and, for a later revision, a
+    parenthetical ``(rN)`` that is not a SemVer prerelease. The file version's
+    fourth component stays 0 so ``3.6.22.3`` is never used as a stand-in for
+    revision 3. Together the two strings round-trip to version, revision, and tag.
+    """
+
+    release_identity = ReleaseIdentity(identity.version, identity.revision)
+    display_version = release_identity.version
+    if release_identity.revision:
+        display_version = f"{release_identity.version} (r{release_identity.revision})"
+    file_version = f"{release_identity.version}.0"
+    return display_version, file_version
+
+
+def release_identity_from_installer_versions(
+    display_version: str,
+    file_version: str,
+) -> ReleaseIdentity:
+    """Recover the manifest version, release revision, and tag from installer versions."""
+
+    display_match = _DISPLAY_VERSION_RE.fullmatch(str(display_version or "").strip())
+    file_match = _FILE_VERSION_RE.fullmatch(str(file_version or "").strip())
+    if display_match is None or file_match is None:
+        raise ValueError("installer version is not reversible to a release identity")
+    if display_match.group("version") != file_match.group("version"):
+        raise ValueError("installer display and file versions identify different products")
+    revision_text = display_match.group("revision")
+    return ReleaseIdentity(display_match.group("version"), int(revision_text or 0))
+
+
 def _build_iscc_command(
     iscc: str,
     *,
@@ -304,10 +345,7 @@ def _build_iscc_command(
     identity: ReleaseIdentity | None = None,
 ) -> list[str]:
     release_identity = identity or _release_identity_from_environment()
-    display_version = release_identity.version
-    if release_identity.revision:
-        display_version += f"-r{release_identity.revision}"
-    numeric_version = f"{release_identity.version}.{release_identity.revision}"
+    display_version, numeric_version = installer_version_fields(release_identity)
     return [
         iscc,
         f"/DAppName={APP_DISPLAY_NAME}",

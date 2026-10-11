@@ -286,17 +286,41 @@ def _roots(context: ToolContext) -> tuple[Path, ...]:
     return tuple(roots)
 
 
+def _has_approved_roots(context: ToolContext) -> bool:
+    profile = getattr(context, "execution_profile", None)
+    if profile is not None:
+        source = getattr(profile, "approved_roots", ()) or ()
+    else:
+        source = getattr(context, "approved_roots", ()) or ()
+    if isinstance(source, (str, os.PathLike)):
+        return bool(str(source).strip())
+    try:
+        return any(str(root).strip() for root in source)
+    except TypeError:
+        return False
+
+
+def _default_ledger_candidate() -> Path:
+    override = os.environ.get(runtime_paths.USER_DATA_ROOT_ENV, "").strip()
+    if override:
+        data_root = Path(override).expanduser()
+    elif runtime_paths.is_development_runtime():
+        data_root = runtime_paths.project_root() / "user_data"
+    else:
+        data_root = runtime_paths.local_appdata_root() / runtime_paths.APP_DIR_NAME
+    return data_root / "cache" / "download_recovery.sqlite3"
+
+
 def _ledger_path(context: ToolContext) -> Path:
     raw_path = _parameters(context).get("ledger_path")
     if raw_path is None:
-        override = os.environ.get(runtime_paths.USER_DATA_ROOT_ENV, "").strip()
-        if override:
-            data_root = Path(override).expanduser()
-        elif runtime_paths.is_development_runtime():
-            data_root = runtime_paths.project_root() / "user_data"
-        else:
-            data_root = runtime_paths.local_appdata_root() / runtime_paths.APP_DIR_NAME
-        return (data_root / "cache" / "download_recovery.sqlite3").resolve(strict=False)
+        if not _has_approved_roots(context):
+            raise PermissionError("at least one approved root is required")
+        candidate = _default_ledger_candidate()
+        authorizer = getattr(context, "authorize_path", None)
+        if not callable(authorizer):
+            raise PermissionError("ledger path is not authorized")
+        return Path(authorizer(candidate))
     return _resolve_path(raw_path, base=_workspace_root(context))
 
 
@@ -584,11 +608,24 @@ def _table_exists(conn: sqlite3.Connection, name: str) -> bool:
 
 
 def _read_ledger(context: ToolContext) -> _LedgerSnapshot:
+    if not _has_approved_roots(context):
+        return _LedgerSnapshot(Path("download_recovery.sqlite3"), False)
+    explicit_ledger = _parameters(context).get("ledger_path")
     try:
         path = _ledger_path(context)
+    except PermissionError:
+        if explicit_ledger is None:
+            try:
+                candidate = _default_ledger_candidate()
+            except (OSError, RuntimeError, TypeError, ValueError):
+                candidate = Path("download_recovery.sqlite3")
+            return _LedgerSnapshot(candidate, False)
+        return _LedgerSnapshot(Path("download_recovery.sqlite3"), False)
     except (OSError, RuntimeError, TypeError, ValueError) as exc:
         fallback = _workspace_root(context) / "download_recovery.sqlite3"
         return _LedgerSnapshot(fallback, False, error=str(exc))
+    if explicit_ledger is None and not _is_authorized(context, path):
+        return _LedgerSnapshot(path, False)
     _raise_if_cancelled(context)
     if not path.is_file():
         return _LedgerSnapshot(path, False)
@@ -989,8 +1026,8 @@ def _ledger_is_authorized_for_cleanup(
     context: ToolContext,
     ledger: _LedgerSnapshot,
 ) -> bool:
-    if _parameters(context).get("ledger_path") is None:
-        return True
+    if not ledger.present or not _has_approved_roots(context):
+        return False
     return _is_authorized(context, ledger.path)
 
 

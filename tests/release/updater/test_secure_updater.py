@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
 import os
@@ -347,7 +348,7 @@ def test_manifest_verifier_rejects_symlinked_metadata_without_reading_external_f
     try:
         manifest_link.symlink_to(manifest_path)
     except OSError as exc:
-        pytest.skip(f"symlink creation unavailable: {exc}")
+        pytest.fail(f"symlink creation unavailable: {exc}; enable Developer Mode or run elevated - symlink attack coverage must not be silently skipped")
 
     with pytest.raises(ManifestError, match="unsafe"):
         UpdateManifestVerifier(public_key_pem=public_pem).load_verified(
@@ -1284,7 +1285,7 @@ def test_download_lock_rejects_symlinked_lock_root_without_touching_external_dir
     try:
         (cache_dir / ".updater-locks").symlink_to(external, target_is_directory=True)
     except OSError as exc:
-        pytest.skip(f"directory symlink creation unavailable: {exc}")
+        pytest.fail(f"directory symlink creation unavailable: {exc}; enable Developer Mode or run elevated - symlink attack coverage must not be silently skipped")
 
     with pytest.raises(OSError, match="lock root"):
         with target_download_lock(
@@ -1365,7 +1366,7 @@ def test_file_lock_does_not_create_directories_through_symlinked_parent(tmp_path
     try:
         alias.symlink_to(external, target_is_directory=True)
     except OSError as exc:
-        pytest.skip(f"directory symlink creation unavailable: {exc}")
+        pytest.fail(f"directory symlink creation unavailable: {exc}; enable Developer Mode or run elevated - symlink attack coverage must not be silently skipped")
     lock_root = alias / "created-outside"
 
     with pytest.raises(OSError):
@@ -1388,7 +1389,7 @@ def test_downloader_rejects_preexisting_target_symlink_without_touching_external
     try:
         target.symlink_to(external)
     except OSError as exc:
-        pytest.skip(f"symlink creation unavailable: {exc}")
+        pytest.fail(f"symlink creation unavailable: {exc}; enable Developer Mode or run elevated - symlink attack coverage must not be silently skipped")
     asset = UpdateAsset(
         name=target.name,
         url="https://github.com/owner/repo/releases/download/v/installer.exe",
@@ -1417,7 +1418,7 @@ def test_downloader_does_not_create_staging_through_symlinked_ancestor(tmp_path)
     try:
         alias.symlink_to(external, target_is_directory=True)
     except OSError as exc:
-        pytest.skip(f"directory symlink creation unavailable: {exc}")
+        pytest.fail(f"directory symlink creation unavailable: {exc}; enable Developer Mode or run elevated - symlink attack coverage must not be silently skipped")
     asset = UpdateAsset(
         name="installer.exe",
         url="https://github.com/owner/repo/releases/download/v/installer.exe",
@@ -1447,7 +1448,7 @@ def test_downloader_rejects_preexisting_partial_symlink_without_touching_externa
     try:
         partial.symlink_to(external)
     except OSError as exc:
-        pytest.skip(f"symlink creation unavailable: {exc}")
+        pytest.fail(f"symlink creation unavailable: {exc}; enable Developer Mode or run elevated - symlink attack coverage must not be silently skipped")
     asset = UpdateAsset(
         name="installer.exe",
         url="https://github.com/owner/repo/releases/download/v/installer.exe",
@@ -2529,7 +2530,7 @@ def test_github_client_ignores_linked_and_oversized_cache(tmp_path):
     try:
         cache.symlink_to(outside)
     except (NotImplementedError, OSError):
-        pytest.skip("symlinks are unavailable")
+        pytest.fail("symlinks are unavailable; enable Developer Mode or run elevated - symlink attack coverage must not be silently skipped")
 
     client = GitHubReleaseClient(owner="owner", repo="repo", cache_path=cache)
     assert client._load_cache() == {}
@@ -3123,6 +3124,92 @@ def test_installer_runner_detaches_inno_self_update_with_post_install_handoff(tm
     assert calls[0]["kwargs"]["env"]["UCRAWL_RESTART_HANDOFF_TOKEN"] == (
         "one-time-restart-token"
     )
+    assert calls[0]["kwargs"]["startupinfo"].lpAttributeList["handle_list"]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="installer lease inheritance requires Windows")
+def test_detached_installer_keeps_delete_lock_until_process_exits(tmp_path):
+    installer = tmp_path / "installer.exe"
+    installer.write_bytes(b"installer")
+    asset = _windows_asset_for_file(installer)
+    install_dir = tmp_path / "installed"
+    install_dir.mkdir()
+
+    def popen(argv, **kwargs):
+        del argv
+        return subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            shell=False,
+            close_fds=True,
+            startupinfo=kwargs["startupinfo"],
+            creationflags=kwargs.get("creationflags", 0),
+        )
+
+    runner = InstallerRunner(
+        package_verifier=PackageVerifier(
+            os_name="windows",
+            trusted_publishers=["CN=Test"],
+            verify_func=lambda _p, _a: None,
+        ),
+        popen_func=popen,
+    )
+    process = runner.launch_verified_installer(
+        installer,
+        asset,
+        version="3.7.0",
+        log_path=tmp_path / "install.log",
+        install_dir=install_dir,
+        restart_handoff_path=None,
+        approved_root=tmp_path,
+    )
+    try:
+        with pytest.raises(OSError):
+            installer.unlink()
+    finally:
+        process.kill()
+        process.wait(timeout=10)
+
+    installer.unlink()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="verified installer leases require Windows")
+def test_run_verified_installer_holds_delete_lock_until_process_returns(tmp_path):
+    installer = tmp_path / "installer.msi"
+    installer.write_bytes(b"installer")
+    digest = hashlib.sha256(installer.read_bytes()).hexdigest()
+    asset = UpdateAsset(
+        name="installer.msi",
+        url="https://github.com/owner/repo/releases/download/v/installer.msi",
+        sha256=digest,
+        size=installer.stat().st_size,
+        installer_type="msi",
+        os="windows",
+        arch="x64",
+    )
+
+    def fake_run(argv, **kwargs):
+        del kwargs
+        with pytest.raises(OSError):
+            installer.unlink()
+        return subprocess.CompletedProcess(argv, 0)
+
+    runner = InstallerRunner(
+        package_verifier=PackageVerifier(
+            os_name="windows",
+            trusted_publishers=["CN=Test"],
+            verify_func=lambda _p, _a: None,
+        ),
+        run_func=fake_run,
+    )
+    runner.run_verified_installer(
+        installer,
+        asset,
+        version="3.7.0",
+        log_path=tmp_path / "install.log",
+        approved_root=tmp_path,
+    )
+
+    installer.unlink()
 
 
 def _windows_asset_for_file(path: Path) -> UpdateAsset:
@@ -3271,6 +3358,35 @@ def test_windows_verifier_rejects_publisher_mismatch_when_thumbprint_matches(tmp
 
     with pytest.raises(VerificationError, match="publisher"):
         verifier.verify(installer, asset)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Authenticode verification requires Windows")
+def test_windows_verifier_passes_package_path_as_independent_literalpath(tmp_path):
+    installer = tmp_path / "a b; $(calc).exe"
+    installer.write_bytes(b"unsigned")
+    asset = _windows_asset_for_file(installer)
+    captured: dict[str, object] = {}
+
+    def fake_run(argv, **kwargs):
+        script_path = Path(argv[argv.index("-File") + 1])
+        captured["argv"] = list(argv)
+        captured["script"] = script_path.read_text(encoding="utf-8-sig")
+        return subprocess.run(argv, **kwargs)
+
+    with pytest.raises(VerificationError, match="not valid"):
+        PackageVerifier(
+            os_name="windows",
+            trusted_thumbprints=["FFFF"],
+            run_func=fake_run,
+        ).verify(installer, asset)
+
+    argv = captured["argv"]
+    script = str(captured["script"])
+    assert isinstance(argv, list)
+    assert "-Command" not in argv
+    assert argv[argv.index("-LiteralPath") + 1] == str(installer)
+    assert "Get-AuthenticodeSignature -LiteralPath $LiteralPath" in script
+    assert str(installer) not in script
 
 
 def test_windows_verifier_accepts_normalized_sha1_thumbprint(tmp_path):
@@ -3698,7 +3814,7 @@ def test_atomic_write_does_not_create_parent_through_symlinked_ancestor(tmp_path
     try:
         alias.symlink_to(external, target_is_directory=True)
     except OSError as exc:
-        pytest.skip(f"directory symlink creation unavailable: {exc}")
+        pytest.fail(f"directory symlink creation unavailable: {exc}; enable Developer Mode or run elevated - symlink attack coverage must not be silently skipped")
 
     with pytest.raises(OSError, match="ancestry"):
         _atomic_write_text(alias / "metadata" / "state.json", "{}")
@@ -3719,7 +3835,7 @@ def _approved_root_swap_fixture(
         probe.symlink_to(outside, target_is_directory=True)
         probe.unlink()
     except OSError as exc:
-        pytest.skip(f"directory symlink creation unavailable: {exc}")
+        pytest.fail(f"directory symlink creation unavailable: {exc}; enable Developer Mode or run elevated - symlink attack coverage must not be silently skipped")
 
     swapped = False
 
@@ -4246,7 +4362,7 @@ def test_bounded_read_rejects_ancestor_replaced_after_chain_validation(
         probe.symlink_to(outside_ancestor, target_is_directory=True)
         probe.unlink()
     except OSError as exc:
-        pytest.skip(f"directory symlink creation unavailable: {exc}")
+        pytest.fail(f"directory symlink creation unavailable: {exc}; enable Developer Mode or run elevated - symlink attack coverage must not be silently skipped")
     real_validate = directory_capability_module._require_regular_directory_ancestry
     approved_text = os.path.normcase(os.path.abspath(os.fspath(approved)))
     swapped = False
@@ -4387,13 +4503,102 @@ def test_update_trust_config_explicitly_disables_os_signature_for_personal_relea
     assert UPDATE_REQUIRE_OS_SIGNATURE is False
 
 
-def test_update_entrypoints_pass_shared_os_signature_policy():
-    gui_source = Path("app/ui/main_window.py").read_text(encoding="utf-8")
-    helper_source = Path("entry/updater_helper.py").read_text(encoding="utf-8")
+def _call_name(node: ast.AST | None) -> str | None:
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        return node.attr
+    return None
 
-    for source in (gui_source, helper_source):
-        assert "UPDATE_REQUIRE_OS_SIGNATURE" in source
-        assert "require_os_signature=UPDATE_REQUIRE_OS_SIGNATURE" in source
+
+def _policy_name(expr: ast.AST | None) -> str:
+    if isinstance(expr, ast.Name) and expr.id == "UPDATE_REQUIRE_OS_SIGNATURE":
+        return expr.id
+    raise AssertionError("PackageVerifier policy is not UPDATE_REQUIRE_OS_SIGNATURE")
+
+
+def _policy_names_passed_toward_package_verifier(source: str) -> list[str]:
+    """解析真实调用。注释和字符串里的同名关键字不会被当成传参。"""
+    names: list[str] = []
+    for node in ast.walk(ast.parse(source)):
+        if not isinstance(node, ast.Call):
+            continue
+        keywords = {item.arg: item.value for item in node.keywords if item.arg}
+        func_name = _call_name(node.func)
+        if func_name == "PackageVerifier":
+            names.append(_policy_name(keywords.get("require_os_signature")))
+        elif func_name == "prepare_verified_update":
+            if _call_name(keywords.get("package_verifier_cls")) != "PackageVerifier":
+                raise AssertionError("update entry does not pass PackageVerifier")
+            names.append(_policy_name(keywords.get("require_os_signature")))
+    return names
+
+
+def _assert_prepare_verified_update_forwards_policy(source: str) -> None:
+    tree = ast.parse(source)
+    function = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "prepare_verified_update"
+    )
+    forwarded = False
+    for node in ast.walk(function):
+        if not isinstance(node, ast.Call) or _call_name(node.func) != "package_verifier_cls":
+            continue
+        keywords = {item.arg: item.value for item in node.keywords if item.arg}
+        expr = keywords.get("require_os_signature")
+        if not isinstance(expr, ast.Name) or expr.id != "require_os_signature":
+            raise AssertionError("prepare_verified_update does not forward the policy parameter")
+        forwarded = True
+    if not forwarded:
+        raise AssertionError("prepare_verified_update never constructs its package verifier")
+
+
+def test_update_entrypoints_pass_shared_os_signature_policy():
+    from app.config.update_trust import UPDATE_REQUIRE_OS_SIGNATURE
+    import app.services.update_check_service as update_check_service
+    import entry.updater_helper as updater_helper
+
+    comment_only = "\n".join(
+        (
+            "def build():",
+            "    # require_os_signature=UPDATE_REQUIRE_OS_SIGNATURE",
+            "    return None",
+        )
+    )
+    commented_wrong_call = "\n".join(
+        (
+            "def build():",
+            "    # require_os_signature=UPDATE_REQUIRE_OS_SIGNATURE",
+            "    return PackageVerifier(require_os_signature=True)",
+        )
+    )
+    assert _policy_names_passed_toward_package_verifier(comment_only) == []
+    with pytest.raises(AssertionError):
+        _policy_names_passed_toward_package_verifier(commented_wrong_call)
+
+    desktop = Path("app/ui/main_window.py").read_text(encoding="utf-8")
+    helper = Path("entry/updater_helper.py").read_text(encoding="utf-8")
+    service = Path("app/services/update_check_service.py").read_text(encoding="utf-8")
+
+    assert _policy_names_passed_toward_package_verifier(desktop) == [
+        "UPDATE_REQUIRE_OS_SIGNATURE"
+    ]
+    assert _policy_names_passed_toward_package_verifier(helper) == [
+        "UPDATE_REQUIRE_OS_SIGNATURE"
+    ]
+    _assert_prepare_verified_update_forwards_policy(service)
+    assert (
+        updater_helper.UPDATE_REQUIRE_OS_SIGNATURE
+        is update_check_service.UPDATE_REQUIRE_OS_SIGNATURE
+        is UPDATE_REQUIRE_OS_SIGNATURE
+    )
+
+    delivered = PackageVerifier(
+        require_os_signature=UPDATE_REQUIRE_OS_SIGNATURE,
+        verify_func=lambda _path, _asset: None,
+    )
+    assert delivered.require_os_signature is UPDATE_REQUIRE_OS_SIGNATURE
 
 
 def test_updater_helper_loads_asset_from_signed_manifest(tmp_path, monkeypatch):

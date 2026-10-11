@@ -11,6 +11,20 @@ import pytest
 
 import shared.filesystem_directory_capability as capability_module
 
+_FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
+
+
+def _require_symlink(link, target, *, directory: bool = False):
+    kind = "directory symlink" if directory else "file symlink"
+    try:
+        link.symlink_to(target, target_is_directory=directory)
+    except OSError as exc:
+        pytest.fail(
+            f"{kind} creation failed; this test needs permission to create symbolic links "
+            "(Windows: enable Developer Mode or grant SeCreateSymbolicLinkPrivilege): "
+            f"{exc}"
+        )
+
 
 def test_snapshot_children_returns_bounded_primitive_metadata_and_skips_links(
     tmp_path,
@@ -24,10 +38,7 @@ def test_snapshot_children_returns_bounded_primitive_metadata_and_skips_links(
     outside = tmp_path / "outside.bin"
     outside.write_bytes(b"outside")
     link = approved / "outside-link"
-    try:
-        link.symlink_to(outside)
-    except OSError as exc:
-        pytest.skip(f"file symlink creation unavailable: {exc}")
+    _require_symlink(link, outside)
 
     with capability_module.filesystem_directory_capability(approved) as capability:
         snapshot = capability.snapshot_children(max_entries=8)
@@ -301,10 +312,7 @@ def test_open_capability_rejects_directory_reparse_points(
     else:
         candidate = tmp_path / "approved-link"
         target = candidate
-    try:
-        candidate.symlink_to(outside, target_is_directory=True)
-    except OSError as exc:
-        pytest.skip(f"directory symlink creation unavailable: {exc}")
+    _require_symlink(candidate, outside, directory=True)
 
     with pytest.raises(OSError, match="regular directory"):
         capability_module.open_filesystem_directory_capability(target)
@@ -378,6 +386,33 @@ def test_posix_generation_lease_opens_nonblocking_before_type_check(
     os.close(seed)
 
     assert flags_seen and flags_seen[0] & nonblocking
+
+
+def test_posix_open_child_passes_nofollow_and_directory_fd(tmp_path, monkeypatch):
+    nofollow = getattr(os, "O_NOFOLLOW", 0) or 0x20000
+    monkeypatch.setattr(capability_module.os, "O_NOFOLLOW", nofollow, raising=False)
+    seen: dict[str, object] = {}
+
+    def fake_open(name, flags, mode=0o777, *, dir_fd=None):
+        seen["name"] = name
+        seen["flags"] = flags
+        seen["dir_fd"] = dir_fd
+        return 77
+
+    capability = capability_module.FilesystemDirectoryCapability(
+        tmp_path,
+        descriptor=91,
+        identity=(0, 0),
+    )
+    monkeypatch.setattr(capability_module.os, "open", fake_open)
+    monkeypatch.setattr(capability, "assert_bound", lambda: None)
+
+    descriptor = capability.open_child("payload.bin", os.O_RDONLY)
+
+    assert descriptor == 77
+    assert seen["name"] == "payload.bin"
+    assert int(seen["flags"]) & nofollow == nofollow
+    assert seen["dir_fd"] == 91
 
 
 @pytest.mark.skipif(
@@ -991,11 +1026,8 @@ def test_capability_rejects_ancestor_replacement_after_acquisition(tmp_path):
     outside_payload = outside_approved / "payload.bin"
     outside_payload.write_bytes(b"outside")
     probe = tmp_path / "directory-link-probe"
-    try:
-        probe.symlink_to(outside_ancestor, target_is_directory=True)
-        probe.unlink()
-    except OSError as exc:
-        pytest.skip(f"directory symlink creation unavailable: {exc}")
+    _require_symlink(probe, outside_ancestor, directory=True)
+    probe.unlink()
 
     with pytest.raises(OSError):
         with capability_module.filesystem_directory_capability(approved) as capability:
@@ -1023,11 +1055,8 @@ def test_derived_child_capability_cannot_outlive_parent_authority(tmp_path):
     outside_payload.write_bytes(b"outside")
     moved_ancestor = tmp_path / "ancestor-before-swap"
     probe = tmp_path / "directory-link-probe"
-    try:
-        probe.symlink_to(outside_ancestor, target_is_directory=True)
-        probe.unlink()
-    except OSError as exc:
-        pytest.skip(f"directory symlink creation unavailable: {exc}")
+    _require_symlink(probe, outside_ancestor, directory=True)
+    probe.unlink()
 
     parent = capability_module._open_directory_capability(approved)
     child = parent.open_directory_child(child_path.name)
@@ -1049,10 +1078,7 @@ def _final_file_symlink(tmp_path):
     outside = tmp_path / "outside.bin"
     outside.write_bytes(b"outside")
     link = approved / "payload.bin"
-    try:
-        link.symlink_to(outside)
-    except OSError as exc:
-        pytest.skip(f"file symlink creation unavailable: {exc}")
+    _require_symlink(link, outside)
     return approved, link, outside
 
 
@@ -1096,10 +1122,7 @@ def test_capability_open_rejects_file_replaced_by_symlink_after_stat(
     outside = tmp_path / "outside.bin"
     outside.write_bytes(b"outside")
     replacement = approved / "replacement-link"
-    try:
-        replacement.symlink_to(outside)
-    except OSError as exc:
-        pytest.skip(f"file symlink creation unavailable: {exc}")
+    _require_symlink(replacement, outside)
     swapped = False
 
     def swap() -> None:
@@ -1208,10 +1231,7 @@ def test_capability_stat_rejects_final_directory_reparse(tmp_path):
     outside = tmp_path / "outside-directory"
     outside.mkdir()
     link = approved / "directory-link"
-    try:
-        link.symlink_to(outside, target_is_directory=True)
-    except OSError as exc:
-        pytest.skip(f"directory symlink creation unavailable: {exc}")
+    _require_symlink(link, outside, directory=True)
 
     with capability_module.filesystem_directory_capability(approved) as capability:
         with pytest.raises(OSError, match="reparse|link"):
@@ -1240,29 +1260,38 @@ def test_capability_create_truncate_uses_verified_handle(tmp_path, preexisting):
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows CreateFileW contract")
-def test_windows_child_open_rejects_mocked_reparse_and_closes_handle(
+def test_windows_createfile_opens_reparse_point_and_closes_that_handle(
     tmp_path,
     monkeypatch,
 ):
+    issued_handle = 0x1501
+    created_flags: list[int] = []
+    returned_handles: list[int] = []
     closed: list[int] = []
-    monkeypatch.setattr(
-        capability_module,
-        "_create_windows_child_handle",
-        lambda *_args, **_kwargs: 501,
-    )
-    monkeypatch.setattr(
-        capability_module,
-        "_windows_handle_information",
-        lambda _handle: capability_module._WindowsDirectoryInformation(
-            file_index=7,
-            attributes=0x400,
-        ),
-    )
-    monkeypatch.setattr(
-        capability_module,
-        "_close_windows_handle",
-        lambda handle: closed.append(handle),
-    )
+
+    def create_file(*args):
+        created_flags.append(int(args[5]))
+        returned_handles.append(issued_handle)
+        return issued_handle
+
+    def get_information(_handle, information):
+        structure = information._obj
+        structure.dwFileAttributes = 0x400
+        structure.nFileIndexHigh = 0
+        structure.nFileIndexLow = 7
+        return 1
+
+    def close_handle(handle):
+        closed.append(int(handle))
+        return 1
+
+    class _Kernel32:
+        def __init__(self, *_args, **_kwargs):
+            self.CreateFileW = create_file
+            self.GetFileInformationByHandle = get_information
+            self.CloseHandle = close_handle
+
+    monkeypatch.setattr(capability_module.ctypes, "WinDLL", _Kernel32)
 
     with pytest.raises(OSError, match="reparse"):
         capability_module._open_windows_child_file(
@@ -1270,7 +1299,9 @@ def test_windows_child_open_rejects_mocked_reparse_and_closes_handle(
             os.O_RDONLY,
         )
 
-    assert closed == [501]
+    assert created_flags
+    assert created_flags[0] & _FILE_FLAG_OPEN_REPARSE_POINT == _FILE_FLAG_OPEN_REPARSE_POINT
+    assert closed == returned_handles == [issued_handle]
 
 
 def test_capability_rename_child_no_replace_moves_regular_file(tmp_path):

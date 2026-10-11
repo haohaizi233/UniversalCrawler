@@ -6,7 +6,7 @@ import json
 import os
 import secrets
 import stat
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -86,6 +86,34 @@ def read_history_json(
     if _contains_surrogate(value):
         raise ValueError("tool history contains malformed Unicode")
     return value
+
+
+def locked_update_json(
+    path: Path,
+    mutator: Callable[[Any | None], Any],
+    *,
+    cache_root: Path,
+    max_bytes: int = MAX_HISTORY_BYTES,
+    writer: Callable[..., None] | None = None,
+) -> None:
+    """Read, mutate, and publish one history file while holding an exclusive lock."""
+
+    root, target = _approved_target(path, cache_root=cache_root, create_root=True)
+    publish = writer or atomic_write_json
+    with filesystem_directory_capability(root) as capability:
+        descriptor = _acquire_history_lock(capability, f"{target.name}.lock")
+        try:
+            current = read_history_json(
+                path,
+                cache_root=cache_root,
+                max_bytes=max_bytes,
+            )
+            updated = mutator(current)
+            if updated is None:
+                return
+            publish(path, updated, cache_root=cache_root)
+        finally:
+            _release_history_lock(descriptor)
 
 
 def atomic_write_json(
@@ -170,6 +198,48 @@ def _require_regular_stat(value: os.stat_result) -> None:
         or value.st_nlink != 1
     ):
         raise OSError("tool history path is not a regular no-link file")
+
+
+def _acquire_history_lock(
+    capability: FilesystemDirectoryCapability,
+    lock_name: str,
+) -> int:
+    descriptor = capability.open_child(lock_name, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        if os.fstat(descriptor).st_size <= 0:
+            os.write(descriptor, b"\0")
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        if os.name == "nt":
+            import msvcrt
+
+            msvcrt.locking(descriptor, msvcrt.LK_LOCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+    except BaseException:
+        _close_descriptor(descriptor, None)
+        raise
+    return descriptor
+
+
+def _release_history_lock(descriptor: int) -> None:
+    primary_error: BaseException | None = None
+    try:
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        if os.name == "nt":
+            import msvcrt
+
+            msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+    except BaseException as exc:
+        primary_error = exc
+        raise
+    finally:
+        _close_descriptor(descriptor, primary_error)
 
 
 def _create_temp_file(
@@ -281,6 +351,7 @@ __all__ = [
     "MAX_HISTORY_BYTES",
     "atomic_write_json",
     "bounded_history_snapshot",
+    "locked_update_json",
     "persist_retry_delay",
     "read_history_json",
 ]

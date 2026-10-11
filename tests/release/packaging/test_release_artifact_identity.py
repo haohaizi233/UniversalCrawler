@@ -51,7 +51,15 @@ def test_installer_uses_display_revision_numeric_file_version_and_unique_name(
 
     command = tool._build_iscc_command("ISCC.exe", output_dir=tmp_path, identity=identity)
 
-    assert f"/DAppVersion={tool.PACKAGE_VERSION}-r3" in command
-    assert f"/DVersionInfoVersion={tool.PACKAGE_VERSION}.3" in command
+    display_version, file_version = tool.installer_version_fields(identity)
+    recovered = tool.release_identity_from_installer_versions(display_version, file_version)
+    assert display_version == f"{tool.PACKAGE_VERSION} (r3)"
+    assert file_version == f"{tool.PACKAGE_VERSION}.0"
+    assert "-r3" not in display_version
+    assert recovered.version == identity.version
+    assert recovered.revision == identity.revision == 3
+    assert recovered.tag == identity.tag == f"v{tool.PACKAGE_VERSION}-r3"
+    assert f"/DAppVersion={display_version}" in command
+    assert f"/DVersionInfoVersion={file_version}" in command
     assert f"/DOutputBaseFilename={tool.INSTALLER_BASENAME}-r3" in command
     assert tool.get_setup_exe_path(identity).name == f"{tool.INSTALLER_BASENAME}-r3.exe"

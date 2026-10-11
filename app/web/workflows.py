@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import sys
 import time
 from time import monotonic as _monotonic
 from typing import Any, Callable, Coroutine
@@ -38,6 +39,74 @@ from shared.selection_runtime import RuleSelection
 
 BroadcastFn = Callable[[str, Any], Coroutine[Any, Any, Any]]
 ExecutionProfileFactory = Callable[[], ExecutionProfile]
+
+
+def _attach_exception_note_best_effort(
+    error: BaseException,
+    note: str,
+) -> None:
+    try:
+        add_note = object.__getattribute__(error, "add_note")
+    except BaseException:
+        return
+    if not callable(add_note):
+        return
+    try:
+        add_note(note)
+    except BaseException:
+        pass
+
+
+async def _await_executor_result(worker):
+    """Keep a shielded executor job owned until its real completion."""
+
+    try:
+        return await asyncio.shield(worker)
+    except asyncio.CancelledError as primary:
+        while not worker.done():
+            try:
+                await asyncio.shield(worker)
+            except asyncio.CancelledError:
+                continue
+            except BaseException:
+                break
+        try:
+            worker.result()
+        except BaseException:
+            _attach_exception_note_best_effort(
+                primary,
+                "direct download worker also failed after cancellation",
+            )
+        raise primary
+
+
+def _close_sdk_after_download(sdk, primary: BaseException | None) -> None:
+    try:
+        sdk.close()
+    except (RuntimeError, OSError, AttributeError) as cleanup_error:
+        if primary is not None:
+            _attach_exception_note_best_effort(
+                primary,
+                "direct download SDK cleanup also failed",
+            )
+        try:
+            debug_logger.log_exception(
+                "WebWorkflowService",
+                "close_sdk",
+                cleanup_error,
+            )
+        except BaseException:
+            pass
+    except BaseException as cleanup_error:
+        if primary is None or (
+            isinstance(primary, Exception)
+            and not isinstance(cleanup_error, Exception)
+        ):
+            raise
+        _attach_exception_note_best_effort(
+            primary,
+            "direct download SDK cleanup also failed",
+        )
 
 def build_selection_strategy(selection_dict: dict | None):
     """从 Web 端 `selection` 参数构建 SelectionStrategy 实例。"""
@@ -496,7 +565,7 @@ class WebWorkflowService:
                 pending_item.progress = pct
                 self._schedule_progress_broadcast(loop, pending_item.id, pending_item, pct)
 
-            result = await loop.run_in_executor(
+            worker = loop.run_in_executor(
                 None,
                 lambda: sdk.download_video(
                     url=url,
@@ -509,6 +578,7 @@ class WebWorkflowService:
                     network_policy="public",
                 ),
             )
+            result = await _await_executor_result(worker)
         except (TypeError, ValueError) as exc:
             await self._broadcast_download_error(pending_item, str(exc))
             return {
@@ -541,10 +611,7 @@ class WebWorkflowService:
                 "elapsed": round(time.time() - start_at, 2),
             }
         finally:
-            try:
-                sdk.close()
-            except (RuntimeError, OSError, AttributeError) as exc:
-                debug_logger.log_exception("WebWorkflowService", "close_sdk", exc)
+            _close_sdk_after_download(sdk, sys.exception())
 
         if result.get("status") == "ok":
             return await self._broadcast_download_success(pending_item, result)

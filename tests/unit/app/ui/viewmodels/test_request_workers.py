@@ -134,3 +134,16 @@ def test_sequential_worker_does_not_callback_after_shutdown() -> None:
     worker._thread.join(timeout=2)
 
     assert received == []
+
+
+def test_sequential_worker_reports_exact_acceptance_after_shutdown() -> None:
+    worker = SequentialRequestWorker(
+        name="test-sequential-submit-contract",
+        on_result=lambda _result: None,
+        process=lambda request: request,
+    )
+
+    assert worker.submit("accepted") is True
+    worker.shutdown()
+
+    assert worker.submit("rejected") is False

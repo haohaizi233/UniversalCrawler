@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import subprocess
 import threading
 import time
 from pathlib import Path
@@ -1752,3 +1754,192 @@ def test_runner_shutdown_timeout_can_be_repeated_to_flush_late_terminal_state(
 
     assert _persisted_by_id(history_path)[row["run_id"]]["status"] == "cancelled"
     assert _active_tool_threads() == []
+
+
+def test_runner_rejects_oversized_valid_history_and_remains_usable(
+    tmp_path: Path,
+) -> None:
+    history_path = tmp_path / "oversized-history.json"
+    max_history_bytes = getattr(tool_runner_module, "MAX_HISTORY_BYTES", 64 * 1024)
+    oversized_row = {
+        **_terminal_row(
+            "oversized-external-row",
+            1.0,
+            owner_id="unit:runner",
+            host_surface="test",
+        ),
+        "padding": "x" * (max_history_bytes + 4096),
+    }
+    history_path.write_bytes(json.dumps([oversized_row]).encode("utf-8"))
+    assert history_path.stat().st_size > max_history_bytes
+
+    profile = _profile(tmp_path)
+    service = ToolRunnerService(
+        registry=_registry(EchoTool()),
+        history_path=history_path,
+    )
+    assert service.history(execution_profile=profile) == []
+
+    queued = service.run("echo", {"value": "after-huge"}, execution_profile=profile)
+    terminal = service.wait_for_run(
+        queued["run_id"], execution_profile=profile, timeout=2.0
+    )
+    assert terminal["status"] == "succeeded"
+    assert service.shutdown(wait=True, timeout=2.0)
+    assert [row["run_id"] for row in json.loads(history_path.read_bytes())] == [
+        queued["run_id"]
+    ]
+    assert history_path.stat().st_size <= max_history_bytes
+    assert getattr(tool_runner_module, "MAX_HISTORY_BYTES", None) == max_history_bytes
+
+
+def test_runner_rejects_escaped_lone_surrogate_history_and_remains_usable(
+    tmp_path: Path,
+) -> None:
+    history_path = tmp_path / "surrogate-history.json"
+    malformed = _terminal_row(
+        "surrogate-external-row",
+        1.0,
+        owner_id="unit:runner",
+        host_surface="test",
+    )
+    malformed["message"] = "malformed-\ud800-history"
+    history_path.write_bytes(
+        json.dumps([malformed], ensure_ascii=True).encode("ascii")
+    )
+
+    profile = _profile(tmp_path)
+    service = ToolRunnerService(
+        registry=_registry(EchoTool()),
+        history_path=history_path,
+    )
+    assert service.history(execution_profile=profile) == []
+
+    queued = service.run(
+        "echo", {"value": "after-surrogate"}, execution_profile=profile
+    )
+    terminal = service.wait_for_run(
+        queued["run_id"], execution_profile=profile, timeout=2.0
+    )
+    assert terminal["status"] == "succeeded"
+    assert service.shutdown(wait=True, timeout=2.0)
+    persisted = history_path.read_text(encoding="utf-8")
+    assert "surrogate-external-row" not in persisted
+    assert "\ud800" not in persisted
+
+
+def test_runner_does_not_read_or_replace_external_symlink_history(
+    tmp_path: Path,
+) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    external_history = outside / "history.json"
+    external_history.write_text(
+        json.dumps(
+            [
+                _terminal_row(
+                    "external-symlink-row",
+                    1.0,
+                    owner_id="unit:runner",
+                    host_surface="test",
+                )
+            ]
+        ),
+        encoding="utf-8",
+    )
+    external_bytes = external_history.read_bytes()
+    cache_root = tmp_path / "cache"
+    cache_root.mkdir()
+    history_path = cache_root / "history.json"
+    try:
+        history_path.symlink_to(external_history)
+    except OSError as exc:
+        pytest.skip(f"file symlink unavailable: {exc}")
+
+    profile = _profile(tmp_path)
+    service = ToolRunnerService(
+        registry=_registry(EchoTool()),
+        history_path=history_path,
+    )
+    assert service.history(execution_profile=profile) == []
+    queued = service.run("echo", {"value": "after-link"}, execution_profile=profile)
+    assert service.wait_for_run(
+        queued["run_id"], execution_profile=profile, timeout=2.0
+    )["status"] == "succeeded"
+    assert service.shutdown(wait=True, timeout=0.5) is False
+    assert external_history.read_bytes() == external_bytes
+    assert history_path.is_symlink()
+
+    history_path.unlink()
+    assert service.shutdown(wait=True, timeout=2.0)
+    assert external_history.read_bytes() == external_bytes
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows junction contract")
+def test_runner_does_not_read_history_through_external_junction(
+    tmp_path: Path,
+) -> None:
+    outside = tmp_path / "junction-outside"
+    outside.mkdir()
+    external_history = outside / "history.json"
+    external_history.write_text(
+        json.dumps(
+            [
+                _terminal_row(
+                    "external-junction-row",
+                    1.0,
+                    owner_id="unit:runner",
+                    host_surface="test",
+                )
+            ]
+        ),
+        encoding="utf-8",
+    )
+    external_bytes = external_history.read_bytes()
+    junction = tmp_path / "cache-junction"
+    completed = subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(junction), str(outside)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if completed.returncode != 0:
+        pytest.skip(f"junction unavailable: {completed.stderr or completed.stdout}")
+
+    history_path = junction / "history.json"
+    profile = _profile(tmp_path)
+    service = ToolRunnerService(
+        registry=_registry(EchoTool()),
+        history_path=history_path,
+    )
+    assert service.history(execution_profile=profile) == []
+    queued = service.run(
+        "echo", {"value": "after-junction"}, execution_profile=profile
+    )
+    assert service.wait_for_run(
+        queued["run_id"], execution_profile=profile, timeout=2.0
+    )["status"] == "succeeded"
+    assert service.shutdown(wait=True, timeout=0.5) is False
+    assert external_history.read_bytes() == external_bytes
+
+    os.rmdir(junction)
+    junction.mkdir()
+    assert service.shutdown(wait=True, timeout=2.0)
+    assert external_history.read_bytes() == external_bytes
+
+
+def test_atomic_history_write_rejects_targets_outside_controlled_cache_root(
+    tmp_path: Path,
+) -> None:
+    cache_root = tmp_path / "cache"
+    cache_root.mkdir()
+    outside = tmp_path / "outside-history.json"
+
+    with pytest.raises(OSError):
+        tool_runner_module._atomic_write_json(
+            outside,
+            [],
+            cache_root=cache_root,
+        )
+
+    assert not outside.exists()

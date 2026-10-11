@@ -7,7 +7,7 @@ from contextlib import contextmanager
 from copy import deepcopy
 from pathlib import Path
 from typing import Any, Callable, Iterator
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import pytest
 
@@ -38,8 +38,19 @@ class _NoopFailedRecordStore:
     def request_refresh(self, **_kwargs) -> None:
         return None
 
-    def shutdown(self) -> None:
-        return None
+    def shutdown(self, timeout: float = 1.0) -> bool:
+        del timeout
+        return True
+
+
+class _PendingShutdownFailedRecordStore(_NoopFailedRecordStore):
+    def __init__(self) -> None:
+        self.shutdown_calls = 0
+
+    def shutdown(self, timeout: float = 1.0) -> bool:
+        del timeout
+        self.shutdown_calls += 1
+        return self.shutdown_calls > 1
 
 
 class _FakeToolRunner:
@@ -273,6 +284,30 @@ def _desktop_profile(tmp_path: Path, *, owner_id: str = "desktop-test") -> Execu
     )
 
 
+def test_destroy_reports_pending_failed_record_store_shutdown(tmp_path: Path) -> None:
+    runner = _FakeToolRunner()
+    store = _PendingShutdownFailedRecordStore()
+    with patch("app.services.frontend_state_service.debug_logger.log") as log:
+        service = FrontendStateService(
+            config_manager=ConfigManager(str(tmp_path / "config.json")),
+            failed_record_store=store,
+            tool_runner_service=runner,
+            execution_profile=_desktop_profile(tmp_path),
+        )
+
+        drained = service.destroy()
+
+    assert drained is False
+    assert store.shutdown_calls >= 1
+    log.assert_any_call(
+        component="FrontendStateService",
+        action="destroy.failed_record_store_pending",
+        level="WARN",
+        message="Failed-record persistence is still draining after the shutdown wait expired",
+        status_code="FAILED_RECORD_SHUTDOWN_PENDING",
+    )
+
+
 def test_dynamic_toolbox_snapshot_comes_from_injected_runner(tmp_path: Path) -> None:
     runner = _FakeToolRunner(records=[_record()])
     profile = _desktop_profile(tmp_path)
@@ -332,6 +367,10 @@ def test_link_parser_projection_uses_only_owner_scoped_safe_structured_rows(
                             "resource_kind": "page",
                             "format_hint": "PLATFORM",
                             "expanded": False,
+                            "admittable": False,
+                            "admission_reason_code": (
+                                "candidate_requires_crawl_resolution"
+                            ),
                             "ignored": "must-not-be-projected",
                         }
                     ]
@@ -350,7 +389,8 @@ def test_link_parser_projection_uses_only_owner_scoped_safe_structured_rows(
             sections=frozenset({"toolbox_display_projection"})
         )
 
-    result = snapshot["toolbox_display_projection"]["result"]
+    projection = snapshot["toolbox_display_projection"]
+    result = projection["result"]
     assert result["rows"] == [
         {
             "id": candidate_id,
@@ -361,6 +401,8 @@ def test_link_parser_projection_uses_only_owner_scoped_safe_structured_rows(
             "resource_kind": "page",
             "format_hint": "PLATFORM",
             "expanded": False,
+            "admittable": False,
+            "admission_reason_code": "candidate_requires_crawl_resolution",
         }
     ]
     rendered = repr(snapshot)
@@ -368,11 +410,120 @@ def test_link_parser_projection_uses_only_owner_scoped_safe_structured_rows(
     assert "private/path" not in rendered
     assert "private_data" not in rendered
     assert "must-not-be-projected" not in rendered
+    assert projection["actions"]["tool_admit_candidates"] is False
+    assert projection["action_payloads"]["tool_admit_candidates"] == {
+        "tool_id": "link_parser",
+        "run_id": "run-finished",
+    }
     assert (
         "lookup_private_result",
         profile,
         "run-finished",
     ) in runner.calls
+
+
+@pytest.mark.parametrize(
+    ("resource_kind", "platform", "format_hint"),
+    (("media", "bilibili", "MP4"), ("playlist", "missav", "HLS")),
+)
+def test_link_parser_projection_exposes_candidate_admission_only_for_selectable_rows(
+    tmp_path: Path,
+    resource_kind: str,
+    platform: str,
+    format_hint: str,
+) -> None:
+    profile = _desktop_profile(tmp_path, owner_id="desktop:link-admission")
+    candidate_id = hashlib.sha256(resource_kind.encode("utf-8")).hexdigest()
+    runner = _FakeToolRunner(
+        records=[
+            _record(
+                tool_id="link_parser",
+                private_owner_id=profile.owner_id,
+                structured_data={
+                    "links": [
+                        {
+                            "candidate_id": candidate_id,
+                            "display_url": f"https://{platform}.example/[redacted]",
+                            "platform": platform,
+                            "resource_kind": resource_kind,
+                            "format_hint": format_hint,
+                            "expanded": False,
+                            "admittable": True,
+                            "admission_reason_code": "",
+                        }
+                    ]
+                },
+            )
+        ]
+    )
+
+    with _service(tmp_path, runner, execution_profile=profile) as service:
+        projection = service.get_snapshot(
+            sections=frozenset({"toolbox_display_projection"})
+        )["toolbox_display_projection"]
+
+    assert projection["actions"]["tool_admit_candidates"] is True
+    assert projection["action_payloads"]["tool_admit_candidates"] == {
+        "tool_id": "link_parser",
+        "run_id": "run-finished",
+    }
+    assert "candidate_ids" not in projection["action_payloads"]["tool_admit_candidates"]
+
+
+def test_link_parser_projection_consumes_server_admission_capability(
+    tmp_path: Path,
+) -> None:
+    profile = _desktop_profile(tmp_path, owner_id="desktop:link-policy")
+    blocked_id = hashlib.sha256(b"generic-media").hexdigest()
+    admitted_id = hashlib.sha256(b"missav-playlist").hexdigest()
+    runner = _FakeToolRunner(
+        records=[
+            _record(
+                tool_id="link_parser",
+                private_owner_id=profile.owner_id,
+                structured_data={
+                    "links": [
+                        {
+                            "candidate_id": blocked_id,
+                            "display_url": "https://cdn.example/[redacted]",
+                            "platform": "generic",
+                            "resource_kind": "media",
+                            "format_hint": "MP4",
+                            "expanded": False,
+                            "admittable": False,
+                            "admission_reason_code": (
+                                "candidate_downloader_unavailable"
+                            ),
+                        },
+                        {
+                            "candidate_id": admitted_id,
+                            "display_url": "https://missav.ai/[redacted]",
+                            "platform": "missav",
+                            "resource_kind": "playlist",
+                            "format_hint": "HLS",
+                            "expanded": False,
+                            "admittable": True,
+                            "admission_reason_code": "",
+                        },
+                    ]
+                },
+            )
+        ]
+    )
+
+    with _service(tmp_path, runner, execution_profile=profile) as service:
+        projection = service.get_snapshot(
+            sections=frozenset({"toolbox_display_projection"})
+        )["toolbox_display_projection"]
+
+    assert [
+        (row["candidate_id"], row["admittable"], row["admission_reason_code"])
+        for row in projection["result"]["rows"]
+    ] == [
+        (blocked_id, False, "candidate_downloader_unavailable"),
+        (admitted_id, True, ""),
+    ]
+    assert projection["actions"]["tool_admit_candidates"] is True
 
 
 @pytest.mark.parametrize(
@@ -412,7 +563,7 @@ def test_link_parser_projection_rejects_malformed_display_authorities(
     assert not FrontendStateService._is_safe_display_url(display_url)
 
 
-@pytest.mark.parametrize("format_hint", ([], {}, 1, "UNKNOWN"))
+@pytest.mark.parametrize("format_hint", ([], {}, 1, "UNKNOWN", "VIDEO", "PROFILE"))
 def test_link_parser_projection_rejects_untrusted_format_hints_without_raising(
     tmp_path: Path,
     format_hint: Any,
@@ -481,9 +632,11 @@ def test_tool_projection_rejects_unavailable_or_non_whitelisted_structured_rows(
                     "candidate_id": candidate_id,
                     "display_url": display_url,
                     "platform": "generic",
-                    "resource_kind": "page",
-                    "format_hint": "PLATFORM",
-                    "expanded": False,
+            "resource_kind": "page",
+            "format_hint": "PLATFORM",
+            "expanded": False,
+            "admittable": False,
+            "admission_reason_code": "candidate_requires_crawl_resolution",
                 }
             ]
         },
@@ -518,6 +671,8 @@ def test_link_parser_projection_is_bounded_and_deterministic(tmp_path: Path) -> 
             "resource_kind": "page",
             "format_hint": "PLATFORM",
             "expanded": bool(index % 2),
+            "admittable": False,
+            "admission_reason_code": "candidate_requires_crawl_resolution",
         }
         for index in range(200)
     ]
@@ -549,6 +704,68 @@ def test_link_parser_projection_is_bounded_and_deterministic(tmp_path: Path) -> 
     )
     assert first["warnings"][-1] == "Tool result display was truncated."
     assert first["warnings"].count("Tool result display was truncated.") == 1
+
+
+def test_link_parser_projection_keeps_first_64_unique_valid_rows(tmp_path: Path) -> None:
+    profile = _desktop_profile(tmp_path, owner_id="desktop:valid-quota")
+    first_id = hashlib.sha256(b"first-valid-candidate").hexdigest()
+    links = [
+        *[{"candidate_id": "invalid"} for _ in range(64)],
+        {
+            "candidate_id": first_id,
+            "display_url": "https://example.com/[redacted]",
+            "platform": "generic",
+            "resource_kind": "media",
+            "format_hint": "MP4",
+            "expanded": False,
+            "admittable": True,
+            "admission_reason_code": "",
+        },
+        {
+            "candidate_id": first_id,
+            "display_url": "https://example.com/[redacted]",
+            "platform": "generic",
+            "resource_kind": "media",
+            "format_hint": "MP4",
+            "expanded": False,
+            "admittable": True,
+            "admission_reason_code": "",
+        },
+        *[
+            {
+                "candidate_id": hashlib.sha256(
+                    f"valid-candidate-{index}".encode()
+                ).hexdigest(),
+                "display_url": "https://example.com/[redacted]",
+                "platform": "generic",
+                "resource_kind": "playlist",
+                "format_hint": "HLS",
+                "expanded": True,
+                "admittable": True,
+                "admission_reason_code": "",
+            }
+            for index in range(70)
+        ],
+    ]
+    runner = _FakeToolRunner(
+        records=[
+            _record(
+                tool_id="link_parser",
+                private_owner_id=profile.owner_id,
+                structured_data={"links": links},
+            )
+        ]
+    )
+
+    with _service(tmp_path, runner, execution_profile=profile) as service:
+        result = service.get_snapshot(
+            sections=frozenset({"toolbox_display_projection"})
+        )["toolbox_display_projection"]["result"]
+
+    assert len(result["rows"]) == 64
+    assert result["rows"][0]["candidate_id"] == first_id
+    assert len({row["candidate_id"] for row in result["rows"]}) == 64
+    assert result["warnings"][-1] == "Tool result display was truncated."
 
 
 def test_tool_validate_forwards_parameters_and_exact_host_owned_profile(tmp_path: Path) -> None:

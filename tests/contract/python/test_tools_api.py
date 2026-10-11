@@ -1574,3 +1574,107 @@ def test_ucrawl_sdk_cached_tools_close_is_terminal(tmp_path: Path) -> None:
         first.tools
     with pytest.raises(RuntimeError, match="closed"):
         tools.list()
+
+
+def test_tools_api_link_parser_runtime_projection_is_owner_scoped_not_durable(
+    tmp_path: Path,
+) -> None:
+    import json
+
+    from app.services.tool_runner_service import ToolRunnerService
+    from ucrawl.tools import ToolsAPI
+
+    candidate_keys = {
+        "candidate_id",
+        "display_url",
+        "platform",
+        "resource_kind",
+        "format_hint",
+        "expanded",
+        "admittable",
+        "admission_reason_code",
+    }
+    parameters = {
+        "text": " ".join(
+            (
+                "https://cdn.example.com/private/generic.mp4?token=generic-secret",
+                "https://www.douyin.com/private/master.m3u8?token=douyin-secret",
+                "https://missav.ai/private/master.m3u8?token=missav-secret",
+                "https://www.bilibili.com/private/video.mp4?token=bilibili-secret",
+            )
+        )
+    }
+    owner = local_execution_profile(
+        host_surface="sdk",
+        owner_id="sdk:link-owner",
+        approved_roots=(tmp_path,),
+        tool_permissions=("network",),
+        allow_external_plugins=False,
+    )
+    other_owner = local_execution_profile(
+        host_surface="sdk",
+        owner_id="sdk:link-other",
+        approved_roots=(tmp_path,),
+        tool_permissions=("network",),
+        allow_external_plugins=False,
+    )
+    history_path = tmp_path / "sdk-link-history.json"
+    service = ToolRunnerService(history_path=history_path, max_workers=1)
+    owner_api = ToolsAPI(execution_profile=owner, service=service)
+    other_api = ToolsAPI(execution_profile=other_owner, service=service)
+    try:
+        queued = owner_api.run("link_parser", parameters)
+        terminal = owner_api.wait_for_run(queued["run_id"], timeout=2.0)
+        fetched = owner_api.get_run(queued["run_id"])
+
+        links = terminal["result"]["data"]["links"]
+        assert fetched["result"]["data"]["links"] == links
+        assert all(set(row) == candidate_keys for row in links)
+        assert {
+            (row["platform"], row["resource_kind"]): (
+                row["admittable"],
+                row["admission_reason_code"],
+            )
+            for row in links
+        } == {
+            ("generic", "media"): (False, "candidate_downloader_unavailable"),
+            ("douyin", "playlist"): (False, "candidate_downloader_unavailable"),
+            ("missav", "playlist"): (True, ""),
+            ("bilibili", "media"): (True, ""),
+        }
+
+        assert other_api.get_run(queued["run_id"]) is None
+        mismatch = other_api.wait_for_run(queued["run_id"], timeout=0)
+        assert mismatch == {
+            "status": "forbidden",
+            "code": "tool_owner_mismatch",
+            "message": "tool run belongs to another owner",
+            "run_id": queued["run_id"],
+        }
+        history = owner_api.history(tool_id="link_parser")
+        assert "data" not in history[0]["result"]
+
+        public_text = json.dumps(
+            {
+                "terminal": terminal,
+                "fetched": fetched,
+                "mismatch": mismatch,
+                "history": history,
+            },
+            ensure_ascii=False,
+        )
+        for secret in (
+            "generic-secret",
+            "douyin-secret",
+            "missav-secret",
+            "bilibili-secret",
+            "/private/",
+            "?token=",
+        ):
+            assert secret not in public_text
+    finally:
+        assert other_api.close()
+        assert owner_api.close()
+
+    persisted = json.loads(history_path.read_text(encoding="utf-8"))
+    assert "data" not in persisted[0]["result"]

@@ -1022,3 +1022,160 @@ def test_tools_interrupt_stays_cancelled_when_ordinary_close_cleanup_fails(
 def _bind(api: RecordingToolsAPI, profile: ExecutionProfile) -> RecordingToolsAPI:
     api.execution_profile = profile
     return api
+
+
+def test_tools_cli_link_parser_json_is_owner_scoped_safe_and_not_durable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from app.services import tool_runner_service as runner_module
+    from app.services.tool_runner_service import ToolRunnerService
+    from cli.commands import tools as tools_command
+    from cli.main import main
+    from shared.execution_profile import local_execution_profile
+    from ucrawl.tools import ToolsAPI
+
+    class ForeignQueuedToolsAPI(ToolsAPI):
+        def __init__(
+            self,
+            execution_profile: ExecutionProfile,
+            service: ToolRunnerService,
+            foreign_run_id: str,
+        ) -> None:
+            super().__init__(execution_profile=execution_profile, service=service)
+            self._foreign_run_id = foreign_run_id
+
+        def run(self, tool_id: str, params: dict[str, Any]) -> dict[str, str]:
+            del tool_id, params
+            return {"status": "queued", "run_id": self._foreign_run_id}
+
+    candidate_keys = {
+        "candidate_id",
+        "display_url",
+        "platform",
+        "resource_kind",
+        "format_hint",
+        "expanded",
+        "admittable",
+        "admission_reason_code",
+    }
+    parameters = {
+        "text": " ".join(
+            (
+                "https://cdn.example.com/private/generic.mp4?token=generic-secret",
+                "https://www.douyin.com/private/master.m3u8?token=douyin-secret",
+                "https://missav.ai/private/master.m3u8?token=missav-secret",
+                "https://www.bilibili.com/private/video.mp4?token=bilibili-secret",
+            )
+        )
+    }
+    monkeypatch.setattr(tools_command, "get_default_save_dir", lambda: str(tmp_path))
+    monkeypatch.setattr(runner_module, "user_cache_root", lambda: tmp_path / "cache")
+    monkeypatch.setattr(runner_module, "user_data_root", lambda: tmp_path / "data")
+
+    assert (
+        main(
+            [
+                "tools",
+                "run",
+                "link_parser",
+                "--params",
+                json.dumps(parameters),
+            ]
+        )
+        == 0
+    )
+    terminal = json.loads(capsys.readouterr().out)
+    links = terminal["result"]["data"]["links"]
+    assert all(set(row) == candidate_keys for row in links)
+    assert {
+        (row["platform"], row["resource_kind"]): (
+            row["admittable"],
+            row["admission_reason_code"],
+        )
+        for row in links
+    } == {
+        ("generic", "media"): (False, "candidate_downloader_unavailable"),
+        ("douyin", "playlist"): (False, "candidate_downloader_unavailable"),
+        ("missav", "playlist"): (True, ""),
+        ("bilibili", "media"): (True, ""),
+    }
+    assert main(["tools", "history", "--tool-id", "link_parser", "--limit", "10"]) == 0
+    history = json.loads(capsys.readouterr().out)
+    assert history
+    assert all("data" not in row["result"] for row in history)
+    persisted_path = tmp_path / "cache" / "tool_history.json"
+    persisted = json.loads(persisted_path.read_text(encoding="utf-8"))
+    assert all("data" not in row["result"] for row in persisted)
+
+    public_text = json.dumps(
+        {"terminal": terminal, "history": history, "persisted": persisted},
+        ensure_ascii=False,
+    )
+    for secret in (
+        "generic-secret",
+        "douyin-secret",
+        "missav-secret",
+        "bilibili-secret",
+        "/private/",
+        "?token=",
+    ):
+        assert secret not in public_text
+
+    foreign_history_path = tmp_path / "foreign-history.json"
+    foreign_service = ToolRunnerService(
+        history_path=foreign_history_path,
+        max_workers=1,
+    )
+    foreign_owner = local_execution_profile(
+        host_surface="sdk",
+        owner_id="sdk:foreign-owner",
+        approved_roots=(tmp_path,),
+        tool_permissions=("network",),
+        allow_external_plugins=False,
+    )
+    foreign_owner_api = ToolsAPI(
+        execution_profile=foreign_owner,
+        service=foreign_service,
+    )
+    try:
+        foreign_queued = foreign_owner_api.run("link_parser", parameters)
+        foreign_terminal = foreign_owner_api.wait_for_run(
+            foreign_queued["run_id"], timeout=2.0
+        )
+        assert foreign_terminal["result"]["data"]["links"]
+
+        monkeypatch.setattr(
+            tools_command,
+            "ToolsAPI",
+            lambda *, execution_profile: ForeignQueuedToolsAPI(
+                execution_profile,
+                foreign_service,
+                foreign_queued["run_id"],
+            ),
+        )
+        assert (
+            main(
+                [
+                    "tools",
+                    "run",
+                    "link_parser",
+                    "--params",
+                    json.dumps(parameters),
+                ]
+            )
+            != 0
+        )
+        mismatch = json.loads(capsys.readouterr().out)
+        assert mismatch == {
+            "status": "forbidden",
+            "code": "tool_owner_mismatch",
+            "message": "tool run belongs to another owner",
+            "run_id": foreign_queued["run_id"],
+        }
+    finally:
+        assert foreign_owner_api.close()
+
+    foreign_persisted = json.loads(foreign_history_path.read_text(encoding="utf-8"))
+    assert all("data" not in row["result"] for row in foreign_persisted)

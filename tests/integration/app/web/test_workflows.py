@@ -1,4 +1,5 @@
 import asyncio
+import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -134,6 +135,59 @@ class WebWorkflowServiceTests(unittest.IsolatedAsyncioTestCase):
             merge_params.call_args.kwargs["execution_profile"], profile
         )
         self.assertIs(build_sdk.call_args.kwargs["execution_profile"], profile)
+
+    async def test_direct_download_cancellation_drains_worker_before_sdk_close(self):
+        started = threading.Event()
+        release = threading.Event()
+        finished = threading.Event()
+        close_observed_finished: list[bool] = []
+        fake_sdk = MagicMock()
+
+        def blocking_download(**_kwargs):
+            started.set()
+            assert release.wait(2.0)
+            finished.set()
+            return {"status": "ok", "meta": {}}
+
+        def close_sdk() -> None:
+            close_observed_finished.append(finished.is_set())
+
+        fake_sdk.download_video.side_effect = blocking_download
+        fake_sdk.close.side_effect = close_sdk
+
+        with (
+            patch("app.core.plugin_registry.registry.get_plugin", return_value=object()),
+            patch("app.web.workflows.validate_direct_download_url", return_value=None),
+            patch("app.web.workflows.validate_config_types", return_value=None),
+            patch("app.web.workflows.get_platform_defaults", return_value={}),
+            patch("app.web.workflows.merge_convenience_params"),
+            patch("app.web.workflows.build_sdk", return_value=fake_sdk),
+        ):
+            task = asyncio.create_task(
+                self.service.direct_download(
+                    {
+                        "url": "https://example.com/video",
+                        "source": "douyin",
+                    },
+                    log_error=False,
+                )
+            )
+            self.assertTrue(await asyncio.to_thread(started.wait, 2.0))
+            task.cancel("first cancellation")
+            await asyncio.sleep(0)
+            for attempt in range(7):
+                task.cancel(f"later cancellation {attempt}")
+                await asyncio.sleep(0)
+            completed_before_release = task.done()
+            closed_before_release = fake_sdk.close.called
+            release.set()
+            with self.assertRaises(asyncio.CancelledError) as raised:
+                await task
+
+        self.assertFalse(completed_before_release)
+        self.assertFalse(closed_before_release)
+        self.assertEqual(raised.exception.args, ("first cancellation",))
+        self.assertEqual(close_observed_finished, [True])
 
     async def test_start_crawl_merges_config_and_updates_save_dir(self):
         with (

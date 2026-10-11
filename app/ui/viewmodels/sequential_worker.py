@@ -34,12 +34,13 @@ class SequentialRequestWorker(Generic[RequestT, ResultT]):
         self._thread = threading.Thread(target=self._run, name=name, daemon=True)
         self._thread.start()
 
-    def submit(self, request: RequestT) -> None:
+    def submit(self, request: RequestT) -> bool:
         with self._condition:
             if self._shutdown:
-                return
+                return False
             self._pending.append(request)
             self._condition.notify()
+            return True
 
     def shutdown(self) -> None:
         with self._condition:

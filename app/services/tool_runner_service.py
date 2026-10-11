@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-import json
 import os
-import tempfile
 import threading
 import time
 import uuid
@@ -29,7 +27,20 @@ from app.core.tools.contracts import (
 )
 from app.core.tools.registry import ToolRegistry
 from app.debug_logger import debug_logger
-from app.services.tool_history_projection import project_history_record
+from app.services.tool_history_projection import (
+    normalize_tool_result as _normalize_result,
+    project_history_record,
+    project_runtime_record,
+    public_validation_payload as _public_validation_payload,
+    redact_parameters as _redact_parameters,
+)
+from app.services.tool_history_storage import (
+    MAX_HISTORY_BYTES,
+    atomic_write_json as _storage_atomic_write_json,
+    bounded_history_snapshot,
+    persist_retry_delay,
+    read_history_json,
+)
 from app.utils.runtime_paths import user_cache_root, user_data_root
 from shared.execution_profile import (
     ExecutionProfile,
@@ -39,6 +50,10 @@ from shared.execution_profile import (
 ToolEventCallback = Callable[[str, dict[str, Any]], None]
 
 _SHUTDOWN_PERSIST_GRACE_SECONDS = 0.25
+_TOOL_REQUIREMENTS_ERROR = "tool requirements evaluation failed"
+_TOOL_VALIDATION_ERROR = "tool validation failed"
+_TOOL_RUN_ERROR = "tool run failed"
+_PERSIST_RETRY_DELAYS = (0.01, 0.05, 0.1, 0.25)
 
 
 @dataclass(frozen=True, slots=True)
@@ -91,27 +106,42 @@ class _RunRecord:
     runtime_private_result: bool = field(default=False, repr=False)
     claimed_candidate_ids: set[str] = field(default_factory=set, repr=False)
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self, *, include_runtime_data: bool = False) -> dict[str, Any]:
         payload = {
             "run_id": self.run_id,
             "tool_id": self.tool_id,
             "host_surface": self.host_surface,
             "owner_id": self.owner_id,
             "status": self.status.value,
-            "parameters": _json_value(self.parameters),
             "created_at": self.created_at,
             "started_at": self.started_at,
             "finished_at": self.finished_at,
             "progress": self.progress,
             "message": self.message,
-            "progress_details": _json_value(self.progress_details),
         }
         if self.result is not None:
-            payload["result"] = self.result.to_dict()
+            result_status = self.result.status
+            projected_result = {
+                "status": (
+                    result_status.value
+                    if isinstance(result_status, ToolRunStatus)
+                    else result_status
+                ),
+                "message": self.result.message,
+                "warnings": self.result.warnings,
+            }
+            if include_runtime_data:
+                projected_result["data"] = self.result.data
+            payload["result"] = projected_result
         return payload
 
     def to_public_dict(self) -> dict[str, Any]:
         return project_history_record(self.to_dict())
+
+    def to_runtime_public_dict(self) -> dict[str, Any]:
+        if not self.runtime_private_result:
+            return self.to_public_dict()
+        return project_runtime_record(self.to_dict(include_runtime_data=True))
 
 
 class ToolRunnerService:
@@ -135,7 +165,10 @@ class ToolRunnerService:
         self.registry = registry or ToolRegistry(
             external_dir=external_tool_dir or default_external_dir,
         )
-        self.history_path = Path(history_path or (Path(user_cache_root()) / "tool_history.json"))
+        self.history_path = Path(
+            history_path or (Path(user_cache_root()) / "tool_history.json")
+        )
+        self._history_cache_root = self.history_path.parent
         self.history_limit = max(10, int(history_limit))
         self.max_pending = max(1, int(max_pending))
         self.max_pending_per_owner = max(1, int(max_pending_per_owner))
@@ -154,7 +187,9 @@ class ToolRunnerService:
         self._workers_idle.set()
         self._closed = False
         self._persist_generation = 0
+        self._persisted_generation = -1
         self._persist_running = False
+        self._persist_condition = threading.Condition(self._lock)
         self._shutdown_persist_thread: threading.Thread | None = None
         self._shutdown_persist_result: bool | None = None
         self._executor = ThreadPoolExecutor(
@@ -189,10 +224,19 @@ class ToolRunnerService:
         descriptor = self.registry.descriptor(tool_id)
         if descriptor is None:
             return {"status": "error", "valid": False, "errors": ["unknown tool"], "tool_id": tool_id}
+        try:
+            parameters = dict(params or {})
+        except BaseException as exc:
+            _log_exception_best_effort("validate.parameters", exc)
+            return _preflight_error_payload(
+                descriptor.tool.manifest.id,
+                code="tool_validation_failed",
+                message=_TOOL_VALIDATION_ERROR,
+            )
         return _public_validation_payload(
             self._validate_descriptor(
                 descriptor,
-                dict(params or {}),
+                parameters,
                 execution_profile,
             ),
             tool_id=descriptor.tool.manifest.id,
@@ -207,14 +251,13 @@ class ToolRunnerService:
         tool = descriptor.tool
         try:
             grant = self._evaluate_grant(descriptor, parameters, execution_profile)
-        except Exception as exc:
-            debug_logger.log_exception("ToolRunnerService", "requirements", exc)
-            return {
-                "status": "error",
-                "valid": False,
-                "errors": [str(exc)],
-                "tool_id": tool.manifest.id,
-            }
+        except BaseException as exc:
+            _log_exception_best_effort("requirements", exc)
+            return _preflight_error_payload(
+                tool.manifest.id,
+                code="tool_requirements_failed",
+                message=_TOOL_REQUIREMENTS_ERROR,
+            )
         if not grant.allowed:
             return _forbidden_payload(tool.manifest.id, grant)
         context = self._make_context(
@@ -227,10 +270,14 @@ class ToolRunnerService:
         )
         try:
             validation = _normalize_validation(tool.validate(context), context.parameters)
-        except Exception as exc:
-            debug_logger.log_exception("ToolRunnerService", "validate", exc)
-            validation = ToolValidationResult.rejected(str(exc))
-        payload = validation.to_dict()
+            payload = validation.to_dict()
+        except BaseException as exc:
+            _log_exception_best_effort("validate", exc)
+            return _preflight_error_payload(
+                tool.manifest.id,
+                code="tool_validation_failed",
+                message=_TOOL_VALIDATION_ERROR,
+            )
         payload["tool_id"] = tool.manifest.id
         return payload
 
@@ -252,9 +299,18 @@ class ToolRunnerService:
         if descriptor is None:
             return {"status": "error", "message": "unknown tool", "tool_id": str(tool_id or "")}
         tool = descriptor.tool
+        try:
+            parameters = dict(params or {})
+        except BaseException as exc:
+            _log_exception_best_effort("run.parameters", exc)
+            return _preflight_error_payload(
+                tool.manifest.id,
+                code="tool_validation_failed",
+                message=_TOOL_VALIDATION_ERROR,
+            )
         validation = self._validate_descriptor(
             descriptor,
-            dict(params or {}),
+            parameters,
             execution_profile,
         )
         if validation.get("status") != "ok":
@@ -262,20 +318,28 @@ class ToolRunnerService:
                 validation,
                 tool_id=tool.manifest.id,
             )
-        normalized_parameters = dict(validation.get("parameters") or params or {})
+        try:
+            normalized_parameters = dict(validation.get("parameters") or parameters)
+        except BaseException as exc:
+            _log_exception_best_effort("run.normalized_parameters", exc)
+            return _preflight_error_payload(
+                tool.manifest.id,
+                code="tool_validation_failed",
+                message=_TOOL_VALIDATION_ERROR,
+            )
         try:
             grant = self._evaluate_grant(
                 descriptor,
                 normalized_parameters,
                 execution_profile,
             )
-        except Exception as exc:
-            debug_logger.log_exception("ToolRunnerService", "requirements.normalized", exc)
-            return {
-                "status": "error",
-                "message": str(exc),
-                "tool_id": tool.manifest.id,
-            }
+        except BaseException as exc:
+            _log_exception_best_effort("requirements.normalized", exc)
+            return _preflight_error_payload(
+                tool.manifest.id,
+                code="tool_requirements_failed",
+                message=_TOOL_REQUIREMENTS_ERROR,
+            )
         if not grant.allowed:
             return _forbidden_payload(tool.manifest.id, grant)
         run_id = f"tool_{uuid.uuid4().hex}"
@@ -441,7 +505,7 @@ class ToolRunnerService:
             record = self._records.get(str(run_id or ""))
             if record is None or not self._is_owned_by(record, execution_profile):
                 return None
-            return record.to_public_dict()
+            return record.to_runtime_public_dict()
 
     def lookup_private_result(
         self,
@@ -610,7 +674,7 @@ class ToolRunnerService:
             if not self._is_owned_by(record, execution_profile):
                 return _owner_mismatch_payload(normalized)
             if _is_terminal_status(record.status):
-                return record.to_public_dict()
+                return record.to_runtime_public_dict()
             future = self._futures.get(normalized)
         if future is None:
             return {"status": "timeout", "run_id": normalized}
@@ -622,11 +686,19 @@ class ToolRunnerService:
             # Tool exceptions are normally normalized in _execute; cancellation may
             # still surface through Future while the record already has a terminal state.
             pass
+        except BaseException as exc:
+            background_exc = None
+            if future.done() and not future.cancelled():
+                background_exc = future.exception(timeout=0)
+            if background_exc is not exc:
+                raise
         with self._lock:
             record = self._records.get(normalized)
             if record is None:
                 return {"status": "error", "message": "unknown tool run", "run_id": normalized}
-            return record.to_public_dict()
+            if not self._is_owned_by(record, execution_profile):
+                return _owner_mismatch_payload(normalized)
+            return record.to_runtime_public_dict()
 
     def wait_for_idle(self, timeout: float | None = None) -> bool:
         deadline = None if timeout is None else time.monotonic() + max(0.0, float(timeout))
@@ -657,6 +729,7 @@ class ToolRunnerService:
         if not self._history_loaded.wait(history_wait_timeout):
             with self._lock:
                 self._closed = True
+                self._persist_condition.notify_all()
             self._executor.shutdown(wait=False, cancel_futures=True)
             # The queued loader owns the history barrier's finally block. Cancelling
             # it before start would leave every repeated shutdown stuck forever.
@@ -666,6 +739,7 @@ class ToolRunnerService:
         with self._lock:
             first_shutdown = not self._closed
             self._closed = True
+            self._persist_condition.notify_all()
             active_run_ids = tuple(self._futures)
             cancellation_events = (
                 [self._cancel_locked(run_id) for run_id in active_run_ids]
@@ -711,7 +785,12 @@ class ToolRunnerService:
             self._active_workers += 1
             self._workers_idle.clear()
         try:
-            self._execute(*args)
+            try:
+                self._execute(*args)
+            except BaseException as exc:
+                run_id = str(args[0]) if args else ""
+                _log_exception_best_effort("run.worker_boundary", exc)
+                self._terminalize_worker_failure(run_id)
         finally:
             with self._worker_state_lock:
                 self._active_workers = max(0, self._active_workers - 1)
@@ -764,11 +843,11 @@ class ToolRunnerService:
             token.raise_if_cancelled()
             result = _normalize_result(tool.run(context))
             token.raise_if_cancelled()
-        except ToolCancelledError as exc:
-            result = ToolRunResult.cancelled(str(exc))
-        except Exception as exc:
-            debug_logger.log_exception("ToolRunnerService", f"run.{tool.manifest.id}", exc)
-            result = ToolRunResult.failure(str(exc))
+        except ToolCancelledError:
+            result = ToolRunResult.cancelled("tool run cancelled")
+        except BaseException as exc:
+            _log_exception_best_effort(f"run.{tool.manifest.id}", exc)
+            result = ToolRunResult.failure(_TOOL_RUN_ERROR)
         with self._lock:
             record = self._records.get(run_id)
             if record is None:
@@ -795,8 +874,10 @@ class ToolRunnerService:
                 )
                 record.finished_at = time.time()
                 self._mark_persist_dirty_locked()
-                completed_payload = record.to_public_dict()
-                self._finish_run_locked(run_id)
+                try:
+                    completed_payload = record.to_public_dict()
+                finally:
+                    self._finish_run_locked(run_id)
                 terminal_transitioned = True
             persist_synchronously = self._closed
         if not terminal_transitioned:
@@ -807,6 +888,42 @@ class ToolRunnerService:
             else "tools.finished"
         )
         self._emit(terminal_topic, completed_payload)
+        if persist_synchronously:
+            self._persist_history_now()
+        else:
+            self._schedule_persist(mark_dirty=False)
+
+    def _terminalize_worker_failure(self, run_id: str) -> None:
+        with self._lock:
+            record = self._records.get(run_id)
+            if record is None:
+                return
+            token = self._tokens.get(run_id)
+            cancelled = record.status == ToolRunStatus.CANCELLING or (
+                token is not None and token.is_cancelled()
+            )
+            if cancelled:
+                result = ToolRunResult.cancelled("tool run cancelled")
+                record.status = ToolRunStatus.CANCELLED
+                topic = "tools.cancelled"
+            else:
+                result = ToolRunResult.failure(_TOOL_RUN_ERROR)
+                record.status = ToolRunStatus.FAILED
+                topic = "tools.finished"
+            record.result = result
+            record.runtime_private_result = False
+            record.message = result.message
+            record.finished_at = time.time()
+            self._mark_persist_dirty_locked()
+            try:
+                payload = record.to_public_dict()
+            except BaseException as exc:
+                _log_exception_best_effort("run.terminal_projection", exc)
+                payload = project_history_record(record.to_dict())
+            finally:
+                self._finish_run_locked(run_id)
+            persist_synchronously = self._closed
+        self._emit(topic, payload)
         if persist_synchronously:
             self._persist_history_now()
         else:
@@ -826,8 +943,8 @@ class ToolRunnerService:
         if self._settings_provider is not None:
             try:
                 settings = dict(self._settings_provider() or {})
-            except Exception as exc:
-                debug_logger.log_exception("ToolRunnerService", "settings_provider", exc)
+            except BaseException as exc:
+                _log_exception_best_effort("settings_provider", exc)
         return ToolContext(
             parameters=dict(parameters),
             run_id=run_id,
@@ -869,6 +986,7 @@ class ToolRunnerService:
 
     def _mark_persist_dirty_locked(self) -> None:
         self._persist_generation += 1
+        self._persist_condition.notify_all()
 
     def _mark_cancelled_locked(
         self,
@@ -882,11 +1000,17 @@ class ToolRunnerService:
         result = ToolRunResult.cancelled(message)
         record.status = ToolRunStatus.CANCELLED
         record.result = result
+        record.runtime_private_result = False
         record.message = result.message
         record.finished_at = time.time()
         self._mark_persist_dirty_locked()
-        payload = record.to_public_dict()
-        self._finish_run_locked(run_id)
+        try:
+            payload = record.to_public_dict()
+        except BaseException as exc:
+            _log_exception_best_effort("cancel.terminal_projection", exc)
+            payload = project_history_record(record.to_dict())
+        finally:
+            self._finish_run_locked(run_id)
         return payload, True
 
     def _cancel_locked(self, run_id: str) -> tuple[dict[str, Any], str | None]:
@@ -941,14 +1065,18 @@ class ToolRunnerService:
             # Events only invalidate the toolbox section. Owner-scoped state is fetched
             # through history/get_run so one host cannot observe another host's payload.
             callback(str(topic), {})
-        except Exception as exc:
-            debug_logger.log_exception("ToolRunnerService", "event_callback", exc)
+        except BaseException as exc:
+            _log_exception_best_effort("event_callback", exc)
 
     def _load_history(self) -> None:
         try:
-            if not self.history_path.is_file():
+            raw = read_history_json(
+                self.history_path,
+                cache_root=self._history_cache_root,
+                max_bytes=MAX_HISTORY_BYTES,
+            )
+            if raw is None:
                 return
-            raw = json.loads(self.history_path.read_text(encoding="utf-8"))
             if not isinstance(raw, list):
                 return
             loaded: dict[str, _RunRecord] = {}
@@ -971,8 +1099,8 @@ class ToolRunnerService:
                     ),
                 )
                 self._trim_history_locked()
-        except (OSError, ValueError, TypeError) as exc:
-            debug_logger.log_exception("ToolRunnerService", "load_history", exc)
+        except BaseException as exc:
+            _log_exception_best_effort("load_history", exc)
         finally:
             self._history_loaded.set()
 
@@ -980,37 +1108,94 @@ class ToolRunnerService:
         with self._lock:
             if mark_dirty:
                 self._mark_persist_dirty_locked()
-            if self._persist_running:
+            if (
+                self._closed
+                or self._persisted_generation >= self._persist_generation
+                or self._persist_running
+            ):
                 return
             self._persist_running = True
         try:
             self._io_executor.submit(self._persist_loop)
-        except RuntimeError:
+        except BaseException as exc:
+            _log_exception_best_effort("persist_history.schedule", exc)
             with self._lock:
                 self._persist_running = False
 
     def _persist_loop(self) -> None:
-        while True:
-            with self._lock:
-                if self._closed:
-                    self._persist_running = False
+        generation: int | None = None
+        attempt_generation: int | None = None
+        failures = 0
+        try:
+            while True:
+                with self._lock:
+                    if (
+                        self._closed
+                        or self._persisted_generation >= self._persist_generation
+                    ):
+                        return
+                    generation = self._persist_generation
+                if generation != attempt_generation:
+                    attempt_generation = generation
+                    failures = 0
+                try:
+                    with self._history_write_lock:
+                        with self._lock:
+                            snapshot = [
+                                self._records[run_id].to_public_dict()
+                                for run_id in self._order
+                                if run_id in self._records
+                            ]
+                        snapshot = bounded_history_snapshot(
+                            snapshot,
+                            max_bytes=MAX_HISTORY_BYTES,
+                        )
+                        _atomic_write_json(
+                            self.history_path,
+                            snapshot,
+                            cache_root=self._history_cache_root,
+                        )
+                        with self._lock:
+                            self._persisted_generation = max(
+                                self._persisted_generation,
+                                generation,
+                            )
+                except OSError as exc:
+                    failures += 1
+                    _log_exception_best_effort("persist_history", exc)
+                    with self._persist_condition:
+                        if self._closed or self._persisted_generation >= generation:
+                            return
+                        if generation != self._persist_generation:
+                            attempt_generation = None
+                            continue
+                        self._persist_condition.wait(
+                            timeout=persist_retry_delay(
+                                failures,
+                                _PERSIST_RETRY_DELAYS,
+                            )
+                        )
+                    continue
+                except BaseException as exc:
+                    _log_exception_best_effort("persist_history", exc)
                     return
-                generation = self._persist_generation
-            try:
-                with self._history_write_lock:
-                    with self._lock:
-                        snapshot = [
-                            self._records[run_id].to_public_dict()
-                            for run_id in self._order
-                            if run_id in self._records
-                        ]
-                    _atomic_write_json(self.history_path, snapshot)
-            except OSError as exc:
-                debug_logger.log_exception("ToolRunnerService", "persist_history", exc)
+                with self._lock:
+                    if (
+                        self._closed
+                        or self._persisted_generation >= self._persist_generation
+                    ):
+                        return
+                attempt_generation = None
+        finally:
             with self._lock:
-                if self._closed or generation == self._persist_generation:
-                    self._persist_running = False
-                    return
+                retry = (
+                    not self._closed
+                    and generation is not None
+                    and self._persist_generation > generation
+                )
+                self._persist_running = False
+            if retry:
+                self._schedule_persist(mark_dirty=False)
 
     def _persist_history_now(self, *, timeout: float | None = None) -> bool:
         acquired = (
@@ -1022,18 +1207,34 @@ class ToolRunnerService:
             return False
         try:
             with self._lock:
+                generation = self._persist_generation
+                if self._persisted_generation >= generation:
+                    return True
                 snapshot = [
                     self._records[run_id].to_public_dict()
                     for run_id in self._order
                     if run_id in self._records
                 ]
-            _atomic_write_json(self.history_path, snapshot)
-        except OSError as exc:
-            debug_logger.log_exception("ToolRunnerService", "persist_history.shutdown", exc)
+            snapshot = bounded_history_snapshot(
+                snapshot,
+                max_bytes=MAX_HISTORY_BYTES,
+            )
+            _atomic_write_json(
+                self.history_path,
+                snapshot,
+                cache_root=self._history_cache_root,
+            )
+            with self._lock:
+                self._persisted_generation = max(
+                    self._persisted_generation,
+                    generation,
+                )
+                return self._persisted_generation >= self._persist_generation
+        except BaseException as exc:
+            _log_exception_best_effort("persist_history.shutdown", exc)
             return False
         finally:
             self._history_write_lock.release()
-        return True
 
     def _ensure_shutdown_persist_thread(self) -> threading.Thread:
         with self._lock:
@@ -1056,12 +1257,8 @@ class ToolRunnerService:
     def _persist_shutdown_snapshot(self) -> None:
         try:
             result = self._persist_history_now()
-        except Exception as exc:
-            debug_logger.log_exception(
-                "ToolRunnerService",
-                "persist_history.shutdown_worker",
-                exc,
-            )
+        except BaseException as exc:
+            _log_exception_best_effort("persist_history.shutdown_worker", exc)
             result = False
         with self._lock:
             self._shutdown_persist_result = result
@@ -1073,18 +1270,21 @@ class ToolRunnerService:
         *,
         phase: str,
     ) -> None:
-        debug_logger.log(
-            component="ToolRunnerService",
-            action="shutdown_timeout",
-            level="WARN",
-            message="Tool runtime exceeded the bounded shutdown window",
-            status_code="TOOL_SHUTDOWN_TIMEOUT",
-            details={
-                "active_run_ids": list(active_run_ids),
-                "timeout": timeout,
-                "phase": phase,
-            },
-        )
+        try:
+            debug_logger.log(
+                component="ToolRunnerService",
+                action="shutdown_timeout",
+                level="WARN",
+                message="Tool runtime exceeded the bounded shutdown window",
+                status_code="TOOL_SHUTDOWN_TIMEOUT",
+                details={
+                    "active_run_ids": list(active_run_ids),
+                    "timeout": timeout,
+                    "phase": phase,
+                },
+            )
+        except BaseException:
+            pass
 
 
 def _normalize_validation(value: Any, parameters: Mapping[str, Any]) -> ToolValidationResult:
@@ -1166,30 +1366,34 @@ def _owner_mismatch_payload(run_id: str) -> dict[str, Any]:
     }
 
 
-def _normalize_result(value: Any) -> ToolRunResult:
-    if isinstance(value, ToolRunResult):
-        return value
-    if value is None:
-        return ToolRunResult.success("tool run completed")
-    if isinstance(value, Mapping):
-        status = str(value.get("status") or "succeeded").strip().lower()
-        if status in {"error", "failed", ToolRunStatus.FAILED.value}:
-            return ToolRunResult.failure(str(value.get("message") or "tool run failed"), data=dict(value.get("data") or {}))
-        if status in {"cancelled", "canceled"}:
-            return ToolRunResult.cancelled(str(value.get("message") or "tool run cancelled"))
-        return ToolRunResult.success(
-            str(value.get("message") or "tool run completed"),
-            data=dict(value.get("data") or value),
-            output_paths=tuple(str(path) for path in value.get("output_paths", ()) or ()),
-            warnings=tuple(str(item) for item in value.get("warnings", ()) or ()),
-        )
-    return ToolRunResult.success("tool run completed", data={"value": _json_value(value)})
+def _preflight_error_payload(
+    tool_id: str,
+    *,
+    code: str,
+    message: str,
+) -> dict[str, Any]:
+    return {
+        "status": "error",
+        "valid": False,
+        "code": code,
+        "message": message,
+        "errors": [message],
+        "tool_id": tool_id,
+    }
+
+
+def _log_exception_best_effort(action: str, exc: BaseException) -> None:
+    try:
+        debug_logger.log_exception("ToolRunnerService", action, exc)
+    except BaseException:
+        pass
 
 
 def _record_from_dict(value: Any) -> _RunRecord | None:
     if not isinstance(value, Mapping):
         return None
     try:
+        value = project_history_record(value)
         run_id = str(value["run_id"]).strip()
         tool_id = str(value["tool_id"]).strip()
         host_surface = value.get("host_surface")
@@ -1231,8 +1435,8 @@ def _record_from_dict(value: Any) -> _RunRecord | None:
             record.result = ToolRunResult(
                 result_status,
                 str(result.get("message") or ""),
-                dict(result.get("data") or {}),
-                tuple(str(path) for path in result.get("output_paths", ()) or ()),
+                {},
+                (),
                 tuple(str(item) for item in result.get("warnings", ()) or ()),
             )
         return record
@@ -1266,39 +1470,6 @@ def _profile_identity_error(
     }
 
 
-def _redact_parameters(
-    parameters: Mapping[str, Any],
-    *,
-    sensitive_fields: tuple[str, ...] = (),
-) -> dict[str, Any]:
-    sensitive = ("token", "secret", "password", "cookie", "authorization", "proxy_auth")
-    explicit = {str(key).casefold() for key in sensitive_fields}
-    result: dict[str, Any] = {}
-    for key, value in parameters.items():
-        normalized = str(key).casefold()
-        result[str(key)] = (
-            "[redacted]"
-            if normalized in explicit or any(marker in normalized for marker in sensitive)
-            else _json_value(value)
-        )
-    return result
-
-
-def _public_validation_payload(
-    payload: Mapping[str, Any],
-    *,
-    tool_id: str,
-) -> dict[str, Any]:
-    public_payload = dict(payload)
-    parameters = payload.get("parameters")
-    if isinstance(parameters, Mapping):
-        public_payload["parameters"] = _redact_parameters(
-            parameters,
-            sensitive_fields=("text",) if tool_id == "link_parser" else (),
-        )
-    return public_payload
-
-
 def _coerce_run_status(value: Any) -> ToolRunStatus:
     normalized = str(value or "").strip().lower()
     aliases = {
@@ -1315,33 +1486,9 @@ def _coerce_run_status(value: Any) -> ToolRunStatus:
         return ToolRunStatus.FAILED
 
 
-def _json_value(value: Any) -> Any:
-    if isinstance(value, Mapping):
-        return {str(key): _json_value(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple, set, frozenset)):
-        return [_json_value(item) for item in value]
-    if isinstance(value, Path):
-        return str(value)
-    if value is None or isinstance(value, (str, int, float, bool)):
-        return value
-    return str(value)
-
-
-def _atomic_write_json(path: Path, value: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
-            json.dump(value, handle, ensure_ascii=False, indent=2)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temp_name, path)
-    except BaseException:
-        try:
-            os.unlink(temp_name)
-        except OSError:
-            pass
-        raise
+def _atomic_write_json(path: Path, value: Any, *, cache_root: Path | None = None) -> None:
+    root = Path(cache_root) if cache_root is not None else Path(user_cache_root())
+    _storage_atomic_write_json(Path(path), value, cache_root=root, max_bytes=MAX_HISTORY_BYTES)
 
 
 __all__ = ["ToolRunnerService"]

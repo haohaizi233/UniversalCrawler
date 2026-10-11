@@ -23,6 +23,7 @@ from PyQt6.QtWidgets import (
 
 from app.services.icon_registry import ui_icon_path
 from app.ui.components.settings_controls import SettingsComboBox, UiSwitch
+from app.ui.pages.toolbox_link_candidates import LinkCandidatePanel
 from app.ui.pages.toolbox_models import (
     action_enabled,
     freeze_display,
@@ -122,7 +123,7 @@ class ToolParameterEditor(QWidget):
         layout.addLayout(actions)
         self.set_language()
 
-    def set_language(self) -> None:
+    def set_language(self, _language: str | None = None) -> None:
         self.title.setText(self._translate("工具参数"))
         self.validate_button.setText(self._translate("验证参数"))
         self.start_button.setText(self._translate("开始"))
@@ -210,6 +211,7 @@ class ToolExecutionPanel(QWidget):
     """Reusable execution progress and result surface."""
 
     open_result_requested = pyqtSignal()
+    candidate_confirm_requested = pyqtSignal(object)
 
     def __init__(self, translate: Callable[[object], str], parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -237,6 +239,11 @@ class ToolExecutionPanel(QWidget):
         self.result_view.setObjectName("ToolboxResultView")
         self.result_view.setReadOnly(True)
         layout.addWidget(self.result_view, 1)
+        self.candidate_panel = LinkCandidatePanel(translate, self)
+        self.candidate_panel.confirm_requested.connect(
+            self.candidate_confirm_requested.emit
+        )
+        layout.addWidget(self.candidate_panel)
         self.open_result_button = QPushButton()
         self.open_result_button.setObjectName("ToolboxOpenResultButton")
         set_button_icon(self.open_result_button, "action_open_directory.png")
@@ -244,9 +251,11 @@ class ToolExecutionPanel(QWidget):
         layout.addWidget(self.open_result_button, 0, Qt.AlignmentFlag.AlignRight)
         self.set_language()
 
-    def set_language(self) -> None:
+    def set_language(self, language: str | None = None) -> None:
         self.title.setText(self._translate("执行状态"))
         self.open_result_button.setText(self._translate("打开结果"))
+
+        self.candidate_panel.set_language(language)
 
     def render(self, projection: Mapping[str, Any], has_tool: bool) -> None:
         phase = phase_for(projection)
@@ -278,8 +287,37 @@ class ToolExecutionPanel(QWidget):
         self.progress_label.setVisible(bool(text))
         lines = result_lines(projection.get("result"), self._translate)
         self.result_view.setPlainText("\n".join(lines) if lines else self._translate("暂无结果"))
+        self.candidate_panel.render(projection)
         default = has_tool and bool(projection.get("result")) and phase in {"success", "completed"}
         self.open_result_button.setEnabled(action_enabled(projection, "tool_open_result", default))
+
+    def apply_action_result(
+        self,
+        action: str,
+        payload: Mapping[str, Any],
+        action_result: Mapping[str, Any],
+        *,
+        sequence: int | None = None,
+    ) -> None:
+        self.candidate_panel.apply_action_result(
+            action,
+            payload,
+            action_result,
+            sequence=sequence,
+        )
+
+    def bind_action_request(
+        self,
+        action: str,
+        payload: Mapping[str, Any],
+        *,
+        sequence: int,
+    ) -> None:
+        self.candidate_panel.bind_action_request(
+            action,
+            payload,
+            sequence=sequence,
+        )
 
 
 class ToolHistoryPanel(QWidget):
@@ -307,7 +345,7 @@ class ToolHistoryPanel(QWidget):
         layout.addWidget(self.clear_button, 0, Qt.AlignmentFlag.AlignRight)
         self.set_language()
 
-    def set_language(self) -> None:
+    def set_language(self, _language: str | None = None) -> None:
         self.title.setText(self._translate("最近使用"))
         self.clear_button.setText(self._translate("清空历史"))
 

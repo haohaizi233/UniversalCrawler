@@ -9,6 +9,9 @@ from urllib.parse import urlsplit
 
 import pytest
 
+from app.core.tools.link_candidate_admission_policy import (
+    link_candidate_admission_capability,
+)
 from app.services.tool_runner_service import PrivateToolResult
 from shared.execution_profile import ExecutionProfile, local_execution_profile
 
@@ -57,6 +60,66 @@ class _Runner:
         return True
 
 
+class _InterruptingClaimRunner(_Runner):
+    def __init__(
+        self,
+        result: PrivateToolResult | None,
+        interruption: BaseException,
+    ) -> None:
+        super().__init__(result)
+        self.interruption = interruption
+
+    def _claim_private_candidates(
+        self,
+        run_id: str,
+        candidate_ids: Sequence[str],
+        *,
+        execution_profile: ExecutionProfile,
+    ) -> bool:
+        super()._claim_private_candidates(
+            run_id,
+            candidate_ids,
+            execution_profile=execution_profile,
+        )
+        raise self.interruption
+
+
+class _FailBeforeClaimRunner(_Runner):
+    def __init__(
+        self,
+        result: PrivateToolResult | None,
+        failure: Exception,
+    ) -> None:
+        super().__init__(result)
+        self.failure = failure
+
+    def _claim_private_candidates(
+        self,
+        run_id: str,
+        candidate_ids: Sequence[str],
+        *,
+        execution_profile: ExecutionProfile,
+    ) -> bool:
+        del run_id, candidate_ids, execution_profile
+        raise self.failure
+
+
+class _NonBooleanClaimRunner(_Runner):
+    def __init__(self, result: PrivateToolResult | None, claimed: Any) -> None:
+        super().__init__(result)
+        self.claimed = claimed
+
+    def _claim_private_candidates(
+        self,
+        run_id: str,
+        candidate_ids: Sequence[str],
+        *,
+        execution_profile: ExecutionProfile,
+    ) -> bool:
+        del run_id, candidate_ids, execution_profile
+        return self.claimed
+
+
 class _BatchDownloadManager:
     def __init__(self, *, accepted_count: Any = None) -> None:
         self.accepted_count = accepted_count
@@ -66,11 +129,14 @@ class _BatchDownloadManager:
         self.raise_on_cancel = False
         self.cancel_status = "cancelled"
         self.add_error_message = "private queue failure"
+        self.add_error: BaseException | None = None
 
     def add_tasks(self, videos: Sequence[Any], save_dir: str) -> Any:
         batch = tuple(videos)
         self.add_calls.append((batch, save_dir))
         if self.raise_on_add:
+            if self.add_error is not None:
+                raise self.add_error
             raise RuntimeError(self.add_error_message)
         if self.accepted_count is None:
             return len(batch)
@@ -87,6 +153,68 @@ class _BatchDownloadManager:
         if self.raise_on_cancel:
             raise RuntimeError("private rollback failure")
         return {video_id: self.cancel_status for video_id in normalized}
+
+
+class _InterruptingAddDownloadManager(_BatchDownloadManager):
+    def __init__(self, interruption: BaseException) -> None:
+        super().__init__()
+        self.interruption = interruption
+
+    def add_tasks(self, videos: Sequence[Any], save_dir: str) -> Any:
+        super().add_tasks(videos, save_dir)
+        raise self.interruption
+
+
+class _InterruptingAddAndCancelDownloadManager(_InterruptingAddDownloadManager):
+    def __init__(
+        self,
+        add_interruption: BaseException,
+        cancel_interruption: BaseException,
+    ) -> None:
+        super().__init__(add_interruption)
+        self.cancel_interruption = cancel_interruption
+
+    def cancel_videos_and_wait(
+        self,
+        videos: Sequence[Any],
+        timeout_ms: int | None = None,
+    ) -> dict[str, str | None]:
+        super().cancel_videos_and_wait(videos, timeout_ms=timeout_ms)
+        raise self.cancel_interruption
+
+
+class _HostileRollbackMapping(Mapping[str, str]):
+    def __init__(
+        self,
+        values: Mapping[str, str],
+        *,
+        fail_on: str,
+        failure: BaseException,
+    ) -> None:
+        self._values = dict(values)
+        self._fail_on = fail_on
+        self._failure = failure
+
+    def __iter__(self):
+        if self._fail_on == "iter":
+            raise self._failure
+        return iter(self._values)
+
+    def __len__(self) -> int:
+        return len(self._values)
+
+    def __getitem__(self, key: str) -> str:
+        return self._values[key]
+
+    def get(self, key: str, default: Any = None) -> Any:
+        if self._fail_on == "get":
+            raise self._failure
+        return self._values.get(key, default)
+
+
+class _UnprintableRollbackFailure(RuntimeError):
+    def __str__(self) -> str:
+        raise AssertionError("rollback failure must not be stringified")
 
 
 class _WaitFailureDownloadManager:
@@ -184,6 +312,11 @@ def _candidate(
         inferred_format = "HLS"
     elif resource_kind == "media":
         inferred_format = Path(parts.path).suffix.lstrip(".").upper()
+    admission = link_candidate_admission_capability(
+        private_url,
+        platform=platform,
+        resource_kind=resource_kind,
+    )
     return {
         "candidate_id": candidate_id
         or hashlib.sha256(private_url.encode("utf-8")).hexdigest(),
@@ -194,6 +327,8 @@ def _candidate(
         "resource_kind": resource_kind,
         "format_hint": format_hint or inferred_format,
         "expanded": False,
+        "admittable": admission.admittable,
+        "admission_reason_code": admission.reason_code,
     }
 
 
@@ -823,13 +958,10 @@ def test_admission_rejects_a_stringified_queue_count_and_rolls_back(
     assert manager.cancel_calls == [(admitted_item.id,)]
 
 
-def test_admission_drops_sensitive_queue_exception_context_after_rollback(
+def test_admission_preserves_queue_exception_identity_after_rollback(
     tmp_path: Path,
 ) -> None:
-    from app.services.link_candidate_admission_service import (
-        LinkCandidateAdmissionError,
-        LinkCandidateAdmissionService,
-    )
+    from app.services.link_candidate_admission_service import LinkCandidateAdmissionService
 
     secret = "PRIVATE_SENTINEL"
     candidate = _candidate(
@@ -840,7 +972,10 @@ def test_admission_drops_sensitive_queue_exception_context_after_rollback(
     manager.raise_on_add = True
     manager.add_error_message = f"queue rejected {candidate['private_url']}"
 
-    with pytest.raises(LinkCandidateAdmissionError) as caught:
+    primary = RuntimeError(f"queue rejected {candidate['private_url']}")
+    manager.add_error = primary
+
+    with pytest.raises(RuntimeError) as caught:
         service.admit_to_queue(
             "link_parser",
             "run-link-parser",
@@ -850,19 +985,14 @@ def test_admission_drops_sensitive_queue_exception_context_after_rollback(
             save_directory=tmp_path,
         )
 
-    assert caught.value.code == "queue_batch_rejected"
-    assert caught.value.__cause__ is None
-    assert caught.value.__context__ is None
-    assert secret not in repr(caught.value)
+    assert caught.value is primary
+    assert len(manager.cancel_calls) == 1
 
 
-def test_admission_reports_rollback_failure_without_private_queue_details(
+def test_admission_preserves_queue_exception_when_rollback_fails(
     tmp_path: Path,
 ) -> None:
-    from app.services.link_candidate_admission_service import (
-        LinkCandidateAdmissionError,
-        LinkCandidateAdmissionService,
-    )
+    from app.services.link_candidate_admission_service import LinkCandidateAdmissionService
 
     candidate = _candidate("https://www.bilibili.com/media/one.mp4")
     service = LinkCandidateAdmissionService(_Runner(_private_result([candidate])))
@@ -870,7 +1000,10 @@ def test_admission_reports_rollback_failure_without_private_queue_details(
     manager.raise_on_add = True
     manager.raise_on_cancel = True
 
-    with pytest.raises(LinkCandidateAdmissionError) as caught:
+    primary = RuntimeError("private queue failure")
+    manager.add_error = primary
+
+    with pytest.raises(RuntimeError) as caught:
         service.admit_to_queue(
             "link_parser",
             "run-link-parser",
@@ -880,8 +1013,7 @@ def test_admission_reports_rollback_failure_without_private_queue_details(
             save_directory=tmp_path,
         )
 
-    assert caught.value.code == "queue_rollback_failed"
-    assert "private" not in str(caught.value)
+    assert caught.value is primary
     assert len(manager.add_calls) == 1
     assert len(manager.cancel_calls) == 1
 
@@ -954,3 +1086,332 @@ def test_admission_keeps_claim_when_worker_wait_raises(tmp_path: Path) -> None:
     assert caught.value.code == "queue_rollback_failed"
     assert ("run-link-parser", candidate["candidate_id"]) in runner.claimed_candidates
     assert manager.add_calls == 1
+
+
+def test_claim_interruption_keeps_ambiguous_claim_and_rethrows_exact_primary(
+    tmp_path: Path,
+) -> None:
+    from app.services.link_candidate_admission_service import (
+        LinkCandidateAdmissionService,
+    )
+
+    candidate = _candidate("https://www.bilibili.com/media/one.mp4")
+    primary = KeyboardInterrupt("claim interrupted")
+    runner = _InterruptingClaimRunner(_private_result([candidate]), primary)
+    manager = _BatchDownloadManager()
+
+    with pytest.raises(KeyboardInterrupt) as caught:
+        LinkCandidateAdmissionService(runner).admit_to_queue(
+            "link_parser",
+            "run-link-parser",
+            [candidate["candidate_id"]],
+            execution_profile=_profile(tmp_path),
+            download_manager=manager,
+            save_directory=tmp_path,
+    )
+
+    assert caught.value is primary
+    assert runner.claimed_candidates == {
+        ("run-link-parser", candidate["candidate_id"]),
+    }
+    assert manager.add_calls == []
+
+
+def test_claim_failure_cannot_release_a_preexisting_reservation(
+    tmp_path: Path,
+) -> None:
+    from app.services.link_candidate_admission_service import (
+        LinkCandidateAdmissionError,
+        LinkCandidateAdmissionService,
+    )
+
+    candidate = _candidate("https://www.bilibili.com/media/one.mp4")
+    reservation = ("run-link-parser", candidate["candidate_id"])
+    runner = _FailBeforeClaimRunner(
+        _private_result([candidate]),
+        RuntimeError("private claim lookup failed"),
+    )
+    runner.claimed_candidates.add(reservation)
+    manager = _BatchDownloadManager()
+
+    with pytest.raises(LinkCandidateAdmissionError) as caught:
+        LinkCandidateAdmissionService(runner).admit_to_queue(
+            "link_parser",
+            "run-link-parser",
+            [candidate["candidate_id"]],
+            execution_profile=_profile(tmp_path),
+            download_manager=manager,
+            save_directory=tmp_path,
+        )
+
+    assert caught.value.code == "candidate_claim_failed"
+    assert "private" not in str(caught.value)
+    assert runner.claimed_candidates == {reservation}
+    assert manager.add_calls == []
+
+
+@pytest.mark.parametrize("claimed", [1, "claimed", object()])
+def test_non_boolean_claim_result_fails_closed_without_queue_or_release(
+    tmp_path: Path,
+    claimed: Any,
+) -> None:
+    from app.services.link_candidate_admission_service import (
+        LinkCandidateAdmissionError,
+        LinkCandidateAdmissionService,
+    )
+
+    candidate = _candidate("https://www.bilibili.com/media/one.mp4")
+    reservation = ("run-link-parser", candidate["candidate_id"])
+    runner = _NonBooleanClaimRunner(_private_result([candidate]), claimed)
+    runner.claimed_candidates.add(reservation)
+    manager = _BatchDownloadManager()
+
+    with pytest.raises(LinkCandidateAdmissionError) as caught:
+        LinkCandidateAdmissionService(runner).admit_to_queue(
+            "link_parser",
+            "run-link-parser",
+            [candidate["candidate_id"]],
+            execution_profile=_profile(tmp_path),
+            download_manager=manager,
+            save_directory=tmp_path,
+        )
+
+    assert caught.value.code == "candidate_claim_failed"
+    assert runner.claimed_candidates == {reservation}
+    assert manager.add_calls == []
+
+
+def test_add_interruption_rolls_back_and_rethrows_exact_primary(
+    tmp_path: Path,
+) -> None:
+    from app.services.link_candidate_admission_service import (
+        LinkCandidateAdmissionService,
+    )
+
+    candidate = _candidate("https://www.bilibili.com/media/one.mp4")
+    primary = SystemExit("queue interrupted")
+    runner = _Runner(_private_result([candidate]))
+    manager = _InterruptingAddDownloadManager(primary)
+
+    with pytest.raises(SystemExit) as caught:
+        LinkCandidateAdmissionService(runner).admit_to_queue(
+            "link_parser",
+            "run-link-parser",
+            [candidate["candidate_id"]],
+            execution_profile=_profile(tmp_path),
+            download_manager=manager,
+            save_directory=tmp_path,
+        )
+
+    assert caught.value is primary
+    assert runner.claimed_candidates == set()
+    assert len(manager.cancel_calls) == 1
+
+
+def test_cancel_interruption_cannot_replace_add_interruption_primary(
+    tmp_path: Path,
+) -> None:
+    from app.services.link_candidate_admission_service import (
+        LinkCandidateAdmissionService,
+    )
+
+    candidate = _candidate("https://www.bilibili.com/media/one.mp4")
+    primary = KeyboardInterrupt("queue interrupted")
+    cleanup = SystemExit("cancel interrupted")
+    runner = _Runner(_private_result([candidate]))
+    manager = _InterruptingAddAndCancelDownloadManager(primary, cleanup)
+
+    with pytest.raises(KeyboardInterrupt) as caught:
+        LinkCandidateAdmissionService(runner).admit_to_queue(
+            "link_parser",
+            "run-link-parser",
+            [candidate["candidate_id"]],
+            execution_profile=_profile(tmp_path),
+            download_manager=manager,
+            save_directory=tmp_path,
+        )
+
+    assert caught.value is primary
+    assert ("run-link-parser", candidate["candidate_id"]) in runner.claimed_candidates
+    assert len(manager.cancel_calls) == 1
+
+
+def test_cancel_interruption_during_count_rollback_is_domainized(
+    tmp_path: Path,
+) -> None:
+    from app.services.link_candidate_admission_service import (
+        LinkCandidateAdmissionError,
+        LinkCandidateAdmissionService,
+    )
+
+    candidate = _candidate("https://www.bilibili.com/media/one.mp4")
+    runner = _Runner(_private_result([candidate]))
+    manager = _BatchDownloadManager(accepted_count=0)
+    cleanup = KeyboardInterrupt("private cleanup detail")
+
+    def interrupt_cancel(
+        videos: Sequence[Any],
+        timeout_ms: int | None = None,
+    ) -> dict[str, str | None]:
+        del timeout_ms
+        manager.cancel_calls.append(tuple(item.id for item in videos))
+        raise cleanup
+
+    manager.cancel_videos_and_wait = interrupt_cancel  # type: ignore[method-assign]
+
+    with pytest.raises(LinkCandidateAdmissionError) as caught:
+        LinkCandidateAdmissionService(runner).admit_to_queue(
+            "link_parser",
+            "run-link-parser",
+            [candidate["candidate_id"]],
+            execution_profile=_profile(tmp_path),
+            download_manager=manager,
+            save_directory=tmp_path,
+        )
+
+    assert caught.value.code == "queue_rollback_failed"
+    assert "private cleanup detail" not in str(caught.value)
+    assert ("run-link-parser", candidate["candidate_id"]) in runner.claimed_candidates
+
+
+@pytest.mark.parametrize(
+    ("fail_on", "failure"),
+    (
+        ("iter", KeyboardInterrupt("rollback mapping iteration interrupted")),
+        ("get", _UnprintableRollbackFailure("private rollback detail")),
+    ),
+)
+def test_hostile_rollback_mapping_is_domainized_and_keeps_claim(
+    tmp_path: Path,
+    fail_on: str,
+    failure: BaseException,
+) -> None:
+    from app.services.link_candidate_admission_service import (
+        LinkCandidateAdmissionError,
+        LinkCandidateAdmissionService,
+    )
+
+    candidate = _candidate("https://www.bilibili.com/media/one.mp4")
+    runner = _Runner(_private_result([candidate]))
+    manager = _BatchDownloadManager(accepted_count=0)
+
+    def hostile_cancel(
+        videos: Sequence[Any],
+        timeout_ms: int | None = None,
+    ) -> Mapping[str, str]:
+        del timeout_ms
+        video_ids = tuple(item.id for item in videos)
+        manager.cancel_calls.append(video_ids)
+        return _HostileRollbackMapping(
+            {video_id: "cancelled" for video_id in video_ids},
+            fail_on=fail_on,
+            failure=failure,
+        )
+
+    manager.cancel_videos_and_wait = hostile_cancel  # type: ignore[method-assign]
+
+    with pytest.raises(LinkCandidateAdmissionError) as caught:
+        LinkCandidateAdmissionService(runner).admit_to_queue(
+            "link_parser",
+            "run-link-parser",
+            [candidate["candidate_id"]],
+            execution_profile=_profile(tmp_path),
+            download_manager=manager,
+            save_directory=tmp_path,
+        )
+
+    assert caught.value.code == "queue_rollback_failed"
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    assert ("run-link-parser", candidate["candidate_id"]) in runner.claimed_candidates
+    assert len(manager.cancel_calls) == 1
+
+
+@pytest.mark.parametrize("fail_on", ("iter", "get"))
+def test_hostile_rollback_mapping_cannot_replace_add_control_flow_primary(
+    tmp_path: Path,
+    fail_on: str,
+) -> None:
+    from app.services.link_candidate_admission_service import (
+        LinkCandidateAdmissionService,
+    )
+
+    candidate = _candidate("https://www.bilibili.com/media/one.mp4")
+    primary = SystemExit("queue interrupted")
+    secondary = KeyboardInterrupt("rollback mapping interrupted")
+    runner = _Runner(_private_result([candidate]))
+    manager = _InterruptingAddDownloadManager(primary)
+
+    def hostile_cancel(
+        videos: Sequence[Any],
+        timeout_ms: int | None = None,
+    ) -> Mapping[str, str]:
+        del timeout_ms
+        video_ids = tuple(item.id for item in videos)
+        manager.cancel_calls.append(video_ids)
+        return _HostileRollbackMapping(
+            {video_id: "cancelled" for video_id in video_ids},
+            fail_on=fail_on,
+            failure=secondary,
+        )
+
+    manager.cancel_videos_and_wait = hostile_cancel  # type: ignore[method-assign]
+
+    with pytest.raises(SystemExit) as caught:
+        LinkCandidateAdmissionService(runner).admit_to_queue(
+            "link_parser",
+            "run-link-parser",
+            [candidate["candidate_id"]],
+            execution_profile=_profile(tmp_path),
+            download_manager=manager,
+            save_directory=tmp_path,
+        )
+
+    assert caught.value is primary
+    assert ("run-link-parser", candidate["candidate_id"]) in runner.claimed_candidates
+    assert len(manager.cancel_calls) == 1
+
+
+@pytest.mark.parametrize("fail_on", ("iter", "get"))
+def test_hostile_rollback_mapping_cannot_replace_add_exception_primary(
+    tmp_path: Path,
+    fail_on: str,
+) -> None:
+    from app.services.link_candidate_admission_service import (
+        LinkCandidateAdmissionService,
+    )
+
+    candidate = _candidate("https://www.bilibili.com/media/one.mp4")
+    primary = RuntimeError("queue rejected the batch")
+    secondary = KeyboardInterrupt("rollback mapping interrupted")
+    runner = _Runner(_private_result([candidate]))
+    manager = _InterruptingAddDownloadManager(primary)
+
+    def hostile_cancel(
+        videos: Sequence[Any],
+        timeout_ms: int | None = None,
+    ) -> Mapping[str, str]:
+        del timeout_ms
+        video_ids = tuple(item.id for item in videos)
+        manager.cancel_calls.append(video_ids)
+        return _HostileRollbackMapping(
+            {video_id: "cancelled" for video_id in video_ids},
+            fail_on=fail_on,
+            failure=secondary,
+        )
+
+    manager.cancel_videos_and_wait = hostile_cancel  # type: ignore[method-assign]
+
+    with pytest.raises(RuntimeError) as caught:
+        LinkCandidateAdmissionService(runner).admit_to_queue(
+            "link_parser",
+            "run-link-parser",
+            [candidate["candidate_id"]],
+            execution_profile=_profile(tmp_path),
+            download_manager=manager,
+            save_directory=tmp_path,
+        )
+
+    assert caught.value is primary
+    assert ("run-link-parser", candidate["candidate_id"]) in runner.claimed_candidates
+    assert len(manager.cancel_calls) == 1

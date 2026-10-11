@@ -26,6 +26,7 @@ class FrontendToolboxStateMixin:
     """Keep toolbox behavior independent from the broader frontend state service."""
 
     _TOOL_RESULT_MAX_ROWS = 64
+    _TOOL_RESULT_MAX_SOURCE_ROWS = 512
     _TOOL_RESULT_MAX_STRING_LENGTH = 256
     _TOOL_RESULT_MAX_TOTAL_TEXT = 16_384
     _TOOL_RESULT_MAX_WARNINGS = 16
@@ -390,22 +391,30 @@ class FrontendToolboxStateMixin:
             return [], False
 
         rows: list[dict[str, Any]] = []
+        seen_candidate_ids: set[str] = set()
         remaining_budget = max(0, int(text_budget))
         truncated = False
         for index, item in enumerate(links):
-            if index >= self._TOOL_RESULT_MAX_ROWS:
+            if index >= self._TOOL_RESULT_MAX_SOURCE_ROWS:
                 truncated = True
                 break
             row, row_truncated = self._project_link_parser_row(item)
             truncated = truncated or row_truncated
             if row is None:
                 continue
+            candidate_id = row["candidate_id"]
+            if candidate_id in seen_candidate_ids:
+                continue
+            if len(rows) >= self._TOOL_RESULT_MAX_ROWS:
+                truncated = True
+                break
             row_text_size = sum(
                 len(value) for value in row.values() if isinstance(value, str)
             )
             if row_text_size > remaining_budget:
                 truncated = True
                 break
+            seen_candidate_ids.add(candidate_id)
             rows.append(row)
             remaining_budget -= row_text_size
         return rows, truncated
@@ -422,6 +431,8 @@ class FrontendToolboxStateMixin:
         resource_kind = item.get("resource_kind")
         format_hint = item.get("format_hint")
         expanded = item.get("expanded")
+        admittable = item.get("admittable")
+        admission_reason_code = item.get("admission_reason_code")
         if (
             not self._is_safe_candidate_id(candidate_id)
             or not self._is_safe_display_url(display_url)
@@ -430,6 +441,14 @@ class FrontendToolboxStateMixin:
             or not isinstance(format_hint, str)
             or format_hint not in LINK_FORMAT_HINTS
             or type(expanded) is not bool
+            or type(admittable) is not bool
+            or not isinstance(admission_reason_code, str)
+            or len(admission_reason_code) > 80
+            or any(
+                ord(character) < 32 or ord(character) == 127
+                for character in admission_reason_code
+            )
+            or admittable == bool(admission_reason_code)
         ):
             return None, False
 
@@ -449,6 +468,8 @@ class FrontendToolboxStateMixin:
                 "resource_kind": bounded_kind,
                 "format_hint": bounded_format,
                 "expanded": expanded,
+                "admittable": admittable,
+                "admission_reason_code": admission_reason_code,
             },
             (
                 platform_truncated
@@ -591,6 +612,17 @@ class FrontendToolboxStateMixin:
         )
         run_id = str(record.get("run_id") or "")
         cancellable = bool(item.get("cancellable", item.get("supports_cancel", True)))
+        result_rows = result.get("rows") if isinstance(result, Mapping) else ()
+        can_admit_candidates = (
+            normalized_tool_id == "link_parser"
+            and state in {"success", "completed"}
+            and isinstance(result_rows, Sequence)
+            and any(
+                isinstance(row, Mapping)
+                and row.get("admittable") is True
+                for row in result_rows
+            )
+        )
         history_snapshot = (
             list(history)
             if history is not None
@@ -627,11 +659,16 @@ class FrontendToolboxStateMixin:
                 "tool_open_result": execution_enabled
                 and has_private_output,
                 "tool_clear_history": execution_enabled and bool(history_snapshot),
+                "tool_admit_candidates": execution_enabled and can_admit_candidates,
             },
             "action_payloads": {
                 "tool_cancel": {"tool_id": normalized_tool_id, "run_id": run_id},
                 "tool_open_result": {"tool_id": normalized_tool_id, "result_id": run_id},
                 "tool_clear_history": {"tool_id": normalized_tool_id},
+                "tool_admit_candidates": {
+                    "tool_id": normalized_tool_id,
+                    "run_id": run_id,
+                },
             },
         }
 

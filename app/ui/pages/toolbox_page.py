@@ -157,6 +157,9 @@ class ToolboxPage(PageFrame):
         self.parameter_editor.start_requested.connect(self._emit_start)
         self.parameter_editor.cancel_requested.connect(lambda: self._emit_action("tool_cancel"))
         self.execution_panel.open_result_requested.connect(lambda: self._emit_action("tool_open_result"))
+        self.execution_panel.candidate_confirm_requested.connect(
+            self._emit_candidate_admission
+        )
         self.history_panel.clear_requested.connect(lambda: self._emit_action("tool_clear_history"))
         self.tabs.addTab(self.parameter_editor, "参数")
         self.tabs.addTab(self.execution_panel, "结果")
@@ -180,6 +183,7 @@ class ToolboxPage(PageFrame):
         self.progress_label = self.execution_panel.progress_label
         self.result_view = self.execution_panel.result_view
         self.open_result_button = self.execution_panel.open_result_button
+        self.link_candidate_panel = self.execution_panel.candidate_panel
         self.recent_title = self.history_panel.title
         self.recent = self.history_panel.view
         self.clear_history_button = self.history_panel.clear_button
@@ -211,9 +215,9 @@ class ToolboxPage(PageFrame):
         self.subtitle_label.setText(self._t("高效实用的辅助工具，提升工作效率"))
         self.selector_title.setText(self._t("选择工具"))
         self.detail_title.setText(self._t("工具工作台"))
-        self.parameter_editor.set_language()
-        self.execution_panel.set_language()
-        self.history_panel.set_language()
+        self.parameter_editor.set_language(normalized)
+        self.execution_panel.set_language(normalized)
+        self.history_panel.set_language(normalized)
         self.tabs.setTabText(0, self._t("参数"))
         self.tabs.setTabText(1, self._t("结果"))
         self.tabs.setTabText(2, self._t("历史"))
@@ -353,6 +357,62 @@ class ToolboxPage(PageFrame):
         if not self.current_tool_id:
             return
         self._emit_action("tool_start")
+
+    def _emit_candidate_admission(self, request: object) -> None:
+        if not isinstance(request, tuple) or len(request) != 2:
+            return
+        raw_run_id, raw_candidate_ids = request
+        run_id = str(raw_run_id or "").strip()
+        if not isinstance(raw_candidate_ids, tuple):
+            return
+        candidate_ids = tuple(str(value) for value in raw_candidate_ids)
+        if (
+            not run_id
+            or not 0 < len(candidate_ids) <= 64
+            or len(set(candidate_ids)) != len(candidate_ids)
+            or any(
+                len(value) != 64
+                or any(character not in "0123456789abcdef" for character in value)
+                for value in candidate_ids
+            )
+        ):
+            return
+        self.action_requested.emit(
+            "tool_admit_candidates",
+            {
+                "tool_id": "link_parser",
+                "run_id": run_id,
+                "candidate_ids": list(candidate_ids),
+            },
+        )
+
+    def apply_action_result(
+        self,
+        action: str,
+        payload: Mapping[str, Any],
+        action_result: Mapping[str, Any],
+        *,
+        sequence: int | None = None,
+    ) -> None:
+        self.execution_panel.apply_action_result(
+            action,
+            payload,
+            action_result,
+            sequence=sequence,
+        )
+
+    def bind_action_request(
+        self,
+        action: str,
+        payload: Mapping[str, Any],
+        *,
+        sequence: int,
+    ) -> None:
+        self.execution_panel.bind_action_request(
+            action,
+            payload,
+            sequence=sequence,
+        )
 
     def _emit_current_tool(self) -> None:
         if self.current_tool_id:

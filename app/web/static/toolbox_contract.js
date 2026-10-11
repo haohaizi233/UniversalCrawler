@@ -4,11 +4,13 @@
   const ACTIONS = Object.freeze({
     validate: "tool_validate", start: "tool_start", cancel: "tool_cancel",
     openResult: "tool_open_result", clearHistory: "tool_clear_history",
+    admitCandidates: "tool_admit_candidates",
   });
   const ALIASES = Object.freeze({
     validate: ["validate", "tool_validate"], start: ["start", "run", "tool_start"],
     cancel: ["cancel", "tool_cancel"], openResult: ["openResult", "open_result", "tool_open_result"],
     clearHistory: ["clearHistory", "clear_history", "tool_clear_history"],
+    admitCandidates: ["admitCandidates", "admit_candidates", "tool_admit_candidates"],
   });
   const PROJECTION_KEYS = Object.freeze(["toolbox_display_projection", "toolbox_projection", "toolbox_display"]);
   const BATCH_KEYS = Object.freeze(["toolbox_display_batch", "toolbox_projection_batch", "toolbox_batch"]);
@@ -151,6 +153,16 @@
     if (["validate", "start"].includes(kind)) payload.parameters = { ...record(values) };
     if (kind === "cancel" && first(source.runId, source.run_id, source.execution_id)) payload.run_id = String(first(source.runId, source.run_id, source.execution_id));
     if (kind === "openResult" && first(source.resultId, source.result_id, record(source.result).id, record(source.result).result_id)) payload.result_id = String(first(source.resultId, source.result_id, record(source.result).id, record(source.result).result_id));
+    if (kind === "admitCandidates") {
+      payload.run_id = String(first(source.runId, source.run_id, ""));
+      const candidateIds = Array.isArray(source.candidateIds)
+        ? source.candidateIds
+        : (Array.isArray(source.candidate_ids) ? source.candidate_ids : []);
+      payload.candidate_ids = [...new Set(candidateIds
+        .map(value => String(value || ""))
+        .filter(value => /^[a-f0-9]{64}$/.test(value)))]
+        .slice(0, 64);
+    }
     return payload;
   }
   function actionEnabled(projection, action, fallback = false) {
@@ -160,6 +172,45 @@
   }
   function display(value) { if (value === undefined || value === null) return ""; if (["string", "number", "boolean"].includes(typeof value)) return String(value); return display(record(value).display_text || record(value).text); }
   function resultDisplayLines(result) { const source = record(result); const lines = []; const add = value => { if (value && !lines.includes(value)) lines.push(value); }; add(display(source.display_text)); add(display(source.summary)); (source.rows || source.detail_rows || []).forEach(row => { const item = record(row); const label = display(item.label || item.title); const value = display(item.value || item.display_value); add(label && value ? `${label}: ${value}` : display(row)); }); return lines; }
+  function linkCandidateState(projection, previous = {}) {
+    const source = record(projection); const prior = record(previous);
+    const runId = String(first(source.run_id, source.runId, source.execution_id, ""));
+    const rawRows = Array.isArray(record(source.result).rows) ? record(source.result).rows : [];
+    const rows = [];
+    const seenCandidateIds = new Set();
+    for (const rawRow of rawRows) {
+      const row = record(rawRow); const candidateId = String(first(row.candidate_id, row.id, ""));
+      const resourceKind = String(first(row.resource_kind, row.kind, "")).toLowerCase();
+      const admittable = row.admittable;
+      const admissionReasonCode = typeof row.admission_reason_code === "string" ? row.admission_reason_code : null;
+      if (!/^[a-f0-9]{64}$/.test(candidateId) || !["page", "media", "playlist"].includes(resourceKind) || typeof admittable !== "boolean" || admissionReasonCode === null || admissionReasonCode.length > 80 || /[\u0000-\u001f\u007f]/.test(admissionReasonCode) || admittable === !!admissionReasonCode || seenCandidateIds.has(candidateId)) continue;
+      seenCandidateIds.add(candidateId);
+      rows.push({
+        candidateId,
+        label: String(first(row.label, "")),
+        value: String(first(row.value, row.display_url, "")),
+        platform: String(first(row.platform, "")),
+        resourceKind,
+        formatHint: String(first(row.format_hint, "")),
+        expanded: !!row.expanded,
+        selectable: admittable,
+        admissionReasonCode,
+      });
+      if (rows.length >= 64) break;
+    }
+    const identity = `${runId}:${rows.map(row => row.candidateId).join(",")}`;
+    const selectableIds = rows.filter(row => row.selectable).map(row => row.candidateId);
+    const selectedIds = prior.identity === identity && Array.isArray(prior.selectedIds)
+      ? prior.selectedIds.map(String).filter(id => selectableIds.includes(id))
+      : selectableIds;
+    return {
+      runId,
+      identity,
+      rows,
+      selectedIds,
+      enabled: !!runId && selectedIds.length > 0 && actionEnabled(source, "tool_admit_candidates", false),
+    };
+  }
   function normalizeStatus(value) { const key = String(value || "idle").toLowerCase(); return STATUS[key] || key; }
   function normalizeProgress(source) { const value = record(source); const raw = first(value.progress, value.percent, 0); const nested = record(raw); const amount = Number(first(nested.value, nested.percent, raw, 0)); return { progress: Number.isFinite(amount) ? Math.max(0, Math.min(100, amount)) : 0, progressText: String(first(nested.text, nested.label, value.progress_text, value.progressText, "")), progressIndeterminate: !!first(nested.indeterminate, value.progress_indeterminate, value.progressIndeterminate, false) }; }
   function executionFor(snapshot, toolId) {
@@ -169,5 +220,5 @@
   function historyFor(snapshot, toolId) { const projection = projectionFor(snapshot, toolId); const rows = Array.isArray(projection.history) ? projection.history : (Array.isArray(record(snapshot).toolbox_recent_items) ? record(snapshot).toolbox_recent_items : []); return rows.map(row => { const source = record(row); return { ...source, historyId: String(first(source.id, source.history_id, source.result_id, "")), title: String(first(source.title, source.tool_title, "")), timestamp: String(first(source.finished_at, source.last_used, source.time_display, "")), status: normalizeStatus(first(source.state, source.status, "idle")), statusText: String(first(source.status_text, "")), canOpenResult: actionEnabled(source, "tool_open_result", !!first(source.result_id, source.path, false)) }; }); }
   function shouldRender(sections) { const values = sections instanceof Set ? sections : new Set(sections || []); return ["toolbox_items", "toolbox_display_projection", "toolbox_display_batch", "toolbox_execution", "toolbox_recent_items", "toolbox_selected_tool_id"].some(key => values.has(key)); }
 
-  window.UcpToolboxContract = Object.freeze({ normalizeToolDefinition, reduceProjectionCache, projectionFor, toolForSnapshot, validateParameters, resolveActionName, buildActionPayload, actionEnabled, executionFor, historyFor, resultDisplayLines, shouldRender, hasModernContract });
+  window.UcpToolboxContract = Object.freeze({ normalizeToolDefinition, reduceProjectionCache, projectionFor, toolForSnapshot, validateParameters, resolveActionName, buildActionPayload, actionEnabled, executionFor, historyFor, resultDisplayLines, linkCandidateState, shouldRender, hasModernContract });
 })();

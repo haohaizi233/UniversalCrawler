@@ -21,6 +21,9 @@ from app.core.tools.contracts import (
     ToolRequirements,
     ToolRunResult,
 )
+from app.core.tools.link_candidate_admission_policy import (
+    link_candidate_admission_capability,
+)
 from shared.network.pinned_transport import PinnedTransport
 from shared.runtime_options import PUBLIC_DOMAIN_POLICY, DomainPolicyViolation
 
@@ -544,6 +547,11 @@ class LinkParserTool:
             candidate_id = link_candidate_id(private_url)
             platform, resource_kind = classify_link_url(private_url)
             format_hint = link_format_hint(private_url, resource_kind)
+            admission = link_candidate_admission_capability(
+                private_url,
+                platform=platform,
+                resource_kind=resource_kind,
+            )
             public_candidate = {
                 "candidate_id": candidate_id,
                 "display_url": redacted_link_url(private_url),
@@ -551,6 +559,8 @@ class LinkParserTool:
                 "resource_kind": resource_kind,
                 "format_hint": format_hint,
                 "expanded": expanded,
+                "admittable": admission.admittable,
+                "admission_reason_code": admission.reason_code,
             }
             rows.append(public_candidate)
             private_candidates.append(

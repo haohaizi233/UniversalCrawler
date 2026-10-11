@@ -76,6 +76,55 @@ def _private_candidates(result: Any) -> Any:
     return result.private_data["candidates"]
 
 
+def test_candidates_publish_the_server_admission_capability() -> None:
+    from app.core.tools.builtin.link_parser import LinkParserTool
+
+    result = LinkParserTool().run(
+        _context(
+            {
+                "text": " ".join(
+                    (
+                        "https://cdn.example.com/video.mp4",
+                        "https://www.douyin.com/media/master.m3u8",
+                        "https://missav.ai/media/master.m3u8",
+                        "https://www.bilibili.com/media/video.mp4",
+                    )
+                )
+            }
+        )
+    )
+
+    expected = {
+        ("generic", "media"): (
+            False,
+            "candidate_downloader_unavailable",
+        ),
+        ("douyin", "playlist"): (
+            False,
+            "candidate_downloader_unavailable",
+        ),
+        ("missav", "playlist"): (True, ""),
+        ("bilibili", "media"): (True, ""),
+    }
+    public = {
+        (row["platform"], row["resource_kind"]): (
+            row["admittable"],
+            row["admission_reason_code"],
+        )
+        for row in result.data["links"]
+    }
+    private = {
+        (row["platform"], row["resource_kind"]): (
+            row["admittable"],
+            row["admission_reason_code"],
+        )
+        for row in _private_candidates(result)
+    }
+
+    assert public == expected
+    assert private == expected
+
+
 def test_manifest_is_the_complete_input_schema_and_default_parse_is_offline() -> None:
     from app.core.tools.builtin.link_parser import LinkParserTool
 
@@ -144,6 +193,8 @@ def test_manifest_is_the_complete_input_schema_and_default_parse_is_offline() ->
             "resource_kind",
             "format_hint",
             "expanded",
+            "admittable",
+            "admission_reason_code",
         }
         for row in result.data["links"]
     )
@@ -162,6 +213,8 @@ def test_manifest_is_the_complete_input_schema_and_default_parse_is_offline() ->
                 "resource_kind",
                 "format_hint",
                 "expanded",
+                "admittable",
+                "admission_reason_code",
             )
         }
         for row in _private_candidates(result)
@@ -477,6 +530,8 @@ def test_explicit_short_link_expansion_uses_bounded_public_transport() -> None:
             "resource_kind": "page",
             "format_hint": "PLATFORM",
             "expanded": True,
+            "admittable": False,
+            "admission_reason_code": "candidate_requires_crawl_resolution",
         }
     ]
     assert result.data["counts"]["links"] == 1

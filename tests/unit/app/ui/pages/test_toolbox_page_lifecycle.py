@@ -127,6 +127,12 @@ class ToolboxPageLifecycleTests(unittest.TestCase):
         self.assertEqual(algorithm.currentData(), "sha256")
         self.assertEqual(self.page.validation_label.text(), "参数可用")
 
+    def test_reusable_panels_accept_the_shared_language_contract(self) -> None:
+        self.page.parameter_editor.set_language("en-US")
+        self.page.execution_panel.set_language("en-US")
+        self.page.history_panel.set_language("en-US")
+        self.page.link_candidate_panel.set_language("en-US")
+
     def test_emits_named_actions_without_legacy_start_signal(self) -> None:
         self.page.render(_toolbox_snapshot())
         actions: list[tuple[str, dict]] = []

@@ -6,14 +6,15 @@ import os
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any, Protocol
-from urllib.parse import urlsplit
-
 from app.core.tools.builtin.link_parser import (
     classify_link_url,
     link_candidate_id,
     link_format_hint,
     normalize_link_url,
     redacted_link_url,
+)
+from app.core.tools.link_candidate_admission_policy import (
+    link_candidate_admission_capability,
 )
 from app.models import VideoItem
 from app.services.path_policy import PathPolicy
@@ -22,12 +23,6 @@ from shared.execution_profile import ExecutionProfile
 
 
 _MAX_SELECTED_CANDIDATES = 64
-_SUPPORTED_DOWNLOAD_SOURCES = frozenset(
-    {"bilibili", "douyin", "kuaishou", "missav", "xiaohongshu"}
-)
-_VIDEO_EXTENSIONS = frozenset(
-    {".avi", ".flv", ".m4v", ".mkv", ".mov", ".mp4", ".ts", ".webm"}
-)
 _PUBLIC_CANDIDATE_KEYS = (
     "candidate_id",
     "display_url",
@@ -35,6 +30,8 @@ _PUBLIC_CANDIDATE_KEYS = (
     "resource_kind",
     "format_hint",
     "expanded",
+    "admittable",
+    "admission_reason_code",
 )
 _PUBLIC_CANDIDATE_KEY_SET = frozenset(_PUBLIC_CANDIDATE_KEYS)
 _PRIVATE_CANDIDATE_KEY_SET = frozenset(
@@ -170,46 +167,50 @@ class LinkCandidateAdmissionService:
                 selected_ids,
                 execution_profile=execution_profile,
             )
-        except Exception:
-            claimed = False
-        if not claimed:
+        except BaseException as primary:
+            if not isinstance(primary, Exception):
+                raise primary
+            raise self._error(
+                "candidate_claim_failed",
+                "selected links could not be reserved",
+            ) from None
+        if claimed is not True:
+            if claimed is not False:
+                raise self._error(
+                    "candidate_claim_failed",
+                    "selected links could not be reserved",
+                )
             raise self._error(
                 "candidate_already_admitted",
                 "selected link has already been admitted",
             )
 
-        add_failed = False
+        add_failure: BaseException | None = None
         try:
             accepted_count = add_tasks(items, authorized_save_directory)
-        except Exception:
-            add_failed = True
+        except BaseException as primary:
+            add_failure = primary
             accepted_count = None
 
-        if add_failed:
-            if not self._rollback_and_release_claim(
+        if add_failure is not None:
+            self._rollback_and_release_claim(
                 cancel_videos_and_wait,
                 items,
                 normalized_run_id,
                 selected_ids,
                 execution_profile,
-            ):
-                raise self._error(
-                    "queue_rollback_failed",
-                    "download queue rollback could not be confirmed",
-                ) from None
-            raise self._error(
-                "queue_batch_rejected",
-                "download queue rejected the selected links",
             )
+            raise add_failure
 
         if type(accepted_count) is not int or accepted_count != len(items):
-            if not self._rollback_and_release_claim(
+            rollback_confirmed, _rollback_failure = self._rollback_and_release_claim(
                 cancel_videos_and_wait,
                 items,
                 normalized_run_id,
                 selected_ids,
                 execution_profile,
-            ):
+            )
+            if not rollback_confirmed:
                 raise self._error(
                     "queue_rollback_failed",
                     "download queue rollback could not be confirmed",
@@ -249,28 +250,30 @@ class LinkCandidateAdmissionService:
         run_id: str,
         candidate_ids: tuple[str, ...],
         execution_profile: ExecutionProfile,
-    ) -> bool:
+    ) -> tuple[bool, BaseException | None]:
         video_ids = tuple(item.id for item in items)
         try:
             result = cancel_videos_and_wait(items)
-        except Exception:
-            return False
-        if (
-            not isinstance(result, Mapping)
-            or set(result) != set(video_ids)
-            or any(result.get(video_id) != "cancelled" for video_id in video_ids)
-        ):
-            return False
+        except BaseException as failure:
+            return False, failure
         try:
-            return bool(
-                self._tool_runner_service._release_private_candidates(
-                    run_id,
-                    candidate_ids,
-                    execution_profile=execution_profile,
-                )
+            if not isinstance(result, Mapping):
+                return False, None
+            if set(result) != set(video_ids):
+                return False, None
+            if any(result.get(video_id) != "cancelled" for video_id in video_ids):
+                return False, None
+        except BaseException as failure:
+            return False, failure
+        try:
+            released = self._tool_runner_service._release_private_candidates(
+                run_id,
+                candidate_ids,
+                execution_profile=execution_profile,
             )
-        except Exception:
-            return False
+        except BaseException as failure:
+            return False, failure
+        return type(released) is bool and released, None
 
     @staticmethod
     def _validate_selection(candidate_ids: Sequence[str]) -> tuple[str, ...]:
@@ -362,6 +365,11 @@ class LinkCandidateAdmissionService:
                 raise cls._integrity_error()
 
             platform, resource_kind = classify_link_url(private_url)
+            admission = link_candidate_admission_capability(
+                private_url,
+                platform=platform,
+                resource_kind=resource_kind,
+            )
             expected_public = {
                 "candidate_id": candidate_id,
                 "display_url": redacted_link_url(private_url),
@@ -369,6 +377,8 @@ class LinkCandidateAdmissionService:
                 "resource_kind": resource_kind,
                 "format_hint": link_format_hint(private_url, resource_kind),
                 "expanded": raw_candidate.get("expanded"),
+                "admittable": admission.admittable,
+                "admission_reason_code": admission.reason_code,
             }
             if type(expected_public["expanded"]) is not bool:
                 raise cls._integrity_error()
@@ -396,31 +406,27 @@ class LinkCandidateAdmissionService:
         private_url = str(candidate["private_url"])
         platform = str(candidate["platform"])
         resource_kind = str(candidate["resource_kind"])
-        if resource_kind == "page":
-            raise cls._error(
-                "candidate_requires_crawl_resolution",
-                "selected link must be resolved by its platform crawler",
-            )
-        if platform not in _SUPPORTED_DOWNLOAD_SOURCES:
-            raise cls._error(
-                "candidate_downloader_unavailable",
-                "no downloader is available for the selected link",
-            )
-        if resource_kind == "playlist":
-            if platform != "missav":
-                raise cls._error(
-                    "candidate_downloader_unavailable",
-                    "no downloader is available for the selected link",
-                )
-        elif resource_kind == "media":
-            path = urlsplit(private_url).path.lower()
-            if not any(path.endswith(extension) for extension in _VIDEO_EXTENSIONS):
-                raise cls._error(
-                    "candidate_media_type_unsupported",
-                    "selected media type is not supported for direct admission",
-                )
-        else:
-            raise cls._integrity_error()
+        admission = link_candidate_admission_capability(
+            private_url,
+            platform=platform,
+            resource_kind=resource_kind,
+        )
+        if not admission.admittable:
+            messages = {
+                "candidate_requires_crawl_resolution": (
+                    "selected link must be resolved by its platform crawler"
+                ),
+                "candidate_downloader_unavailable": (
+                    "no downloader is available for the selected link"
+                ),
+                "candidate_media_type_unsupported": (
+                    "selected media type is not supported for direct admission"
+                ),
+            }
+            message = messages.get(admission.reason_code)
+            if message is None:
+                raise cls._integrity_error()
+            raise cls._error(admission.reason_code, message)
 
         trace_id = f"link_parser_{run_id}_{candidate_id[:12]}"
         return VideoItem(

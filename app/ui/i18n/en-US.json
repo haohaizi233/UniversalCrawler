@@ -594,5 +594,19 @@
   "自定义": "Custom",
   "检测中": "Checking",
   "这通常表示你正在使用本地构建或预发布构建，无需更新。": "This usually means you are using a local or pre-release build, so no update is needed.",
-  "自动清理过期失败记录": "Automatically clear expired failed records"
+  "自动清理过期失败记录": "Automatically clear expired failed records",
+  "候选资源": "Candidate resources",
+  "仅可加入服务端标记为可下载的候选项；其他项目仅供预览。": "Only candidates marked downloadable by the server can be added; other items are preview-only.",
+  "加入下载队列": "Add to download queue",
+  "仅预览，不能加入下载队列": "Preview only; cannot be added to the download queue",
+  "已选择": "Selected",
+  "项": "items",
+  "已加入下载队列": "Added to download queue",
+  "候选资源回执无效": "Candidate resource receipt is invalid",
+  "候选资源加入失败": "Failed to add candidate resources",
+  "类型": "Type",
+  "候选地址": "Candidate address",
+  "页面": "Page",
+  "媒体": "Media",
+  "播放列表": "Playlist"
 }

@@ -8,6 +8,7 @@ import subprocess
 
 import pytest
 
+from app.ui.pages.toolbox_link_candidates import LinkCandidatePanel
 from app.ui.pages.toolbox_models import result_lines
 
 
@@ -581,6 +582,440 @@ def test_gui_and_web_render_the_same_safe_link_parser_projection() -> None:
     assert "token=" not in rendered
 
 
+def test_link_candidate_contract_preserves_selection_and_builds_exact_admission_payload() -> None:
+    page_id = "a" * 64
+    media_id = "b" * 64
+    playlist_id = "c" * 64
+    expression = f"""
+(() => {{
+  const projection = {{
+    tool_id: "link_parser",
+    run_id: "run-1",
+    state: "success",
+    result: {{ rows: [
+      {{ candidate_id: "{page_id}", resource_kind: "page", platform: "generic", format_hint: "PLATFORM", value: "https://page.example/[redacted]", admittable: false, admission_reason_code: "candidate_requires_crawl_resolution" }},
+      {{ candidate_id: "{media_id}", resource_kind: "media", platform: "bilibili", format_hint: "MP4", value: "https://media.example/[redacted]", admittable: true, admission_reason_code: "" }},
+      {{ candidate_id: "{playlist_id}", resource_kind: "playlist", platform: "missav", format_hint: "HLS", value: "https://list.example/[redacted]", admittable: true, admission_reason_code: "" }}
+    ] }},
+    actions: {{ tool_admit_candidates: true }}
+  }};
+  const first = contract.linkCandidateState(projection, {{}});
+  const same = contract.linkCandidateState(projection, {{
+    ...first,
+    selectedIds: ["{playlist_id}"]
+  }});
+  const next = contract.linkCandidateState({{
+    ...projection,
+    run_id: "run-2"
+  }}, same);
+  const tool = contract.normalizeToolDefinition({{ id: "link_parser", parameters: [] }});
+  return {{
+    rows: first.rows.map(row => [row.candidateId, row.selectable]),
+    firstSelected: first.selectedIds,
+    sameSelected: same.selectedIds,
+    nextSelected: next.selectedIds,
+    action: contract.resolveActionName("admitCandidates", tool, {{
+      toolbox_display_projection: projection
+    }}),
+    payload: contract.buildActionPayload("admitCandidates", tool, {{}}, {{
+      runId: same.runId,
+      candidateIds: same.selectedIds,
+    }})
+  }};
+}})()
+"""
+
+    result = _run_toolbox_contract(expression)
+
+    assert result["rows"] == [
+        [page_id, False],
+        [media_id, True],
+        [playlist_id, True],
+    ]
+    assert result["firstSelected"] == [media_id, playlist_id]
+    assert result["sameSelected"] == [playlist_id]
+    assert result["nextSelected"] == [media_id, playlist_id]
+    assert result["action"] == "tool_admit_candidates"
+    assert result["payload"] == {
+        "tool_id": "link_parser",
+        "run_id": "run-1",
+        "candidate_ids": [playlist_id],
+    }
+    assert "private_url" not in json.dumps(result)
+
+
+def test_link_candidate_contract_consumes_server_admission_capability() -> None:
+    generic_media_id = "d" * 64
+    douyin_playlist_id = "e" * 64
+    missav_playlist_id = "f" * 64
+    bilibili_media_id = "1" * 64
+    expression = f"""
+(() => {{
+  const state = contract.linkCandidateState({{
+    tool_id: "link_parser",
+    run_id: "run-policy",
+    state: "success",
+    result: {{ rows: [
+      {{ candidate_id: "{generic_media_id}", resource_kind: "media", platform: "generic", format_hint: "MP4", value: "https://cdn.example/[redacted]", admittable: false, admission_reason_code: "candidate_downloader_unavailable" }},
+      {{ candidate_id: "{douyin_playlist_id}", resource_kind: "playlist", platform: "douyin", format_hint: "HLS", value: "https://www.douyin.com/[redacted]", admittable: false, admission_reason_code: "candidate_downloader_unavailable" }},
+      {{ candidate_id: "{missav_playlist_id}", resource_kind: "playlist", platform: "missav", format_hint: "HLS", value: "https://missav.ai/[redacted]", admittable: true, admission_reason_code: "" }},
+      {{ candidate_id: "{bilibili_media_id}", resource_kind: "media", platform: "bilibili", format_hint: "MP4", value: "https://www.bilibili.com/[redacted]", admittable: true, admission_reason_code: "" }}
+    ] }},
+    actions: {{ tool_admit_candidates: true }}
+  }}, {{}});
+  return {{
+    rows: state.rows.map(row => [row.candidateId, row.selectable, row.admissionReasonCode]),
+    selectedIds: state.selectedIds,
+  }};
+}})()
+"""
+
+    result = _run_toolbox_contract(expression)
+
+    assert result == {
+        "rows": [
+            [generic_media_id, False, "candidate_downloader_unavailable"],
+            [douyin_playlist_id, False, "candidate_downloader_unavailable"],
+            [missav_playlist_id, True, ""],
+            [bilibili_media_id, True, ""],
+        ],
+        "selectedIds": [missav_playlist_id, bilibili_media_id],
+    }
+
+
+def test_link_candidate_contract_rejects_non_array_ids_and_bounds_rows() -> None:
+    result = _run_toolbox_contract(
+        """
+(() => {
+  const rows = Array.from({ length: 80 }, (_, index) => ({
+    candidate_id: (index + 1).toString(16).padStart(64, "0"),
+    resource_kind: "media",
+    platform: "bilibili",
+    format_hint: "MP4",
+    value: "https://media.example/[redacted]",
+    admittable: true,
+    admission_reason_code: ""
+  }));
+  const state = contract.linkCandidateState({
+    tool_id: "link_parser",
+    run_id: "run-bounded",
+    state: "success",
+    result: { rows },
+    actions: { tool_admit_candidates: true }
+  }, {});
+  const tool = contract.normalizeToolDefinition({ id: "link_parser", parameters: [] });
+  return {
+    rowCount: state.rows.length,
+    selectedCount: state.selectedIds.length,
+    malformed: contract.buildActionPayload("admitCandidates", tool, {}, {
+      runId: "run-bounded",
+      candidate_ids: "not-an-array"
+    })
+  };
+})()
+"""
+    )
+
+    assert result == {
+        "rowCount": 64,
+        "selectedCount": 64,
+        "malformed": {
+            "tool_id": "link_parser",
+            "run_id": "run-bounded",
+            "candidate_ids": [],
+        },
+    }
+
+
+def test_link_candidate_contract_keeps_first_64_unique_valid_rows() -> None:
+    result = _run_toolbox_contract(
+        """
+(() => {
+  const firstId = "a".repeat(64);
+  const rows = [
+    ...Array.from({ length: 64 }, () => ({
+      candidate_id: "invalid",
+      resource_kind: "media"
+    })),
+    { candidate_id: firstId, resource_kind: "media", platform: "bilibili", format_hint: "MP4", value: "first", admittable: true, admission_reason_code: "" },
+    { candidate_id: firstId, resource_kind: "media", platform: "bilibili", format_hint: "MP4", value: "duplicate", admittable: true, admission_reason_code: "" },
+    ...Array.from({ length: 70 }, (_, index) => ({
+      candidate_id: (index + 1).toString(16).padStart(64, "0"),
+      resource_kind: "playlist",
+      platform: "missav",
+      format_hint: "HLS",
+      value: `valid-${index + 1}`,
+      admittable: true,
+      admission_reason_code: ""
+    }))
+  ];
+  const state = contract.linkCandidateState({
+    tool_id: "link_parser",
+    run_id: "run-unique-valid",
+    state: "success",
+    result: { rows },
+    actions: { tool_admit_candidates: true }
+  }, {});
+  return {
+    rowCount: state.rows.length,
+    selectedCount: state.selectedIds.length,
+    firstValue: state.rows[0]?.value,
+    uniqueCount: new Set(state.rows.map(row => row.candidateId)).size
+  };
+})()
+"""
+    )
+
+    assert result == {
+        "rowCount": 64,
+        "selectedCount": 64,
+        "firstValue": "first",
+        "uniqueCount": 64,
+    }
+
+
+def test_toolbox_controller_admits_only_selected_safe_link_candidates() -> None:
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node.js is required for the toolbox JavaScript contract")
+
+    media_id = "b" * 64
+    playlist_id = "c" * 64
+    script = rf"""
+const fs = require("fs");
+const vm = require("vm");
+global.models = [];
+global.window = {{
+  UcpToolboxView: {{
+    renderCards() {{}}, renderEmpty() {{}}, renderDetail() {{}},
+    patchDetail(model) {{ global.models.push(JSON.parse(JSON.stringify(model))); }}
+  }},
+  addEventListener() {{}}, removeEventListener() {{}}
+}};
+for (const filename of process.env.UCP_TOOLBOX_MODULES.split(require("path").delimiter)) {{
+  vm.runInThisContext(fs.readFileSync(filename, "utf8"), {{ filename }});
+}}
+const projection = {{
+  tool_id: "link_parser", run_id: "run-1", state: "success",
+  result: {{ rows: [
+    {{ candidate_id: "{media_id}", resource_kind: "media", platform: "bilibili", format_hint: "MP4", value: "https://media.example/[redacted]", admittable: true, admission_reason_code: "" }},
+    {{ candidate_id: "{playlist_id}", resource_kind: "playlist", platform: "missav", format_hint: "HLS", value: "https://list.example/[redacted]", admittable: true, admission_reason_code: "" }}
+  ] }},
+  actions: {{ tool_admit_candidates: true }}
+}};
+const snapshot = {{ toolbox_items: [{{ id: "link_parser", parameters: [] }}], toolbox_display_projection: projection }};
+const calls = [];
+const controller = window.UcpToolboxController;
+controller.configure({{
+  getState: () => snapshot,
+  requestAction: async (action, payload) => {{
+    calls.push([action, payload]);
+    return {{
+      status: "ok",
+      data: {{
+        status: "queued", tool_id: "link_parser", run_id: "run-1",
+        accepted_count: 1, candidate_ids: ["{playlist_id}"],
+        video_ids: ["video-1"],
+        private_url: "https://secret.example/token"
+      }}
+    }};
+  }}
+}});
+controller.render();
+controller.toggleCandidate("{media_id}", false);
+controller.render();
+controller.admitCandidates().then(() => {{
+  const receiptModel = global.models[global.models.length - 1];
+  snapshot.toolbox_display_projection = {{ ...projection, run_id: "run-2" }};
+  controller.render();
+  const nextModel = global.models[global.models.length - 1];
+  process.stdout.write(JSON.stringify({{
+    calls,
+    sameSelected: receiptModel.candidates.selectedIds,
+    receipt: receiptModel.candidateReceipt,
+    nextSelected: nextModel.candidates.selectedIds
+  }}));
+}});
+"""
+    completed = subprocess.run(
+        [node, "-e", script],
+        check=True,
+        capture_output=True,
+        encoding="utf-8",
+        env={
+            **os.environ,
+            "UCP_TOOLBOX_MODULES": os.pathsep.join(
+                (str(TOOLBOX_CONTRACT_JS), str(TOOLBOX_JS))
+            ),
+        },
+    )
+    result = json.loads(completed.stdout)
+
+    assert result["calls"] == [
+        [
+            "tool_admit_candidates",
+            {
+                "tool_id": "link_parser",
+                "run_id": "run-1",
+                "candidate_ids": [playlist_id],
+            },
+        ]
+    ]
+    assert result["sameSelected"] == [playlist_id]
+    assert result["nextSelected"] == [media_id, playlist_id]
+    assert result["receipt"] == {
+        "status": "queued",
+        "tool_id": "link_parser",
+        "run_id": "run-1",
+        "accepted_count": 1,
+        "candidate_ids": [playlist_id],
+        "video_ids": ["video-1"],
+    }
+    assert "private_url" not in json.dumps(result)
+
+
+def test_toolbox_controller_rejects_mismatched_or_malformed_candidate_receipts() -> None:
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node.js is required for the toolbox JavaScript contract")
+
+    media_id = "b" * 64
+    script = rf"""
+const fs = require("fs");
+const vm = require("vm");
+global.models = [];
+global.window = {{
+  UcpToolboxView: {{
+    renderCards() {{}}, renderEmpty() {{}}, renderDetail() {{}},
+    patchDetail(model) {{ global.models.push(JSON.parse(JSON.stringify(model))); }}
+  }},
+  addEventListener() {{}}, removeEventListener() {{}}
+}};
+for (const filename of process.env.UCP_TOOLBOX_MODULES.split(require("path").delimiter)) {{
+  vm.runInThisContext(fs.readFileSync(filename, "utf8"), {{ filename }});
+}}
+const projection = {{
+  tool_id: "link_parser", run_id: "run-expected", state: "success",
+  result: {{ rows: [{{ candidate_id: "{media_id}", resource_kind: "media", platform: "bilibili", format_hint: "MP4", value: "safe", admittable: true, admission_reason_code: "" }}] }},
+  actions: {{ tool_admit_candidates: true }}
+}};
+const snapshot = {{ toolbox_items: [{{ id: "link_parser", parameters: [] }}], toolbox_display_projection: projection }};
+const controller = window.UcpToolboxController;
+controller.configure({{
+  getState: () => snapshot,
+  requestAction: async () => ({{
+    status: "ok",
+    data: {{
+      status: "queued", tool_id: "link_parser", run_id: "run-stale",
+      accepted_count: true,
+      candidate_ids: Array(65).fill("{media_id}"),
+      video_ids: Array(65).fill("video-1")
+    }}
+  }})
+}});
+controller.render();
+controller.admitCandidates().then(() => {{
+  const model = global.models[global.models.length - 1];
+  process.stdout.write(JSON.stringify({{
+    receipt: model.candidateReceipt,
+    selectedIds: model.candidates.selectedIds,
+    actionMessage: model.actionMessage
+  }}));
+}});
+"""
+    completed = subprocess.run(
+        [node, "-e", script],
+        check=True,
+        capture_output=True,
+        encoding="utf-8",
+        env={
+            **os.environ,
+            "UCP_TOOLBOX_MODULES": os.pathsep.join(
+                (str(TOOLBOX_CONTRACT_JS), str(TOOLBOX_JS))
+            ),
+        },
+    )
+    result = json.loads(completed.stdout)
+
+    assert result["receipt"] == {}
+    assert result["selectedIds"] == [media_id]
+    assert result["actionMessage"]
+
+
+def test_gui_and_web_reject_the_same_unsafe_candidate_receipt_video_id() -> None:
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node.js is required for the toolbox JavaScript contract")
+
+    candidate_id = "b" * 64
+    unsafe_video_id = "video id with spaces"
+    gui_receipt = LinkCandidatePanel._validated_receipt_count(
+        {
+            "status": "queued",
+            "tool_id": "link_parser",
+            "run_id": "run-expected",
+            "accepted_count": 1,
+            "candidate_ids": [candidate_id],
+            "video_ids": [unsafe_video_id],
+        },
+        ("link_parser", "run-expected", (candidate_id,), None),
+    )
+
+    script = rf"""
+const fs = require("fs");
+const vm = require("vm");
+global.models = [];
+global.window = {{
+  UcpToolboxView: {{
+    renderCards() {{}}, renderEmpty() {{}}, renderDetail() {{}},
+    patchDetail(model) {{ global.models.push(JSON.parse(JSON.stringify(model))); }}
+  }},
+  addEventListener() {{}}, removeEventListener() {{}}
+}};
+for (const filename of process.env.UCP_TOOLBOX_MODULES.split(require("path").delimiter)) {{
+  vm.runInThisContext(fs.readFileSync(filename, "utf8"), {{ filename }});
+}}
+const projection = {{
+  tool_id: "link_parser", run_id: "run-expected", state: "success",
+  result: {{ rows: [{{ candidate_id: "{candidate_id}", resource_kind: "media", value: "safe" }}] }},
+  actions: {{ tool_admit_candidates: true }}
+}};
+const snapshot = {{ toolbox_items: [{{ id: "link_parser", parameters: [] }}], toolbox_display_projection: projection }};
+const controller = window.UcpToolboxController;
+controller.configure({{
+  getState: () => snapshot,
+  requestAction: async () => ({{
+    status: "ok",
+    data: {{
+      status: "queued", tool_id: "link_parser", run_id: "run-expected",
+      accepted_count: 1, candidate_ids: ["{candidate_id}"],
+      video_ids: ["{unsafe_video_id}"]
+    }}
+  }})
+}});
+controller.render();
+controller.admitCandidates().then(() => {{
+  const model = global.models[global.models.length - 1];
+  process.stdout.write(JSON.stringify({{ receipt: model.candidateReceipt }}));
+}});
+"""
+    completed = subprocess.run(
+        [node, "-e", script],
+        check=True,
+        capture_output=True,
+        encoding="utf-8",
+        env={
+            **os.environ,
+            "UCP_TOOLBOX_MODULES": os.pathsep.join(
+                (str(TOOLBOX_CONTRACT_JS), str(TOOLBOX_JS))
+            ),
+        },
+    )
+
+    assert gui_receipt is None
+    assert json.loads(completed.stdout)["receipt"] == {}
+
+
 def test_toolbox_projection_reducer_preserves_form_across_progress_only_delta() -> None:
     result = _run_toolbox_contract(
         """
@@ -622,6 +1057,8 @@ def test_toolbox_styles_use_theme_tokens_and_responsive_constraints() -> None:
     assert ".toolbox-parameter" in css
     assert ".toolbox-progress" in css
     assert ".toolbox-history" in css
+    assert ".toolbox-candidate-list" in css
+    assert ".toolbox-candidate-row" in css
     assert "@media (max-width:" in css
     assert "#" not in "\n".join(
         line for line in css.splitlines() if not line.lstrip().startswith("#page-toolbox")
@@ -653,8 +1090,71 @@ def test_toolbox_visible_labels_have_all_webui_translations() -> None:
         "正在启动",
         "运行中",
         "正在取消",
+        "候选资源",
+        "仅可加入服务端标记为可下载的候选项；其他项目仅供预览。",
+        "加入下载队列",
+        "已选择",
+        "项",
+        "已加入下载队列",
+        "页面",
+        "媒体",
+        "播放列表",
     )
 
     for label in labels:
         assert f'"{label}":' in english
         assert f'"{label}":' in traditional
+
+
+def test_candidate_copy_is_shared_by_gui_webui_and_runtime_catalogs() -> None:
+    gui = (ROOT / "app" / "ui" / "pages" / "toolbox_link_candidates.py").read_text(
+        encoding="utf-8"
+    )
+    web = TOOLBOX_VIEW_JS.read_text(encoding="utf-8")
+    english = json.loads((ROOT / "app" / "ui" / "i18n" / "en-US.json").read_text(encoding="utf-8"))
+    traditional = json.loads(
+        (ROOT / "app" / "ui" / "i18n" / "zh-TW.json").read_text(encoding="utf-8")
+    )
+    labels = (
+        "候选资源",
+        "仅可加入服务端标记为可下载的候选项；其他项目仅供预览。",
+        "加入下载队列",
+        "仅预览，不能加入下载队列",
+        "已选择",
+        "项",
+        "已加入下载队列",
+        "候选资源加入失败",
+        "候选资源回执无效",
+        "类型",
+        "候选地址",
+        "页面",
+        "媒体",
+        "播放列表",
+    )
+
+    for label in labels[:3]:
+        assert label in gui
+        assert label in web
+    for label in labels:
+        assert english.get(label)
+        assert traditional.get(label)
+
+    assert '"已加入下载队列": "Added to download queue"' in (
+        ROOT / "app" / "web" / "static" / "i18n.js"
+    ).read_text(encoding="utf-8")
+
+
+def test_toolbox_view_renders_candidate_rows_from_safe_controller_model() -> None:
+    module = TOOLBOX_VIEW_JS.read_text(encoding="utf-8")
+
+    for marker in (
+        'id="toolboxCandidateSection"',
+        'id="toolboxCandidateList"',
+        'id="toolboxAdmitCandidatesButton"',
+        'data-toolbox-candidate',
+        "context.toggleCandidate",
+        "context.admitCandidates",
+    ):
+        assert marker in module
+    assert "private_url" not in module
+    assert "private_path" not in module

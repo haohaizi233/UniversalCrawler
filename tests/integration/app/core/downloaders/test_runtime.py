@@ -36,6 +36,21 @@ from app.models import VideoItem
 from app.utils.bilibili_wbi import BILIBILI_WBI_SIGNER
 from shared.runtime_options import DomainPolicyEngine, DomainPolicyViolation
 
+# 合法 MP4 签名负载：发布前签名校验要求媒体盒文件偏移 4 处为 ftyp。
+_FTYP = b"\x00\x00\x00\x18ftypisom\x00\x00\x00\x00"
+
+
+class _StubMediaProxy:
+    """`FFmpegDownloader._start_validated_media_proxy` 的替身，仅实现 url/stop 协议。"""
+
+    def __init__(self, url: str = "http://127.0.0.1:12345/media"):
+        self.url = url
+        self.stop_calls = 0
+
+    def stop(self) -> None:
+        self.stop_calls += 1
+
+
 class DownloaderStrategyTests(unittest.TestCase):
     
     def _make_stream_response(self, chunks, headers=None, status_code=200):
@@ -154,7 +169,7 @@ class DownloaderStrategyTests(unittest.TestCase):
 
     @patch("app.core.downloaders.base.requests.get")
     def test_base_downloader_zero_retries_still_makes_initial_attempt(self, mocked_get):
-        mocked_get.return_value = self._make_stream_response([b"ok"], headers={"content-length": "2"})
+        mocked_get.return_value = self._make_stream_response([_FTYP], headers={"content-length": str(len(_FTYP))})
 
         with tempfile.TemporaryDirectory() as temp_dir:
             save_path = os.path.join(temp_dir, "demo.mp4")
@@ -167,7 +182,7 @@ class DownloaderStrategyTests(unittest.TestCase):
                 max_retries=0,
             )
 
-            self.assertEqual(Path(save_path).read_bytes(), b"ok")
+            self.assertEqual(Path(save_path).read_bytes(), _FTYP)
 
         self.assertEqual(mocked_get.call_count, 1)
 
@@ -203,11 +218,12 @@ class DownloaderStrategyTests(unittest.TestCase):
         mocked_get,
         _mocked_sleep,
     ):
+        # 首段响应在 content-length 之前中断，第二段按 Range 从断点续传同一合法负载。
         mocked_get.side_effect = [
-            self._make_stream_response([b"12"], headers={"content-length": "4"}),
+            self._make_stream_response([_FTYP[:8]], headers={"content-length": str(len(_FTYP))}),
             self._make_stream_response(
-                [b"34"],
-                headers={"content-length": "2", "content-range": "bytes 2-3/4"},
+                [_FTYP[8:]],
+                headers={"content-length": str(len(_FTYP) - 8), "content-range": f"bytes 8-{len(_FTYP) - 1}/{len(_FTYP)}"},
                 status_code=206,
             ),
         ]
@@ -223,10 +239,10 @@ class DownloaderStrategyTests(unittest.TestCase):
                 support_resume=True,
             )
 
-            self.assertEqual(Path(save_path).read_bytes(), b"1234")
+            self.assertEqual(Path(save_path).read_bytes(), _FTYP)
 
         self.assertEqual(mocked_get.call_count, 2)
-        self.assertEqual(mocked_get.call_args_list[1].kwargs["headers"]["Range"], "bytes=2-")
+        self.assertEqual(mocked_get.call_args_list[1].kwargs["headers"]["Range"], "bytes=8-")
 
     @patch("app.core.downloaders.base.time.sleep", return_value=None)
     @patch("app.core.downloaders.base.requests.get")
@@ -259,13 +275,19 @@ class DownloaderStrategyTests(unittest.TestCase):
     def test_base_downloader_publishes_with_atomic_replace(self):
         downloader = BaseDownloader()
 
-        with patch("app.core.downloaders.base.os.replace") as replace, patch(
-            "app.core.downloaders.base.os.remove"
-        ) as remove:
-            downloader._finalize_download("source.downloading", "target.mp4")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            # 发布前的签名校验要求临时文件真实存在且带合法媒体头。
+            source = os.path.join(temp_dir, "source.downloading")
+            target = os.path.join(temp_dir, "target.mp4")
+            Path(source).write_bytes(_FTYP)
 
-        replace.assert_called_once_with("source.downloading", "target.mp4")
-        remove.assert_not_called()
+            with patch("app.core.downloaders.base.os.replace") as replace, patch(
+                "app.core.downloaders.base.os.remove"
+            ) as remove:
+                downloader._finalize_download(source, target)
+
+            replace.assert_called_once_with(source, target)
+            remove.assert_not_called()
 
     @patch("app.core.downloaders.base.requests.get")
     def test_base_downloader_rejects_private_redirect_without_retrying(self, mocked_get):
@@ -304,7 +326,7 @@ class DownloaderStrategyTests(unittest.TestCase):
     @patch("app.core.downloaders.base.cfg.get")
     @patch("app.core.downloaders.base.requests.get")
     def test_base_http_download_applies_configured_speed_limit(self, mocked_get, mocked_cfg_get, limiter_type):
-        mocked_get.return_value = self._make_stream_response([b"ab", b"cd"], headers={"content-length": "4"})
+        mocked_get.return_value = self._make_stream_response([_FTYP[:8], _FTYP[8:]], headers={"content-length": str(len(_FTYP))})
         mocked_cfg_get.side_effect = lambda section, key, default=None: 1024 if (section, key) == ("download", "speed_limit_kb") else default
 
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -326,7 +348,7 @@ class DownloaderStrategyTests(unittest.TestCase):
         """HTTP 初次断线后应记录 retry 日志，并把 trace_id 带到失败排查链路。"""
         mocked_get.side_effect = [
             requests.ConnectionError("drop"),
-            self._make_stream_response([b"ok"], headers={"content-length": "2"}),
+            self._make_stream_response([_FTYP], headers={"content-length": str(len(_FTYP))}),
         ]
 
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -341,20 +363,22 @@ class DownloaderStrategyTests(unittest.TestCase):
                 trace_id="trace-retry",
             )
 
-            self.assertEqual(Path(save_path).read_bytes(), b"ok")
+            self.assertEqual(Path(save_path).read_bytes(), _FTYP)
 
         self.assertTrue(any(call.kwargs.get("action") == "http_retry" for call in mocked_log.call_args_list))
         self.assertEqual(mocked_log.call_args_list[0].kwargs.get("trace_id"), "trace-retry")
 
     def test_m3u8_cleanup_removes_external_tool_temp_outputs(self):
-        """N_m3u8DL-RE/yt-dlp 失败时只清理目标 stem 相关的副产物。"""
+        """失败清理不得删除保存目录里的同主干用户文件。"""
         with tempfile.TemporaryDirectory() as temp_dir:
             save_path = os.path.join(temp_dir, "demo.mp4")
+            sibling_media = os.path.join(temp_dir, "demo.ts")
             temp_file = os.path.join(temp_dir, "demo.part")
             temp_dir_path = os.path.join(temp_dir, "demo_tmp")
             unrelated_file = os.path.join(temp_dir, "demo-other.part")
             unrelated_dir = os.path.join(temp_dir, "demo_archive")
             open(save_path, "wb").close()
+            open(sibling_media, "wb").close()
             open(temp_file, "wb").close()
             open(unrelated_file, "wb").close()
             os.mkdir(temp_dir_path)
@@ -362,9 +386,10 @@ class DownloaderStrategyTests(unittest.TestCase):
 
             N_m3u8DL_RE_Downloader._cleanup_external_temp_files(save_path)
 
-            self.assertFalse(os.path.exists(save_path))
+            self.assertTrue(os.path.exists(save_path))
+            self.assertTrue(os.path.exists(sibling_media))
             self.assertFalse(os.path.exists(temp_file))
-            self.assertFalse(os.path.exists(temp_dir_path))
+            self.assertTrue(os.path.exists(temp_dir_path))
             self.assertTrue(os.path.exists(unrelated_file))
             self.assertTrue(os.path.exists(unrelated_dir))
 
@@ -590,21 +615,19 @@ class DownloaderStrategyTests(unittest.TestCase):
 
         self.assertEqual(command[-3:], ["-f", "mp4", "video.mp4.downloading"])
 
-    @patch("app.core.downloaders.ffmpeg.requests.head")
+    @patch.object(FFmpegDownloader, "_start_validated_media_proxy")
     @patch("app.core.downloaders.ffmpeg.subprocess.Popen")
+    @patch("app.core.downloaders.ffmpeg.FFmpegExternalTool.probe_duration_seconds", return_value=(True, 10.0))
     @patch("app.core.downloaders.ffmpeg.FFmpegExternalTool.resolve_executable", return_value="ffmpeg.exe")
     def test_ffmpeg_downloader_reports_structured_progress(
         self,
         _mocked_resolve,
+        _mocked_probe,
         mocked_popen,
-        mocked_head,
+        mocked_start_proxy,
     ):
         """ffmpeg 结构化 progress 输出应能持续映射为百分比，而不是只显示起止状态。"""
-        head_response = Mock()
-        head_response.url = "https://cdn.example.com/video.mp4"
-        head_response.status_code = 200
-        head_response.headers = {"content-length": "4096"}
-        mocked_head.return_value = head_response
+        mocked_start_proxy.return_value = _StubMediaProxy()
 
         process = Mock()
         process.stderr.readline.side_effect = [
@@ -625,26 +648,22 @@ class DownloaderStrategyTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             save_path = os.path.join(temp_dir, "demo.mp4")
             with open(save_path + ".downloading", "wb") as fp:
-                fp.write(b"done")
+                fp.write(_FTYP)
             FFmpegDownloader().download(item, save_path, progress.append, lambda: False)
 
         self.assertEqual(progress, [10, 50, 100])
         process.stderr.close.assert_called()
 
-    @patch("app.core.downloaders.ffmpeg.requests.head")
+    @patch.object(FFmpegDownloader, "_start_validated_media_proxy")
     @patch("app.core.downloaders.ffmpeg.subprocess.Popen")
     @patch("app.core.downloaders.ffmpeg.FFmpegExternalTool.resolve_executable", return_value="ffmpeg.exe")
     def test_ffmpeg_downloader_writes_temp_file_then_promotes_on_success(
         self,
         _mocked_resolve,
         mocked_popen,
-        mocked_head,
+        mocked_start_proxy,
     ):
-        head_response = Mock()
-        head_response.url = "https://cdn.example.com/video.mp4"
-        head_response.status_code = 200
-        head_response.headers = {"content-length": "4096"}
-        mocked_head.return_value = head_response
+        mocked_start_proxy.return_value = _StubMediaProxy()
 
         item = VideoItem(url="https://example.com/video.mp4", title="demo", source="douyin")
         progress = []
@@ -657,7 +676,7 @@ class DownloaderStrategyTests(unittest.TestCase):
             def fake_popen(cmd, **_kwargs):
                 # 断言 ffmpeg 只写临时文件，成功后由下载器 promote 到最终路径。
                 self.assertEqual(cmd[-1], temp_path)
-                Path(cmd[-1]).write_bytes(b"done")
+                Path(cmd[-1]).write_bytes(_FTYP)
                 process = Mock()
                 process.stderr.readline.side_effect = [b"progress=end\n", b""]
                 process.poll.return_value = 0
@@ -670,15 +689,15 @@ class DownloaderStrategyTests(unittest.TestCase):
 
             self.assertTrue(os.path.exists(save_path))
             self.assertFalse(os.path.exists(temp_path))
-            self.assertEqual(Path(save_path).read_bytes(), b"done")
+            self.assertEqual(Path(save_path).read_bytes(), _FTYP)
 
         self.assertEqual(progress, [100])
 
     @patch(
-        "app.core.downloaders.ffmpeg.debug_logger.log_api",
-        side_effect=RuntimeError("head diagnostic failed"),
+        "app.core.downloaders.ffmpeg.debug_logger.log_command",
+        side_effect=RuntimeError("command diagnostic failed"),
     )
-    @patch("app.core.downloaders.ffmpeg.requests.head")
+    @patch.object(FFmpegDownloader, "_start_validated_media_proxy")
     @patch("app.core.downloaders.ffmpeg.subprocess.Popen")
     @patch("app.core.downloaders.ffmpeg.cfg.get")
     @patch(
@@ -690,10 +709,10 @@ class DownloaderStrategyTests(unittest.TestCase):
         _mocked_resolve,
         mocked_cfg_get,
         mocked_popen,
-        mocked_head,
-        mocked_log_api,
+        mocked_start_proxy,
+        mocked_log_command,
     ):
-        """成功 HEAD 的诊断失败不得阻止 ffmpeg 使用解析后的地址下载。"""
+        """进程启动前的命令诊断日志失败，不得阻止 ffmpeg 使用受控代理地址下载。"""
 
         def fake_cfg_get(section, key, default=None):
             if (section, key) == ("download", "max_retries"):
@@ -701,11 +720,8 @@ class DownloaderStrategyTests(unittest.TestCase):
             return default
 
         mocked_cfg_get.side_effect = fake_cfg_get
-        head_response = Mock()
-        head_response.url = "https://cdn.example.com/video.mp4"
-        head_response.status_code = 200
-        head_response.headers = {"content-length": "4096"}
-        mocked_head.return_value = head_response
+        local_proxy = _StubMediaProxy()
+        mocked_start_proxy.return_value = local_proxy
 
         process = Mock()
         process.stderr.readline.return_value = b""
@@ -714,7 +730,7 @@ class DownloaderStrategyTests(unittest.TestCase):
         process.wait.return_value = 0
 
         def fake_popen(command, **_kwargs):
-            Path(command[-1]).write_bytes(b"published")
+            Path(command[-1]).write_bytes(_FTYP)
             return process
 
         mocked_popen.side_effect = fake_popen
@@ -734,25 +750,22 @@ class DownloaderStrategyTests(unittest.TestCase):
                 lambda: False,
             )
 
-            self.assertEqual(Path(save_path).read_bytes(), b"published")
+            self.assertEqual(Path(save_path).read_bytes(), _FTYP)
             self.assertFalse(Path(temp_path).exists())
 
-        mocked_log_api.assert_called_once()
+        mocked_log_command.assert_called_once()
         mocked_popen.assert_called_once()
         command = mocked_popen.call_args.args[0]
         self.assertEqual(
             command[command.index("-i") + 1],
-            "https://cdn.example.com/video.mp4",
+            local_proxy.url,
         )
 
     @patch(
         "app.core.downloaders.ffmpeg.debug_logger.log_exception",
         side_effect=RuntimeError("request diagnostic failed"),
     )
-    @patch(
-        "app.core.downloaders.ffmpeg.requests.head",
-        side_effect=requests.RequestException("HEAD unavailable"),
-    )
+    @patch.object(FFmpegDownloader, "_start_validated_media_proxy")
     @patch("app.core.downloaders.ffmpeg.subprocess.Popen")
     @patch("app.core.downloaders.ffmpeg.cfg.get")
     @patch(
@@ -764,10 +777,10 @@ class DownloaderStrategyTests(unittest.TestCase):
         _mocked_resolve,
         mocked_cfg_get,
         mocked_popen,
-        mocked_head,
+        mocked_start_proxy,
         mocked_log_exception,
     ):
-        """HEAD 网络失败的诊断也失败时，仍须继续使用原始地址策略。"""
+        """进度诊断失败时地址策略不变：ffmpeg 仍只收到受控代理的 loopback 地址。"""
 
         def fake_cfg_get(section, key, default=None):
             if (section, key) == ("download", "max_retries"):
@@ -775,14 +788,17 @@ class DownloaderStrategyTests(unittest.TestCase):
             return default
 
         mocked_cfg_get.side_effect = fake_cfg_get
+        local_proxy = _StubMediaProxy()
+        mocked_start_proxy.return_value = local_proxy
+
         process = Mock()
-        process.stderr.readline.return_value = b""
+        process.stderr.readline.side_effect = [b"out_time_ms=1000000\n", b""]
         process.poll.return_value = 0
         process.returncode = 0
         process.wait.return_value = 0
 
         def fake_popen(command, **_kwargs):
-            Path(command[-1]).write_bytes(b"fallback-published")
+            Path(command[-1]).write_bytes(_FTYP)
             return process
 
         mocked_popen.side_effect = fake_popen
@@ -791,31 +807,44 @@ class DownloaderStrategyTests(unittest.TestCase):
             title="demo",
             source="douyin",
         )
+        item.meta["duration"] = 10
+
+        def failing_progress(_value):
+            raise RuntimeError("progress callback failed")
 
         with tempfile.TemporaryDirectory() as temp_dir:
             save_path = os.path.join(temp_dir, "demo.mp4")
-            FFmpegDownloader().download(
-                item,
-                save_path,
-                lambda _value: None,
-                lambda: False,
-            )
+            # 进度回调失败会走 log_exception 诊断；诊断本身失败也必须被隔离。
+            with patch(
+                "app.core.downloaders.ffmpeg.FFmpegExternalTool.probe_duration_seconds",
+                return_value=(True, 10.0),
+            ):
+                FFmpegDownloader().download(
+                    item,
+                    save_path,
+                    failing_progress,
+                    lambda: False,
+                )
 
-            self.assertEqual(Path(save_path).read_bytes(), b"fallback-published")
+            self.assertEqual(Path(save_path).read_bytes(), _FTYP)
 
-        mocked_head.assert_called_once()
-        self.assertEqual(mocked_log_exception.call_count, 1)
+        self.assertGreaterEqual(mocked_log_exception.call_count, 1)
         mocked_popen.assert_called_once()
         command = mocked_popen.call_args.args[0]
-        self.assertEqual(command[command.index("-i") + 1], item.url)
+        self.assertEqual(command[command.index("-i") + 1], local_proxy.url)
+        self.assertNotEqual(command[command.index("-i") + 1], item.url)
 
     @patch(
         "app.core.downloaders.ffmpeg.debug_logger.log_exception",
         side_effect=RuntimeError("progress diagnostic failed"),
     )
-    @patch("app.core.downloaders.ffmpeg.requests.head")
+    @patch.object(FFmpegDownloader, "_start_validated_media_proxy")
     @patch("app.core.downloaders.ffmpeg.subprocess.Popen")
     @patch("app.core.downloaders.ffmpeg.cfg.get")
+    @patch(
+        "app.core.downloaders.ffmpeg.FFmpegExternalTool.probe_duration_seconds",
+        return_value=(True, 10.0),
+    )
     @patch(
         "app.core.downloaders.ffmpeg.FFmpegExternalTool.resolve_executable",
         return_value="ffmpeg.exe",
@@ -823,9 +852,10 @@ class DownloaderStrategyTests(unittest.TestCase):
     def test_ffmpeg_loop_progress_diagnostic_failure_does_not_block_publication(
         self,
         _mocked_resolve,
+        _mocked_probe,
         mocked_cfg_get,
         mocked_popen,
-        mocked_head,
+        mocked_start_proxy,
         mocked_log_exception,
     ):
         """循环进度回调的诊断失败不得删除已成功写出的临时文件。"""
@@ -836,11 +866,7 @@ class DownloaderStrategyTests(unittest.TestCase):
             return default
 
         mocked_cfg_get.side_effect = fake_cfg_get
-        head_response = Mock()
-        head_response.url = "https://cdn.example.com/video.mp4"
-        head_response.status_code = 200
-        head_response.headers = {}
-        mocked_head.return_value = head_response
+        mocked_start_proxy.return_value = _StubMediaProxy()
 
         process = Mock()
         process.stderr.readline.side_effect = [b"out_time_ms=1000000\n", b""]
@@ -849,7 +875,7 @@ class DownloaderStrategyTests(unittest.TestCase):
         process.wait.return_value = 0
 
         def fake_popen(command, **_kwargs):
-            Path(command[-1]).write_bytes(b"published")
+            Path(command[-1]).write_bytes(_FTYP)
             return process
 
         mocked_popen.side_effect = fake_popen
@@ -876,20 +902,18 @@ class DownloaderStrategyTests(unittest.TestCase):
                 lambda: False,
             )
 
-            self.assertEqual(Path(save_path).read_bytes(), b"published")
+            self.assertEqual(Path(save_path).read_bytes(), _FTYP)
             self.assertFalse(Path(temp_path).exists())
 
         self.assertEqual(progress_calls, [10, 100])
         self.assertGreaterEqual(mocked_log_exception.call_count, 1)
 
-    @patch("app.core.downloaders.ffmpeg.requests.head")
     @patch("app.core.downloaders.ffmpeg.subprocess.Popen")
     @patch("app.core.downloaders.ffmpeg.FFmpegExternalTool.resolve_executable", return_value="ffmpeg.exe")
     def test_public_ffmpeg_download_only_receives_validating_loopback_url(
         self,
         _mocked_resolve,
         mocked_popen,
-        mocked_head,
     ):
         item = VideoItem(url="https://cdn.example.com/video.mp4", title="demo", source="douyin")
         item.meta["_network_policy"] = "public"
@@ -909,7 +933,7 @@ class DownloaderStrategyTests(unittest.TestCase):
                 self.assertEqual(cmd[cmd.index("-i") + 1], FakeProxy.url)
                 self.assertNotIn("HTTPS_PROXY", _kwargs["env"])
                 self.assertNotIn("COOKIE", _kwargs["env"])
-                Path(temp_path).write_bytes(b"done")
+                Path(temp_path).write_bytes(_FTYP)
                 process = Mock()
                 process.stderr.readline.side_effect = [b"progress=end\n", b""]
                 process.poll.return_value = 0
@@ -932,7 +956,6 @@ class DownloaderStrategyTests(unittest.TestCase):
                 downloader.download(item, save_path, lambda _value: None, lambda: False)
 
         mocked_proxy.assert_called_once()
-        mocked_head.assert_not_called()
         self.assertEqual(stopped, [True])
 
     def test_ffmpeg_progress_parser_treats_large_out_time_ms_as_microseconds(self):
@@ -966,7 +989,7 @@ class DownloaderStrategyTests(unittest.TestCase):
         self.assertEqual(stderr_queue.get_nowait(), b"tail-2")
         self.assertIsNone(stderr_queue.get_nowait())
 
-    @patch("app.core.downloaders.ffmpeg.requests.head")
+    @patch.object(FFmpegDownloader, "_start_validated_media_proxy")
     @patch("app.core.downloaders.ffmpeg.subprocess.Popen")
     @patch(
         "app.core.downloaders.ffmpeg.FFmpegExternalTool.resolve_executable",
@@ -976,14 +999,10 @@ class DownloaderStrategyTests(unittest.TestCase):
         self,
         _mocked_resolve,
         mocked_popen,
-        mocked_head,
+        mocked_start_proxy,
     ):
         """真实 download 路径必须有界、消费 EOF，并由 reader 自己关闭 pipe。"""
-        head_response = Mock()
-        head_response.url = "https://cdn.example.com/video.mp4"
-        head_response.status_code = 200
-        head_response.headers = {}
-        mocked_head.return_value = head_response
+        mocked_start_proxy.return_value = _StubMediaProxy()
 
         class FloodingStderr:
             def __init__(self):
@@ -1059,7 +1078,7 @@ class DownloaderStrategyTests(unittest.TestCase):
             save_path = os.path.join(temp_dir, "demo.mp4")
 
             def fake_popen(cmd, **_kwargs):
-                Path(cmd[-1]).write_bytes(b"done")
+                Path(cmd[-1]).write_bytes(_FTYP)
                 return process
 
             mocked_popen.side_effect = fake_popen
@@ -1094,7 +1113,7 @@ class DownloaderStrategyTests(unittest.TestCase):
         self.assertEqual(len(observed_threads), 1)
         self.assertFalse(observed_threads[0].is_alive())
 
-    @patch("app.core.downloaders.ffmpeg.requests.head")
+    @patch.object(FFmpegDownloader, "_start_validated_media_proxy")
     @patch("app.core.downloaders.ffmpeg.subprocess.Popen")
     @patch(
         "app.core.downloaders.ffmpeg.FFmpegExternalTool.resolve_executable",
@@ -1104,14 +1123,10 @@ class DownloaderStrategyTests(unittest.TestCase):
         self,
         _mocked_resolve,
         mocked_popen,
-        mocked_head,
+        mocked_start_proxy,
     ):
         """进程退出与取消竞态时，取消必须在原子发布前再次获胜。"""
-        head_response = Mock()
-        head_response.url = "https://cdn.example.com/video.mp4"
-        head_response.status_code = 200
-        head_response.headers = {}
-        mocked_head.return_value = head_response
+        mocked_start_proxy.return_value = _StubMediaProxy()
 
         cancelled = threading.Event()
         process = Mock()
@@ -1150,8 +1165,8 @@ class DownloaderStrategyTests(unittest.TestCase):
             self.assertFalse(os.path.exists(save_path))
             self.assertFalse(os.path.exists(temp_path))
 
-    @patch("app.core.downloaders.ffmpeg.time.sleep", return_value=None)
-    @patch("app.core.downloaders.ffmpeg.requests.head")
+    @patch.object(FFmpegDownloader, "_wait_for_retry")
+    @patch.object(FFmpegDownloader, "_start_validated_media_proxy")
     @patch("app.core.downloaders.ffmpeg.subprocess.Popen")
     @patch("app.core.downloaders.ffmpeg.cfg.get")
     @patch(
@@ -1163,10 +1178,10 @@ class DownloaderStrategyTests(unittest.TestCase):
         _mocked_resolve,
         mocked_cfg_get,
         mocked_popen,
-        mocked_head,
-        mocked_sleep,
+        mocked_start_proxy,
+        mocked_retry_wait,
     ):
-        """poll 失败同时收到取消时，不得 sleep 或启动第二个 ffmpeg。"""
+        """poll 失败同时收到取消时，不得进入重试退避或启动第二个 ffmpeg。"""
 
         def fake_cfg_get(section, key, default=None):
             if (section, key) == ("download", "max_retries"):
@@ -1174,11 +1189,7 @@ class DownloaderStrategyTests(unittest.TestCase):
             return default
 
         mocked_cfg_get.side_effect = fake_cfg_get
-        head_response = Mock()
-        head_response.url = "https://cdn.example.com/video.mp4"
-        head_response.status_code = 200
-        head_response.headers = {}
-        mocked_head.return_value = head_response
+        mocked_start_proxy.return_value = _StubMediaProxy()
 
         cancelled = threading.Event()
         process = Mock()
@@ -1209,14 +1220,14 @@ class DownloaderStrategyTests(unittest.TestCase):
                 )
 
         self.assertEqual(mocked_popen.call_count, 1)
-        mocked_sleep.assert_not_called()
+        mocked_retry_wait.assert_not_called()
 
     @patch(
         "app.core.downloaders.ffmpeg.debug_logger.log_exception",
         side_effect=RuntimeError("diagnostic logger failed"),
     )
-    @patch("app.core.downloaders.ffmpeg.time.sleep", return_value=None)
-    @patch("app.core.downloaders.ffmpeg.requests.head")
+    @patch.object(FFmpegDownloader, "_wait_for_retry")
+    @patch.object(FFmpegDownloader, "_start_validated_media_proxy")
     @patch("app.core.downloaders.ffmpeg.subprocess.Popen")
     @patch("app.core.downloaders.ffmpeg.cfg.get")
     @patch(
@@ -1228,8 +1239,8 @@ class DownloaderStrategyTests(unittest.TestCase):
         _mocked_resolve,
         mocked_cfg_get,
         mocked_popen,
-        mocked_head,
-        mocked_sleep,
+        mocked_start_proxy,
+        mocked_retry_wait,
         _mocked_log_exception,
     ):
         """取消是主结果；kill/poll/wait 清理失败不得重试或改写异常。"""
@@ -1240,11 +1251,7 @@ class DownloaderStrategyTests(unittest.TestCase):
             return default
 
         mocked_cfg_get.side_effect = fake_cfg_get
-        head_response = Mock()
-        head_response.url = "https://cdn.example.com/video.mp4"
-        head_response.status_code = 200
-        head_response.headers = {}
-        mocked_head.return_value = head_response
+        mocked_start_proxy.return_value = _StubMediaProxy()
 
         process = Mock()
         process.stderr.readline.return_value = b""
@@ -1276,7 +1283,7 @@ class DownloaderStrategyTests(unittest.TestCase):
                 )
 
         self.assertEqual(mocked_popen.call_count, 1)
-        mocked_sleep.assert_not_called()
+        mocked_retry_wait.assert_not_called()
 
     @patch(
         "app.core.downloaders.ffmpeg.debug_logger.log_exception",
@@ -1338,7 +1345,7 @@ class DownloaderStrategyTests(unittest.TestCase):
         "app.core.downloaders.ffmpeg.debug_logger.log_exception",
         side_effect=RuntimeError("diagnostic logger failed"),
     )
-    @patch("app.core.downloaders.ffmpeg.requests.head")
+    @patch.object(FFmpegDownloader, "_start_validated_media_proxy")
     @patch("app.core.downloaders.ffmpeg.subprocess.Popen")
     @patch("app.core.downloaders.ffmpeg.cfg.get")
     @patch(
@@ -1350,7 +1357,7 @@ class DownloaderStrategyTests(unittest.TestCase):
         _mocked_resolve,
         mocked_cfg_get,
         mocked_popen,
-        mocked_head,
+        mocked_start_proxy,
         _mocked_log_exception,
     ):
         """诊断日志不可覆盖真正的有界 wait 失败及其异常链。"""
@@ -1361,11 +1368,7 @@ class DownloaderStrategyTests(unittest.TestCase):
             return default
 
         mocked_cfg_get.side_effect = fake_cfg_get
-        head_response = Mock()
-        head_response.url = "https://cdn.example.com/video.mp4"
-        head_response.status_code = 200
-        head_response.headers = {}
-        mocked_head.return_value = head_response
+        mocked_start_proxy.return_value = _StubMediaProxy()
 
         primary_error = OSError("primary wait failed")
         process = Mock()
@@ -1392,8 +1395,8 @@ class DownloaderStrategyTests(unittest.TestCase):
 
         self.assertIs(raised.exception.__cause__, primary_error)
 
-    @patch("app.core.downloaders.ffmpeg.time.sleep")
-    @patch("app.core.downloaders.ffmpeg.requests.head")
+    @patch.object(FFmpegDownloader, "_wait_for_retry")
+    @patch.object(FFmpegDownloader, "_start_validated_media_proxy")
     @patch("app.core.downloaders.ffmpeg.subprocess.Popen")
     @patch("app.core.downloaders.ffmpeg.cfg.get")
     @patch(
@@ -1405,8 +1408,8 @@ class DownloaderStrategyTests(unittest.TestCase):
         _mocked_resolve,
         mocked_cfg_get,
         mocked_popen,
-        mocked_head,
-        mocked_sleep,
+        mocked_start_proxy,
+        mocked_retry_wait,
     ):
         """重试等待内到达的取消必须在下一轮外部副作用前生效。"""
 
@@ -1416,11 +1419,7 @@ class DownloaderStrategyTests(unittest.TestCase):
             return default
 
         mocked_cfg_get.side_effect = fake_cfg_get
-        head_response = Mock()
-        head_response.url = "https://cdn.example.com/video.mp4"
-        head_response.status_code = 200
-        head_response.headers = {}
-        mocked_head.return_value = head_response
+        mocked_start_proxy.return_value = _StubMediaProxy()
 
         cancelled = threading.Event()
         failed_process = Mock()
@@ -1435,7 +1434,8 @@ class DownloaderStrategyTests(unittest.TestCase):
             return failed_process
 
         mocked_popen.side_effect = start_only_one_process
-        mocked_sleep.side_effect = lambda _seconds: cancelled.set()
+        # 取消在重试退避窗口内到达：下一轮不得再启动代理或 ffmpeg。
+        mocked_retry_wait.side_effect = lambda _check_stop_func: cancelled.set()
         item = VideoItem(
             url="https://example.com/video.mp4",
             title="demo",
@@ -1451,8 +1451,9 @@ class DownloaderStrategyTests(unittest.TestCase):
                     cancelled.is_set,
                 )
 
+        mocked_retry_wait.assert_called_once()
         self.assertEqual(mocked_popen.call_count, 1)
-        self.assertEqual(mocked_head.call_count, 1)
+        self.assertEqual(mocked_start_proxy.call_count, 1)
 
     def test_ffmpeg_command_build_failure_stops_created_proxy(self):
         """代理创建后的命令构建异常也必须走统一清理路径。"""
@@ -1632,7 +1633,7 @@ class DownloaderStrategyTests(unittest.TestCase):
                 if mocked_popen.call_count == 1:
                     Path(command[-1]).write_bytes(b"partial")
                     return first_process
-                Path(command[-1]).write_bytes(b"published")
+                Path(command[-1]).write_bytes(_FTYP)
                 return second_process
 
             def observe_retry(_check_stop_func):
@@ -1679,7 +1680,7 @@ class DownloaderStrategyTests(unittest.TestCase):
                     lambda: False,
                 )
 
-            self.assertEqual(Path(save_path).read_bytes(), b"published")
+            self.assertEqual(Path(save_path).read_bytes(), _FTYP)
             self.assertFalse(Path(temp_path).exists())
 
         self.assertEqual(mocked_start_proxy.call_count, 2)
@@ -2381,7 +2382,7 @@ class DownloaderStrategyTests(unittest.TestCase):
         mocked_popen.assert_not_called()
         local_proxy.stop.assert_called_once_with()
 
-    @patch("app.core.downloaders.ffmpeg.requests.head")
+    @patch.object(FFmpegDownloader, "_start_validated_media_proxy")
     @patch("app.core.downloaders.ffmpeg.subprocess.Popen")
     @patch("app.core.downloaders.ffmpeg.cfg.get")
     @patch(
@@ -2393,7 +2394,7 @@ class DownloaderStrategyTests(unittest.TestCase):
         _mocked_resolve,
         mocked_cfg_get,
         mocked_popen,
-        mocked_head,
+        mocked_start_proxy,
     ):
         """成品已原子发布后，成功日志失败不得将调用反转为失败。"""
 
@@ -2403,11 +2404,7 @@ class DownloaderStrategyTests(unittest.TestCase):
             return default
 
         mocked_cfg_get.side_effect = fake_cfg_get
-        head_response = Mock()
-        head_response.url = "https://cdn.example.com/video.mp4"
-        head_response.status_code = 200
-        head_response.headers = {}
-        mocked_head.return_value = head_response
+        mocked_start_proxy.return_value = _StubMediaProxy()
 
         process = Mock()
         process.stderr.readline.return_value = b""
@@ -2416,7 +2413,7 @@ class DownloaderStrategyTests(unittest.TestCase):
         process.wait.return_value = 0
 
         def fake_popen(command, **_kwargs):
-            Path(command[-1]).write_bytes(b"published")
+            Path(command[-1]).write_bytes(_FTYP)
             return process
 
         mocked_popen.side_effect = fake_popen
@@ -2455,7 +2452,7 @@ class DownloaderStrategyTests(unittest.TestCase):
                     lambda: False,
                 )
 
-            self.assertEqual(Path(save_path).read_bytes(), b"published")
+            self.assertEqual(Path(save_path).read_bytes(), _FTYP)
             self.assertFalse(Path(temp_path).exists())
             mocked_success_log.assert_called()
             self.assertEqual(
@@ -2463,7 +2460,7 @@ class DownloaderStrategyTests(unittest.TestCase):
                 ("download_finished", "FFMPEG_OK", True, False),
             )
 
-    @patch("app.core.downloaders.ffmpeg.requests.head")
+    @patch.object(FFmpegDownloader, "_start_validated_media_proxy")
     @patch("app.core.downloaders.ffmpeg.subprocess.Popen")
     @patch("app.core.downloaders.ffmpeg.cfg.get")
     @patch(
@@ -2475,7 +2472,7 @@ class DownloaderStrategyTests(unittest.TestCase):
         _mocked_resolve,
         mocked_cfg_get,
         mocked_popen,
-        mocked_head,
+        mocked_start_proxy,
     ):
         """发布后的进度回调及其诊断失败都只是观察失败。"""
 
@@ -2485,11 +2482,7 @@ class DownloaderStrategyTests(unittest.TestCase):
             return default
 
         mocked_cfg_get.side_effect = fake_cfg_get
-        head_response = Mock()
-        head_response.url = "https://cdn.example.com/video.mp4"
-        head_response.status_code = 200
-        head_response.headers = {}
-        mocked_head.return_value = head_response
+        mocked_start_proxy.return_value = _StubMediaProxy()
 
         process = Mock()
         process.stderr.readline.return_value = b""
@@ -2498,7 +2491,7 @@ class DownloaderStrategyTests(unittest.TestCase):
         process.wait.return_value = 0
 
         def fake_popen(command, **_kwargs):
-            Path(command[-1]).write_bytes(b"published")
+            Path(command[-1]).write_bytes(_FTYP)
             return process
 
         mocked_popen.side_effect = fake_popen
@@ -2541,7 +2534,7 @@ class DownloaderStrategyTests(unittest.TestCase):
                     lambda: False,
                 )
 
-            self.assertEqual(Path(save_path).read_bytes(), b"published")
+            self.assertEqual(Path(save_path).read_bytes(), _FTYP)
             self.assertFalse(Path(temp_path).exists())
             self.assertEqual(progress_states, [(100, True, False)])
             self.assertEqual(
@@ -2554,7 +2547,7 @@ class DownloaderStrategyTests(unittest.TestCase):
             mocked_success_log.assert_called_once()
             self.assertEqual(mocked_diagnostic_log.call_count, 2)
 
-    @patch("app.core.downloaders.ffmpeg.requests.head")
+    @patch.object(FFmpegDownloader, "_start_validated_media_proxy")
     @patch("app.core.downloaders.ffmpeg.subprocess.Popen")
     @patch("app.core.downloaders.ffmpeg.cfg.get")
     @patch(
@@ -2566,7 +2559,7 @@ class DownloaderStrategyTests(unittest.TestCase):
         _mocked_resolve,
         mocked_cfg_get,
         mocked_popen,
-        mocked_head,
+        mocked_start_proxy,
     ):
         """外部进程失败只能清理本轮临时文件，不得删除旧成品。"""
 
@@ -2576,11 +2569,7 @@ class DownloaderStrategyTests(unittest.TestCase):
             return default
 
         mocked_cfg_get.side_effect = fake_cfg_get
-        head_response = Mock()
-        head_response.url = "https://cdn.example.com/video.mp4"
-        head_response.status_code = 200
-        head_response.headers = {}
-        mocked_head.return_value = head_response
+        mocked_start_proxy.return_value = _StubMediaProxy()
 
         process = Mock()
         process.stderr.readline.return_value = b""
@@ -2615,7 +2604,7 @@ class DownloaderStrategyTests(unittest.TestCase):
             self.assertEqual(Path(save_path).read_bytes(), b"old-final")
             self.assertFalse(Path(temp_path).exists())
 
-    @patch("app.core.downloaders.ffmpeg.requests.head")
+    @patch.object(FFmpegDownloader, "_start_validated_media_proxy")
     @patch("app.core.downloaders.ffmpeg.subprocess.Popen")
     @patch(
         "app.core.downloaders.ffmpeg.FFmpegExternalTool.resolve_executable",
@@ -2625,14 +2614,9 @@ class DownloaderStrategyTests(unittest.TestCase):
         self,
         _mocked_resolve,
         mocked_popen,
-        mocked_head,
+        mocked_start_proxy,
     ):
         """取消必须保留旧成品，并在启动任何外部进程前返回。"""
-        head_response = Mock()
-        head_response.url = "https://cdn.example.com/video.mp4"
-        head_response.status_code = 200
-        head_response.headers = {}
-        mocked_head.return_value = head_response
         process = Mock()
         process.stderr.readline.return_value = b""
         process.returncode = 0
@@ -2657,10 +2641,10 @@ class DownloaderStrategyTests(unittest.TestCase):
 
             self.assertEqual(Path(save_path).read_bytes(), b"old-final")
 
-        mocked_head.assert_not_called()
+        mocked_start_proxy.assert_not_called()
         mocked_popen.assert_not_called()
 
-    @patch("app.core.downloaders.ffmpeg.requests.head")
+    @patch.object(FFmpegDownloader, "_start_validated_media_proxy")
     @patch("app.core.downloaders.ffmpeg.subprocess.Popen")
     @patch("app.core.downloaders.ffmpeg.cfg.get")
     @patch(
@@ -2672,7 +2656,7 @@ class DownloaderStrategyTests(unittest.TestCase):
         _mocked_resolve,
         mocked_cfg_get,
         mocked_popen,
-        mocked_head,
+        mocked_start_proxy,
     ):
         """os.replace 失败时必须保留旧成品并清理本轮临时文件。"""
 
@@ -2682,11 +2666,7 @@ class DownloaderStrategyTests(unittest.TestCase):
             return default
 
         mocked_cfg_get.side_effect = fake_cfg_get
-        head_response = Mock()
-        head_response.url = "https://cdn.example.com/video.mp4"
-        head_response.status_code = 200
-        head_response.headers = {}
-        mocked_head.return_value = head_response
+        mocked_start_proxy.return_value = _StubMediaProxy()
 
         process = Mock()
         process.stderr.readline.return_value = b""
@@ -2729,7 +2709,7 @@ class DownloaderStrategyTests(unittest.TestCase):
     @patch.object(FFmpegDownloader, "PROGRESS_TIMEOUT_SEC", 0.0)
     @patch.object(FFmpegDownloader, "STDERR_POLL_INTERVAL_SEC", 0.001)
     @patch("app.core.downloaders.ffmpeg.time.sleep", return_value=None)
-    @patch("app.core.downloaders.ffmpeg.requests.head")
+    @patch.object(FFmpegDownloader, "_start_validated_media_proxy")
     @patch("app.core.downloaders.ffmpeg.subprocess.Popen")
     @patch("app.core.downloaders.ffmpeg.cfg.get")
     @patch(
@@ -2741,7 +2721,7 @@ class DownloaderStrategyTests(unittest.TestCase):
         _mocked_resolve,
         mocked_cfg_get,
         mocked_popen,
-        mocked_head,
+        mocked_start_proxy,
         _mocked_sleep,
     ):
         """停滞 watchdog 之后的每次 wait 都必须带有限 timeout。"""
@@ -2752,11 +2732,7 @@ class DownloaderStrategyTests(unittest.TestCase):
             return default
 
         mocked_cfg_get.side_effect = fake_cfg_get
-        head_response = Mock()
-        head_response.url = "https://cdn.example.com/video.mp4"
-        head_response.status_code = 200
-        head_response.headers = {}
-        mocked_head.return_value = head_response
+        mocked_start_proxy.return_value = _StubMediaProxy()
 
         process = Mock()
         process.stderr.readline.return_value = b""
@@ -2796,7 +2772,7 @@ class DownloaderStrategyTests(unittest.TestCase):
     @patch.object(FFmpegDownloader, "STDERR_POLL_INTERVAL_SEC", 0.001)
     @patch.object(FFmpegDownloader, "PROCESS_WAIT_TIMEOUT_SEC", 0.01)
     @patch.object(FFmpegDownloader, "STDERR_JOIN_TIMEOUT_SEC", 0.02)
-    @patch("app.core.downloaders.ffmpeg.requests.head")
+    @patch.object(FFmpegDownloader, "_start_validated_media_proxy")
     @patch("app.core.downloaders.ffmpeg.subprocess.Popen")
     @patch("app.core.downloaders.ffmpeg.cfg.get")
     @patch(
@@ -2808,7 +2784,7 @@ class DownloaderStrategyTests(unittest.TestCase):
         _mocked_resolve,
         mocked_cfg_get,
         mocked_popen,
-        mocked_head,
+        mocked_start_proxy,
     ):
         """两次 wait 均超时也必须关闭 pipe，并在有界时间内收掉真实 reader。"""
 
@@ -2818,11 +2794,7 @@ class DownloaderStrategyTests(unittest.TestCase):
             return default
 
         mocked_cfg_get.side_effect = fake_cfg_get
-        head_response = Mock()
-        head_response.url = "https://cdn.example.com/video.mp4"
-        head_response.status_code = 200
-        head_response.headers = {}
-        mocked_head.return_value = head_response
+        mocked_start_proxy.return_value = _StubMediaProxy()
 
         class BlockingStderr:
             def __init__(self):
@@ -2891,25 +2863,22 @@ class DownloaderStrategyTests(unittest.TestCase):
                 thread.join(timeout=0.2)
 
     @patch.object(FFmpegDownloader, "RETRY_DELAY_SEC", 0.0)
-    @patch("app.core.downloaders.ffmpeg.requests.head")
+    @patch.object(FFmpegDownloader, "_start_validated_media_proxy")
     @patch("app.core.downloaders.ffmpeg.subprocess.Popen")
+    @patch("app.core.downloaders.ffmpeg.FFmpegExternalTool.probe_duration_seconds", return_value=(True, 12.0))
     @patch("app.core.downloaders.ffmpeg.FFmpegExternalTool.resolve_executable", return_value="ffmpeg.exe")
     def test_ffmpeg_downloader_refreshes_douyin_stream_url_between_retries(
         self,
         _mocked_resolve,
+        _mocked_probe,
         mocked_popen,
-        mocked_head,
+        mocked_start_proxy,
     ):
-        """抖音 play_url 失败重试时应重新解析可用 CDN，而不是死用同一条失效地址。"""
-        head_first = Mock()
-        head_first.url = "https://cdn1.example.com/video.mp4"
-        head_first.status_code = 200
-        head_first.headers = {"content-length": "4096"}
-        head_second = Mock()
-        head_second.url = "https://cdn2.example.com/video.mp4"
-        head_second.status_code = 200
-        head_second.headers = {"content-length": "8192"}
-        mocked_head.side_effect = [head_first, head_second]
+        """抖音 play_url 失败重试时应重新建立受控代理通道，而不是死用同一条失效地址。"""
+        # 每次尝试都必须重新解析并钉死地址；ffmpeg 只能看到各轮的 loopback 代理地址。
+        first_proxy = _StubMediaProxy("http://127.0.0.1:12345/media?u=cdn1")
+        second_proxy = _StubMediaProxy("http://127.0.0.1:23456/media?u=cdn2")
+        mocked_start_proxy.side_effect = [first_proxy, second_proxy]
 
         failed_process = Mock()
         failed_process.stderr.readline.side_effect = [b"", b""]
@@ -2937,24 +2906,24 @@ class DownloaderStrategyTests(unittest.TestCase):
                 if mocked_popen.call_count == 1:
                     return failed_process
                 self.assertEqual(cmd[-1], temp_path)
-                Path(cmd[-1]).write_bytes(b"done")
+                Path(cmd[-1]).write_bytes(_FTYP)
                 return success_process
 
             mocked_popen.side_effect = fake_popen
 
             FFmpegDownloader().download(item, save_path, progress.append, lambda: False)
 
-        self.assertEqual(mocked_head.call_count, 2)
+        self.assertEqual(mocked_start_proxy.call_count, 2)
         first_cmd = mocked_popen.call_args_list[0].args[0]
         second_cmd = mocked_popen.call_args_list[1].args[0]
-        self.assertEqual(first_cmd[first_cmd.index("-i") + 1], "https://cdn1.example.com/video.mp4")
-        self.assertEqual(second_cmd[second_cmd.index("-i") + 1], "https://cdn2.example.com/video.mp4")
+        self.assertEqual(first_cmd[first_cmd.index("-i") + 1], first_proxy.url)
+        self.assertEqual(second_cmd[second_cmd.index("-i") + 1], second_proxy.url)
         self.assertEqual(progress, [100])
 
     @patch.object(FFmpegDownloader, "PROGRESS_TIMEOUT_SEC", 0.01)
     @patch.object(FFmpegDownloader, "STDERR_POLL_INTERVAL_SEC", 0.005)
     @patch.object(FFmpegDownloader, "RETRY_DELAY_SEC", 0.0)
-    @patch("app.core.downloaders.ffmpeg.requests.head")
+    @patch.object(FFmpegDownloader, "_start_validated_media_proxy")
     @patch("app.core.downloaders.ffmpeg.subprocess.Popen")
     @patch("app.core.downloaders.ffmpeg.cfg.get")
     @patch("app.core.downloaders.ffmpeg.FFmpegExternalTool.resolve_executable", return_value="ffmpeg.exe")
@@ -2963,14 +2932,10 @@ class DownloaderStrategyTests(unittest.TestCase):
         _mocked_resolve,
         mocked_cfg_get,
         mocked_popen,
-        mocked_head,
+        mocked_start_proxy,
     ):
         """stderr 不再产出时，下载器仍应按无进度超时主动 kill 进程。"""
-        head_response = Mock()
-        head_response.url = "https://cdn.example.com/video.mp4"
-        head_response.status_code = 200
-        head_response.headers = {"content-length": "4096"}
-        mocked_head.return_value = head_response
+        mocked_start_proxy.return_value = _StubMediaProxy()
 
         def fake_cfg_get(section, key, default=None):
             if (section, key) == ("download", "max_retries"):
@@ -3601,19 +3566,20 @@ class DownloaderStrategyTests(unittest.TestCase):
 
         mocked_cfg_get.side_effect = cfg_get
         head_response = Mock()
-        head_response.headers = {"content-length": "10", "accept-ranges": "bytes", "etag": '"v1"'}
+        head_response.headers = {"content-length": str(len(_FTYP)), "accept-ranges": "bytes", "etag": '"v1"'}
         head_response.raise_for_status.return_value = None
         mocked_head.return_value = head_response
+        # 首段在 8 字节处断线，重试按 Range 从断点续传同一合法负载。
         mocked_get.side_effect = [
             self._make_stream_response_raising(
-                [b"1234"],
+                [_FTYP[:8]],
                 requests.ConnectionError("drop"),
-                headers={"content-length": "10", "content-range": "bytes 0-9/10"},
+                headers={"content-length": str(len(_FTYP)), "content-range": f"bytes 0-{len(_FTYP) - 1}/{len(_FTYP)}"},
                 status_code=206,
             ),
             self._make_stream_response(
-                [b"567890"],
-                headers={"content-length": "6", "content-range": "bytes 4-9/10"},
+                [_FTYP[8:]],
+                headers={"content-length": str(len(_FTYP) - 8), "content-range": f"bytes 8-{len(_FTYP) - 1}/{len(_FTYP)}"},
                 status_code=206,
             ),
         ]
@@ -3623,9 +3589,9 @@ class DownloaderStrategyTests(unittest.TestCase):
             save_path = os.path.join(temp_dir, "demo.mp4")
             ChunkedDownloader().download(item, save_path, lambda _value, **_kwargs: None, lambda: False)
 
-            self.assertEqual(Path(save_path).read_bytes(), b"1234567890")
+            self.assertEqual(Path(save_path).read_bytes(), _FTYP)
 
-        self.assertEqual(mocked_get.call_args_list[1].kwargs["headers"]["Range"], "bytes=4-9")
+        self.assertEqual(mocked_get.call_args_list[1].kwargs["headers"]["Range"], "bytes=8-15")
         self.assertEqual(mocked_get.call_args_list[1].kwargs["headers"]["If-Range"], '"v1"')
         self.assertTrue(any(call.kwargs.get("action") == "chunk_retry" for call in mocked_log.call_args_list))
 
@@ -3649,25 +3615,26 @@ class DownloaderStrategyTests(unittest.TestCase):
 
         mocked_cfg_get.side_effect = cfg_get
         head_response = Mock()
-        head_response.headers = {"content-length": "10", "accept-ranges": "bytes"}
+        head_response.headers = {"content-length": str(len(_FTYP)), "accept-ranges": "bytes"}
         head_response.raise_for_status.return_value = None
         mocked_head.return_value = head_response
         mocked_get.return_value = self._make_stream_response(
-            [b"0123456789"],
-            headers={"content-length": "10", "content-range": "bytes 0-9/10"},
+            [_FTYP],
+            headers={"content-length": str(len(_FTYP)), "content-range": f"bytes 0-{len(_FTYP) - 1}/{len(_FTYP)}"},
             status_code=206,
         )
         item = VideoItem(url="https://example.com/video.mp4", title="demo", source="douyin")
 
         with tempfile.TemporaryDirectory() as temp_dir:
             save_path = os.path.join(temp_dir, "demo.mp4")
-            Path(temp_dir, ".demo.mp4.part0").write_bytes(b"stale-data!!")
+            # 超长陈旧分片（大于本片期望的 16 字节）不得参与合并。
+            Path(temp_dir, ".demo.mp4.part0").write_bytes(b"stale-data!!" * 2)
 
             ChunkedDownloader().download(item, save_path, lambda _value, **_kwargs: None, lambda: False)
 
-            self.assertEqual(Path(save_path).read_bytes(), b"0123456789")
+            self.assertEqual(Path(save_path).read_bytes(), _FTYP)
 
-        self.assertEqual(mocked_get.call_args.kwargs["headers"]["Range"], "bytes=0-9")
+        self.assertEqual(mocked_get.call_args.kwargs["headers"]["Range"], "bytes=0-15")
 
     @patch("app.core.downloaders.chunked.time.sleep", return_value=None)
     @patch("app.core.downloaders.chunked.requests.get")
@@ -3703,6 +3670,8 @@ class DownloaderStrategyTests(unittest.TestCase):
                     lambda: False,
                 )
 
+    # 缺 audio_url 的单段流必须自带音画才能完成；这里打桩 ffprobe 证实内嵌音频轨。
+    @patch("app.core.downloaders.bilibili.FFmpegExternalTool.probe_contains_audio", return_value=(True, True))
     @patch.object(BilibiliDownloader, "_run_merge_process")
     @patch("app.core.downloaders.bilibili.FFmpegExternalTool.build_merge_command", return_value=["ffmpeg", "-i", "video", "output"])
     @patch("app.core.downloaders.bilibili.FFmpegExternalTool.resolve_executable", return_value="ffmpeg.exe")
@@ -3713,6 +3682,7 @@ class DownloaderStrategyTests(unittest.TestCase):
         _mocked_resolve,
         mocked_build_merge,
         mocked_run_merge,
+        _mocked_probe,
     ):
         """验证 `test_bilibili_downloader_downloads_video_only_streams_when_audio_missing` 对应场景是否符合预期，供 `DownloaderStrategyTests` 使用。"""
         mocked_get.return_value = self._make_stream_response(
@@ -3725,7 +3695,7 @@ class DownloaderStrategyTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temp_dir:
             save_path = os.path.join(temp_dir, "demo.mp4")
-            mocked_run_merge.side_effect = lambda *args, **kwargs: Path(kwargs["save_path"]).write_bytes(b"merged")
+            mocked_run_merge.side_effect = lambda *args, **kwargs: Path(kwargs["save_path"]).write_bytes(b"\x00\x00\x00\x18ftypisom\x00\x00\x00\x00merged")
             BilibiliDownloader().download(item, save_path, progress.append, lambda: False)
 
         self.assertEqual(progress, [10, 10, 90, 90, 91, 100])
@@ -3760,7 +3730,7 @@ class DownloaderStrategyTests(unittest.TestCase):
             save_path = os.path.join(temp_dir, "demo.mp4")
             temp_v = os.path.join(temp_dir, "demo_video.m4s")
             temp_a = os.path.join(temp_dir, "demo_audio.m4s")
-            mocked_run_merge.side_effect = lambda *args, **kwargs: Path(kwargs["save_path"]).write_bytes(b"merged")
+            mocked_run_merge.side_effect = lambda *args, **kwargs: Path(kwargs["save_path"]).write_bytes(b"\x00\x00\x00\x18ftypisom\x00\x00\x00\x00merged")
 
             BilibiliDownloader().download(item, save_path, lambda *_args, **_kwargs: None, lambda: False)
 
@@ -3773,6 +3743,8 @@ class DownloaderStrategyTests(unittest.TestCase):
         self.assertEqual(mocked_get.call_count, 2)
         mocked_run_merge.assert_called_once()
 
+    # 缺 audio_url 的单段流必须自带音画才能完成；这里打桩 ffprobe 证实内嵌音频轨。
+    @patch("app.core.downloaders.bilibili.FFmpegExternalTool.probe_contains_audio", return_value=(True, True))
     @patch.object(BilibiliDownloader, "_run_merge_process")
     @patch("app.core.downloaders.bilibili.time.sleep", return_value=None)
     @patch("app.core.downloaders.bilibili.debug_logger.log")
@@ -3787,6 +3759,7 @@ class DownloaderStrategyTests(unittest.TestCase):
         mocked_log,
         _mocked_sleep,
         mocked_run_merge,
+        _mocked_probe,
     ):
         first_chunk = b"x" * 524288
         incomplete = requests.exceptions.ChunkedEncodingError(
@@ -3813,7 +3786,7 @@ class DownloaderStrategyTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temp_dir:
             save_path = os.path.join(temp_dir, "demo.mp4")
-            mocked_run_merge.side_effect = lambda *args, **kwargs: Path(kwargs["save_path"]).write_bytes(b"merged")
+            mocked_run_merge.side_effect = lambda *args, **kwargs: Path(kwargs["save_path"]).write_bytes(b"\x00\x00\x00\x18ftypisom\x00\x00\x00\x00merged")
 
             BilibiliDownloader().download(item, save_path, lambda *_args, **_kwargs: None, lambda: False)
 
@@ -3826,6 +3799,8 @@ class DownloaderStrategyTests(unittest.TestCase):
         )
         mocked_run_merge.assert_called_once()
 
+    # 缺 audio_url 的单段流必须自带音画才能完成；这里打桩 ffprobe 证实内嵌音频轨。
+    @patch("app.core.downloaders.bilibili.FFmpegExternalTool.probe_contains_audio", return_value=(True, True))
     @patch.object(BilibiliDownloader, "_run_merge_process")
     @patch("app.core.downloaders.bilibili.time.sleep", return_value=None)
     @patch("app.core.downloaders.bilibili.FFmpegExternalTool.build_merge_command", return_value=["ffmpeg", "-i", "video", "output"])
@@ -3838,6 +3813,7 @@ class DownloaderStrategyTests(unittest.TestCase):
         _mocked_build_merge,
         _mocked_sleep,
         mocked_run_merge,
+        _mocked_probe,
     ):
         mocked_get.side_effect = [
             self._make_stream_response([b"12"], headers={"content-length": "4"}),
@@ -3856,7 +3832,7 @@ class DownloaderStrategyTests(unittest.TestCase):
 
             def finish_merge(*_args, **kwargs):
                 stream_bytes.append(Path(kwargs["temp_v"]).read_bytes())
-                Path(kwargs["save_path"]).write_bytes(b"merged")
+                Path(kwargs["save_path"]).write_bytes(b"\x00\x00\x00\x18ftypisom\x00\x00\x00\x00merged")
 
             mocked_run_merge.side_effect = finish_merge
             BilibiliDownloader().download(item, save_path, lambda *_args, **_kwargs: None, lambda: False)
@@ -3936,6 +3912,8 @@ class DownloaderStrategyTests(unittest.TestCase):
             {"fnval": 4048, "bvid": "BV1xx", "cid": "123"},
         )
 
+    # 缺 audio_url 的单段流必须自带音画才能走到合并；这里打桩 ffprobe 证实内嵌音频轨。
+    @patch("app.core.downloaders.bilibili.FFmpegExternalTool.probe_contains_audio", return_value=(True, True))
     @patch.object(BilibiliDownloader, "_run_merge_process", side_effect=MergeError("ffmpeg failed"))
     @patch("app.core.downloaders.bilibili.FFmpegExternalTool.build_merge_command", return_value=["ffmpeg", "-i", "video", "output"])
     @patch("app.core.downloaders.bilibili.FFmpegExternalTool.resolve_executable", return_value="ffmpeg.exe")
@@ -3946,6 +3924,7 @@ class DownloaderStrategyTests(unittest.TestCase):
         _mocked_resolve,
         _mocked_build_merge,
         _mocked_run_merge,
+        _mocked_probe,
     ):
         """验证 `test_bilibili_downloader_raises_merge_error_when_ffmpeg_fails` 对应场景是否符合预期，供 `DownloaderStrategyTests` 使用。"""
         mocked_get.return_value = self._make_stream_response(
@@ -4361,7 +4340,14 @@ class DownloaderStrategyTests(unittest.TestCase):
         item.meta["_network_policy"] = "public"
         process = Mock(returncode=0)
         process.poll.return_value = 0
-        mocked_popen.return_value = process
+
+        def fake_popen(cmd, _creation_flags):
+            save_dir = cmd[cmd.index("--save-dir") + 1]
+            save_name = cmd[cmd.index("--save-name") + 1]
+            Path(save_dir, f"{save_name}.mp4").write_bytes(b"\x00\x00\x00\x18ftypisom" + b"\x00" * 8)
+            return process
+
+        mocked_popen.side_effect = fake_popen
         stopped = []
 
         class FakeProxy:
@@ -4378,10 +4364,13 @@ class DownloaderStrategyTests(unittest.TestCase):
                 (None, None, None, None, ("93.184.216.34", 443)),
             ]
         )
-        with patch("app.core.downloaders.base.PUBLIC_DOMAIN_POLICY", public_policy), patch.object(
-            downloader, "_start_local_hls_proxy", return_value=FakeProxy()
-        ):
-            downloader.download(item, "demo.mp4", lambda _value: None, lambda: False)
+        with tempfile.TemporaryDirectory() as temp_dir, patch(
+            "app.core.downloaders.base.PUBLIC_DOMAIN_POLICY", public_policy
+        ), patch(
+            "app.core.downloaders.m3u8.FFmpegExternalTool.probe_duration_seconds",
+            return_value=(False, None),
+        ), patch.object(downloader, "_start_local_hls_proxy", return_value=FakeProxy()):
+            downloader.download(item, os.path.join(temp_dir, "demo.mp4"), lambda _value: None, lambda: False)
 
         command = mocked_popen.call_args.args[0]
         self.assertIn(FakeProxy.url, command)
@@ -4603,14 +4592,31 @@ https://cdn.example.com/seg2.m4s?token=1
     ):
         process = Mock()
         process.returncode = 0
-        mocked_popen.return_value = process
+        process.poll.return_value = 0
+
+        def fake_popen(cmd, *args, **kwargs):
+            del args, kwargs
+            save_dir = cmd[cmd.index("--save-dir") + 1]
+            save_name = cmd[cmd.index("--save-name") + 1]
+            Path(save_dir, f"{save_name}.mp4").write_bytes(b"\x00\x00\x00\x18ftypisom" + b"\x00" * 8)
+            return process
+
+        mocked_popen.side_effect = fake_popen
         item = VideoItem(url="https://cdn.example.com/live/index.m3u8", title="live", source="douyin")
 
-        N_m3u8DL_RE_Downloader().download(item, "demo.mp4", lambda _value, **_kwargs: None, lambda: False)
+        with tempfile.TemporaryDirectory() as temp_dir, patch(
+            "app.core.downloaders.m3u8.FFmpegExternalTool.probe_duration_seconds",
+            return_value=(False, None),
+        ):
+            save_path = os.path.join(temp_dir, "demo.mp4")
+            N_m3u8DL_RE_Downloader().download(item, save_path, lambda _value, **_kwargs: None, lambda: False)
+            self.assertTrue(os.path.isfile(save_path))
 
         mocked_wait_progress.assert_called_once()
         self.assertIs(mocked_wait_progress.call_args.args[0], process)
-        self.assertEqual(mocked_wait_progress.call_args.args[1], "demo.mp4")
+        waited = str(mocked_wait_progress.call_args.args[1])
+        self.assertTrue(waited.endswith("ucp-media.mp4"))
+        self.assertIn(N_m3u8DL_RE_Downloader.NM3U8_TEMP_ROOT_NAME, waited)
         self.assertEqual(mocked_wait_progress.call_args.args[4], 0)
         self.assertEqual(mocked_popen.call_args.kwargs["creationflags"], 321)
         self.assertEqual(mocked_popen.call_args.kwargs["stdout"], subprocess.PIPE)
@@ -4955,7 +4961,7 @@ https://cdn.example.com/seg2.m4s?token=1
             downloader,
             "_curl_cffi_get_response",
             return_value=response,
-        ) as mocked_get:
+        ) as mocked_get, self.assertRaises(DomainPolicyViolation):
             downloader._hls_proxy_open_upstream(
                 "https://cdn.example/video.mp4",
                 {},
@@ -4963,9 +4969,7 @@ https://cdn.example.com/seg2.m4s?token=1
                 domain_policy=policy,
         )
 
-        self.assertEqual(mocked_get.call_args.args[3], proxy_url)
-        self.assertIsNone(mocked_get.call_args.kwargs["curl_options"])
-        self.assertTrue(callable(mocked_get.call_args.kwargs["header_callback"]))
+        mocked_get.assert_not_called()
 
     def test_hls_proxy_explicit_proxy_size_limit_survives_cleanup_logging_failure(self):
         downloader = N_m3u8DL_RE_Downloader()
@@ -4987,6 +4991,9 @@ https://cdn.example.com/seg2.m4s?token=1
         ), patch(
             "app.core.downloaders.m3u8.debug_logger.log_exception",
             side_effect=RuntimeError("diagnostic logger failed"),
+        ), patch(
+            "app.core.downloaders.hls_proxy.prepare_hls_curl_request",
+            side_effect=lambda url, _policy, _proxy: (url, None),
         ):
             with self.assertRaisesRegex(DomainPolicyViolation, "size limit"):
                 downloader._hls_proxy_request_response(
@@ -5008,6 +5015,9 @@ https://cdn.example.com/seg2.m4s?token=1
             downloader,
             "_curl_cffi_get_response",
             return_value=response,
+        ), patch(
+            "app.core.downloaders.hls_proxy.prepare_hls_curl_request",
+            side_effect=lambda url, _policy, _proxy: (url, None),
         ):
             with self.assertRaisesRegex(DomainPolicyViolation, "size limit"):
                 downloader._hls_proxy_request_response(
@@ -5036,7 +5046,10 @@ https://cdn.example.com/seg2.m4s?token=1
                 raise OSError("curl write aborted")
             return response
 
-        with patch.object(
+        with patch(
+            "app.core.downloaders.hls_proxy.prepare_hls_curl_request",
+            side_effect=lambda url, _policy, _proxy: (url, None),
+        ), patch.object(
             downloader,
             "_curl_cffi_get_response",
             side_effect=return_oversized_playlist,
@@ -5061,7 +5074,10 @@ https://cdn.example.com/seg2.m4s?token=1
                     raise OSError("curl write aborted")
             return response
 
-        with patch.object(
+        with patch(
+            "app.core.downloaders.hls_proxy.prepare_hls_curl_request",
+            side_effect=lambda url, _policy, _proxy: (url, None),
+        ), patch.object(
             downloader,
             "_curl_cffi_get_response",
             side_effect=return_oversized_playlist,
@@ -5093,7 +5109,10 @@ https://cdn.example.com/seg2.m4s?token=1
                     self.assertEqual(kwargs["content_callback"](body), len(body))
                     return response
 
-                with patch.object(
+                with patch(
+                    "app.core.downloaders.hls_proxy.prepare_hls_curl_request",
+                    side_effect=lambda url, _policy, _proxy: (url, None),
+                ), patch.object(
                     downloader,
                     "_curl_cffi_get_response",
                     side_effect=return_response,
@@ -5151,7 +5170,10 @@ https://cdn.example.com/seg2.m4s?token=1
             content=b"x" * (8 * 1024 * 1024 + 1),
         )
 
-        with patch.object(downloader, "_curl_cffi_get_response", return_value=response):
+        with patch(
+            "app.core.downloaders.hls_proxy.prepare_hls_curl_request",
+            side_effect=lambda url, _policy, _proxy: (url, None),
+        ), patch.object(downloader, "_curl_cffi_get_response", return_value=response):
             with self.assertRaisesRegex(DomainPolicyViolation, "size limit"):
                 downloader._hls_proxy_request_response(
                     object(),
@@ -5325,10 +5347,11 @@ https://cdn.example.com/seg2.m4s?token=1
             target = Path(temp_dir) / "target.mp4"
             raw_path.write_bytes(b"transport-stream")
 
-            def fake_popen(_command, **kwargs):
+            def fake_popen(command, **kwargs):
                 self.assertNotIn("HTTPS_PROXY", kwargs["env"])
                 self.assertNotIn("COOKIE", kwargs["env"])
-                target.write_bytes(b"mp4")
+                # 生产代码要求 ffmpeg 把 remux 结果写进 staging 文件，且发布前校验 ftyp 签名。
+                Path(command[-1]).write_bytes(_FTYP)
                 return process
 
             mocked_popen.side_effect = fake_popen
@@ -5778,7 +5801,11 @@ seg1.ts
         fake_session = FakeSession()
         with tempfile.TemporaryDirectory() as temp_dir:
             save_path = os.path.join(temp_dir, "demo.ts")
-            with patch.object(downloader, "_make_curl_cffi_session", return_value=fake_session):
+            # 绕过公网地址钉死层，让 FakeSession 直接收到目标 URL。
+            with patch.object(downloader, "_make_curl_cffi_session", return_value=fake_session), patch(
+                "app.core.downloaders.hls_proxy.prepare_hls_curl_request",
+                side_effect=lambda url, _policy, _proxy: (url, None),
+            ):
                 downloader._download_with_curl_cffi_hls(
                     item,
                     save_path,
@@ -5833,7 +5860,11 @@ https://cdn.example.com/seg2.ts
         fake_session = FakeSession()
         with tempfile.TemporaryDirectory() as temp_dir:
             save_path = os.path.join(temp_dir, "demo.ts")
-            with patch.object(downloader, "_make_curl_cffi_session", return_value=fake_session):
+            # 绕过公网地址钉死层，让 FakeSession 直接收到目标 URL。
+            with patch.object(downloader, "_make_curl_cffi_session", return_value=fake_session), patch(
+                "app.core.downloaders.hls_proxy.prepare_hls_curl_request",
+                side_effect=lambda url, _policy, _proxy: (url, None),
+            ):
                 downloader._download_with_curl_cffi_hls(
                     item,
                     save_path,
@@ -6018,7 +6049,15 @@ https://cdn.example.com/seg2.ts
         process = Mock()
         process.returncode = 0
         process.poll.return_value = 0
-        mocked_popen.return_value = process
+
+        def fake_popen(cmd, *args, **kwargs):
+            del args, kwargs
+            save_dir = cmd[cmd.index("--save-dir") + 1]
+            save_name = cmd[cmd.index("--save-name") + 1]
+            Path(save_dir, f"{save_name}.mp4").write_bytes(b"\x00\x00\x00\x18ftypisom" + b"\x00" * 8)
+            return process
+
+        mocked_popen.side_effect = fake_popen
         mocked_wait_progress.return_value = None
         item = VideoItem(url="https://cdn.example.com/live/index.m3u8", title="直播", source="douyin")
 
@@ -6026,7 +6065,13 @@ https://cdn.example.com/seg2.ts
             if value == 100:
                 raise RuntimeError("ui callback failed")
 
-        N_m3u8DL_RE_Downloader().download(item, "demo.mp4", progress, lambda: False)
+        with tempfile.TemporaryDirectory() as temp_dir, patch(
+            "app.core.downloaders.m3u8.FFmpegExternalTool.probe_duration_seconds",
+            return_value=(False, None),
+        ):
+            save_path = os.path.join(temp_dir, "demo.mp4")
+            N_m3u8DL_RE_Downloader().download(item, save_path, progress, lambda: False)
+            self.assertTrue(os.path.isfile(save_path))
 
         mocked_cleanup.assert_not_called()
 
@@ -6346,6 +6391,33 @@ https://cdn.example.com/seg2.ts
         worker = DownloadWorker(item, "downloads")
 
         self.assertIsNone(worker._detect_actual_file_type("missing-file.bin"))
+
+    def test_download_worker_rejects_shifted_ftyp_executable_and_html(self):
+        item = VideoItem(url="https://example.com/video.bin", title="demo", source="douyin")
+        worker = DownloadWorker(item, "downloads")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            shifted = os.path.join(temp_dir, "shifted.bin")
+            with open(shifted, "wb") as fp:
+                fp.write(b"XXftyp" + b"\x00" * 16)
+            with self.assertRaises(ValueError):
+                worker._detect_actual_file_type(shifted)
+
+            executable = os.path.join(temp_dir, "program.bin")
+            with open(executable, "wb") as fp:
+                fp.write(b"MZ" + b"\x00" * 16)
+            with self.assertRaises(ValueError):
+                worker._detect_actual_file_type(executable)
+
+            html = os.path.join(temp_dir, "page.bin")
+            with open(html, "wb") as fp:
+                fp.write(b"<html><body>no</body></html>")
+            with self.assertRaises(ValueError):
+                worker._detect_actual_file_type(html)
+
+            flv = os.path.join(temp_dir, "clip.bin")
+            with open(flv, "wb") as fp:
+                fp.write(b"FLV\x01" + b"\x00" * 16)
+            self.assertEqual(worker._detect_actual_file_type(flv), ".flv")
 
     def test_video_item_update_from_dict_uses_field_whitelist(self):
         """验证 `test_video_item_update_from_dict_uses_field_whitelist` 对应场景是否符合预期，供 `DownloaderStrategyTests` 使用。"""

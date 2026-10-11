@@ -193,22 +193,49 @@ def _record_playlist_fail_closed(proxy: subject._LocalHlsProxy, playlist: str) -
         record_playlist(ROOT_URL, playlist)
 
 
+def _do_get_status(proxy: subject._LocalHlsProxy, path: str) -> int:
+    handler = subject._HlsProxyHandler.__new__(subject._HlsProxyHandler)
+    handler.path = path
+    handler.server = SimpleNamespace(owner=proxy)
+    handler.request_version = "HTTP/1.1"
+    handler.command = "GET"
+    handler.requestline = f"GET {path} HTTP/1.1"
+    handler.close_connection = True
+    handler.wfile = io.BytesIO()
+    handler.do_GET()
+    status_line = handler.wfile.getvalue().splitlines()[0]
+    return int(status_line.split()[1])
+
+
 def test_hls_proxy_rejects_unsigned_expired_and_unlisted_urls() -> None:
     proxy, _downloader, clock = _new_proxy(expires_at=1_100)
     verify_path = _required_method(proxy, "verify_path")
-
-    assert verify_path("/hls?u=aHR0cHM6Ly9tZWRpYS5leGFtcGxlL21hc3Rlci5tM3U4") is None
-
+    unsigned = "/hls?u=aHR0cHM6Ly9tZWRpYS5leGFtcGxlL21hc3Rlci5tM3U4"
     signed_root = _path(proxy.local_url_for(ROOT_URL))
+
+    assert verify_path(unsigned) is None
+    with patch.object(proxy, "serve") as serve:
+        assert _do_get_status(proxy, unsigned) == 403
+        serve.assert_not_called()
+
     clock.value = 1_100
     assert verify_path(signed_root) is None
+    with patch.object(proxy, "serve") as serve:
+        assert _do_get_status(proxy, signed_root) == 403
+        serve.assert_not_called()
 
     clock.value = 1_101
     assert verify_path(signed_root) is None
+    with patch.object(proxy, "serve") as serve:
+        assert _do_get_status(proxy, signed_root) == 403
+        serve.assert_not_called()
 
     clock.value = 1_000
     unlisted = _path(proxy.local_url_for("https://media.example/not-in-playlist.ts"))
     assert verify_path(unlisted) is None
+    with patch.object(proxy, "serve") as serve:
+        assert _do_get_status(proxy, unlisted) == 403
+        serve.assert_not_called()
 
 
 def test_hls_capability_is_task_local_and_tamper_evident() -> None:
@@ -402,12 +429,8 @@ def test_hls_capability_authorizes_resources_only_from_an_authorized_parent() ->
     authorize(ROOT_URL, allowed_child)
     assert verify_path(_path(proxy.local_url_for(allowed_child))) == "https://cdn.example:443/segment.ts"
 
-    try:
+    with pytest.raises(subject.HlsCapabilityError, match="parent|authorized"):
         authorize("https://media.example/unlisted.m3u8", blocked_child)
-    except (ExternalToolError, DomainPolicyViolation):
-        # Either an explicit rejection or a no-op is acceptable; both must keep
-        # the child outside the capability membership.
-        pass
     assert verify_path(_path(proxy.local_url_for(blocked_child))) is None
 
 
@@ -1129,6 +1152,33 @@ def test_redirect_membership_update_is_atomic_when_any_hop_is_private() -> None:
         )
 
     assert proxy.verify_path(_path(proxy.local_url_for(public_hop))) is None
+
+
+def test_hls_proxy_drops_custom_auth_headers_when_crossing_origin() -> None:
+    headers = {
+        "User-Agent": "safe-agent",
+        "X-Auth-Token": "secret",
+        "Cookie": "sid=secret",
+        "Authorization": "Bearer secret",
+    }
+    proxy, downloader = _new_basic_proxy(headers=headers)
+    cross_origin_url = "https://cdn.example/segment.ts"
+    proxy.authorize_playlist_resource(ROOT_URL, cross_origin_url)
+
+    proxy.fetch(cross_origin_url)
+
+    sent_headers = downloader.requests[-1][1]
+    assert sent_headers["User-Agent"] == "safe-agent"
+    assert "X-Auth-Token" not in sent_headers
+    assert "Cookie" not in sent_headers
+    assert "Authorization" not in sent_headers
+
+
+def test_hls_proxy_rejects_outbound_header_control_characters() -> None:
+    proxy, _downloader = _new_basic_proxy(headers={"User-Agent": "bad\r\nX-Injected: 1"})
+
+    with pytest.raises(DomainPolicyViolation, match="header"):
+        proxy.upstream_headers_for(ROOT_URL)
 
 
 def test_hls_proxy_strips_cross_origin_credentials_and_host() -> None:

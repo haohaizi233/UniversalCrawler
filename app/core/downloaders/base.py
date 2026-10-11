@@ -6,6 +6,7 @@ import os
 import re
 import threading
 import time
+import urllib.parse
 from typing import Any, Callable, cast
 
 import requests
@@ -24,6 +25,113 @@ from shared.network_proxy import requests_proxy_mapping
 
 ProgressCallback = Callable[..., None]
 StopCheck = Callable[[], bool]
+
+_CONTROL_CHARACTER = re.compile(r"[\x00-\x1f\x7f]")
+_HEADER_TOKEN = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+\Z")
+_MEDIA_BOX_SUFFIXES = frozenset({".mp4", ".m4v", ".mov", ".m4a"})
+
+# DownloadWorker._detect_actual_file_type 仍只读 32 字节，并用
+# 「前 12 字节里出现 ftyp」和「前 5 字节里出现 FLV」改名。那次改名不在
+# 下载器里，需要另改 app/core/download_manager.py。
+DOWNLOAD_MANAGER_SIGNATURE_RENAME_NOTE = (
+    "download_manager.DownloadWorker 仍按 32 字节窗口做宽松 ftyp/FLV 改名，"
+    "该逻辑需要另改 download_manager.py。"
+)
+
+
+class HlsPlaylistResponse(StreamDownloadError):
+    """HTTP 响应体仍是 HLS 播放列表，不能当作普通文件发布。"""
+
+
+def reject_control_characters(label: str, value: str) -> str:
+    """拒绝标头、Referer、代理地址里的控制字符。"""
+    text = str(value)
+    if _CONTROL_CHARACTER.search(text):
+        raise DomainPolicyViolation(f"{label} contains control characters")
+    return text
+
+
+def validate_header_token(name: str, value: str) -> tuple[str, str]:
+    header_name = str(name).strip()
+    header_value = str(value)
+    if not _HEADER_TOKEN.fullmatch(header_name) or _CONTROL_CHARACTER.search(header_value):
+        raise DomainPolicyViolation("outbound header contains control characters or is invalid")
+    return header_name, header_value
+
+
+def assert_same_save_directory(left: str, right: str) -> None:
+    """签名改名只能留在原保存目录，避免路径穿越。"""
+    left_dir = os.path.normcase(os.path.abspath(os.path.dirname(left)))
+    right_dir = os.path.normcase(os.path.abspath(os.path.dirname(right)))
+    if left_dir != right_dir:
+        raise StreamDownloadError("媒体改名必须留在同一保存目录")
+
+
+def looks_like_html_payload(header: bytes) -> bool:
+    sample = header.lstrip().lower()
+    return sample.startswith((b"<!doctype", b"<html", b"<head", b"<body", b"<script", b"<?xml"))
+
+
+def assert_publishable_media(path: str, intended_path: str) -> None:
+    """在发布前拒绝空文件、MZ、HTML、错位 ftyp 和非法 FLV。
+
+    未知签名不能借 .mp4 扩展名成功结束。download_manager 的 32 字节改名
+    仍需另人修改，本校验只保证下载器自己不会先把坏文件发布出去。
+    """
+    intended_suffix = os.path.splitext(intended_path)[1].lower()
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as handle:
+            header = handle.read(64)
+    except OSError as exc:
+        raise StreamDownloadError(f"无法校验媒体签名: {exc}") from exc
+    if size <= 0 or not header:
+        raise StreamDownloadError("空文件不能作为下载成功")
+    if header.startswith(b"MZ"):
+        raise StreamDownloadError(f"拒绝 MZ 可执行文件。{DOWNLOAD_MANAGER_SIGNATURE_RENAME_NOTE}")
+    if looks_like_html_payload(header):
+        raise StreamDownloadError(f"拒绝 HTML 响应。{DOWNLOAD_MANAGER_SIGNATURE_RENAME_NOTE}")
+    if intended_suffix == ".flv" and not header.startswith(b"FLV\x01"):
+        raise StreamDownloadError(f"FLV 必须是 FLV\\x01。{DOWNLOAD_MANAGER_SIGNATURE_RENAME_NOTE}")
+    if intended_suffix in _MEDIA_BOX_SUFFIXES and (len(header) < 8 or header[4:8] != b"ftyp"):
+        raise StreamDownloadError(
+            "未知签名不能保留 .mp4 成功结果，ftyp 必须对齐偏移 4。"
+            + DOWNLOAD_MANAGER_SIGNATURE_RENAME_NOTE
+        )
+
+
+def durations_consistent(actual: float, expected: float) -> bool:
+    if expected <= 0:
+        return actual > 0
+    return abs(actual - expected) <= max(1.0, expected * 0.02)
+
+
+def sizes_consistent(actual: int, expected: int) -> bool:
+    if expected <= 0:
+        return actual > 0
+    return abs(actual - expected) <= max(4096, int(expected * 0.02))
+
+
+def single_file_http_forbidden(url: str) -> bool:
+    """`.ts`、`.m4s` 和 `.m3u8` 不能按单个 HTTP 文件成功保存。"""
+    try:
+        path = urllib.parse.urlsplit(str(url or "")).path.lower()
+    except ValueError:
+        return False
+    return path.endswith((".ts", ".m4s", ".m3u8"))
+
+
+def http_payload_is_hls_playlist(content_type: str, path: str) -> bool:
+    """用响应类型和正文判断播放列表，不看 URL 里是否出现 m3u8 字符串。"""
+    lowered = str(content_type or "").lower()
+    if "mpegurl" in lowered or "m3u8" in lowered:
+        return True
+    try:
+        with open(path, "rb") as handle:
+            prefix = handle.read(4096)
+    except OSError:
+        return False
+    return b"#EXTM3U" in prefix
 
 
 class TransferRateLimiter:
@@ -212,8 +320,38 @@ class BaseDownloader:
             except OSError:
                 pass
 
+    def _assert_expected_http_media(
+        self,
+        media_path: str,
+        expected_size_bytes: int | None,
+        expected_duration: float | None,
+    ) -> None:
+        """meta 里有期望大小或时长时，不满足就失败。ffprobe 不可用也不能放过时长。"""
+        if type(expected_size_bytes) is int and expected_size_bytes > 0:
+            try:
+                actual_size = os.path.getsize(media_path)
+            except OSError as exc:
+                raise StreamDownloadError(f"HTTP 下载结果无法核对大小: {exc}") from exc
+            if not sizes_consistent(actual_size, expected_size_bytes):
+                raise StreamDownloadError(
+                    f"HTTP 下载大小与预期不一致: expected {expected_size_bytes}, got {actual_size}"
+                )
+        if (
+            isinstance(expected_duration, (int, float))
+            and not isinstance(expected_duration, bool)
+            and expected_duration > 0
+        ):
+            from .external import FFmpegExternalTool
+
+            try:
+                FFmpegExternalTool.assert_duration_if_expected(media_path, float(expected_duration))
+            except DomainPolicyViolation as exc:
+                raise StreamDownloadError(f"HTTP 下载时长不符合预期: {exc}") from exc
+
     def _finalize_download(self, temp_path: str, save_path: str) -> None:
-        """下载完整后原子替换目标文件，失败时保留旧文件。"""
+        """校验签名后原子替换目标文件，失败时保留旧文件。"""
+        assert_same_save_directory(temp_path, save_path)
+        assert_publishable_media(temp_path, save_path)
         os.replace(temp_path, save_path)
 
     @staticmethod
@@ -249,11 +387,17 @@ class BaseDownloader:
         proxy: str | None = None,
         trace_id: str | None = None,
         domain_policy: DomainPolicyEngine | None = None,
+        expected_size_bytes: int | None = None,
+        expected_duration: float | None = None,
     ) -> None:
         """按配置执行普通 HTTP 下载，支持基于 `.downloading` 临时文件的续传重试。"""
+        if single_file_http_forbidden(url):
+            raise StreamDownloadError("分片或播放列表不能按单文件 HTTP 成功保存")
         # 只在最后 rename 到 save_path，避免失败或中断时把半成品暴露成可播放文件。
         temp_path = save_path + ".downloading"
         success = False
+        response_content_type = ""
+        content_length_known = False
         proxies = requests_proxy_mapping(proxy)
         retry_count = self._coerce_retry_count(max_retries)
         rate_limiter = TransferRateLimiter(cfg.get("download", "speed_limit_kb", 0))
@@ -295,7 +439,10 @@ class BaseDownloader:
                     **request_kwargs,
                 ) as response:
                     response.raise_for_status()
-                    total_size = int(response.headers.get("content-length", 0))
+                    response_content_type = str(response.headers.get("content-type") or "")
+                    raw_content_length = response.headers.get("content-length")
+                    content_length_known = raw_content_length is not None
+                    total_size = int(raw_content_length or 0) if content_length_known else 0
                     if response.status_code == 206:
                         content_range = response.headers.get("content-range") or response.headers.get("Content-Range")
                         parsed_range = self._parse_content_range_header(content_range)
@@ -408,8 +555,19 @@ class BaseDownloader:
             # 网络失败且重试耗尽后清理兜底临时文件，避免失败列表删除时再遗留 `.downloading`。
             self._cleanup_temp_file(temp_path)
             raise StreamDownloadError(error_message)
+        if not content_length_known and downloaded == 0:
+            self._cleanup_temp_file(temp_path)
+            raise StreamDownloadError("HTTP 响应没有 Content-Length 且正文为空")
+        if http_payload_is_hls_playlist(response_content_type, temp_path):
+            self._cleanup_temp_file(temp_path)
+            raise HlsPlaylistResponse("HTTP 响应仍是 HLS 播放列表")
 
-        self._finalize_download(temp_path, save_path)
+        try:
+            self._assert_expected_http_media(temp_path, expected_size_bytes, expected_duration)
+            self._finalize_download(temp_path, save_path)
+        except StreamDownloadError:
+            self._cleanup_temp_file(temp_path)
+            raise
         if progress_callback:
             self._emit_progress(progress_callback, 100, bytes_downloaded=total_size or downloaded, bytes_total=total_size or downloaded)
 

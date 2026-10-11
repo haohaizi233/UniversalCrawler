@@ -17,3 +17,32 @@ class DownloaderRegistryTests(unittest.TestCase):
 
         self.assertTrue({"douyin", "xiaohongshu", "kuaishou", "missav", "bilibili"}.issubset(source_ids))
 
+    def test_failed_load_stays_unloaded_until_retry_succeeds(self):
+        from unittest.mock import patch
+
+        from app.core.downloaders.registry import DownloaderRegistry
+
+        class _FakeRegistry:
+            def __init__(self) -> None:
+                self._loaded = True
+                self.calls = 0
+
+            def get_all_plugins_safe(self):
+                self.calls += 1
+                if self.calls == 1:
+                    raise RuntimeError("discovery failed")
+                return []
+
+        fake = _FakeRegistry()
+        registry = DownloaderRegistry()
+        registry._downloaders["preset"] = object()
+        with patch("app.core.plugin_registry.registry", fake):
+            with self.assertRaises(RuntimeError):
+                registry.get("douyin")
+            self.assertFalse(registry._loaded)
+            self.assertNotIn("douyin", registry._downloaders)
+            self.assertIsNone(registry.get("douyin"))
+
+        self.assertTrue(registry._loaded)
+        self.assertEqual(fake.calls, 2)
+

@@ -10,17 +10,14 @@ import threading
 import time
 from collections import deque
 
-import requests
-
 from app.config import DEFAULT_USER_AGENT, cfg
 from app.debug_logger import debug_logger
 from app.exceptions import DownloaderStoppedError, ExternalToolError, ExternalToolNotFoundError
 from app.models import VideoItem
 from shared.runtime_options import DomainPolicyViolation
-from shared.network_proxy import requests_proxy_mapping
 from shared.subprocess_env import isolated_media_subprocess_env
 
-from .base import BaseDownloader, ProgressCallback, StopCheck
+from .base import BaseDownloader, ProgressCallback, StopCheck, sizes_consistent
 from .external import FFmpegExternalTool, build_hidden_startupinfo
 
 # 基于 external.py 封装命令构建和可执行文件解析，这里只负责进程生命周期与进度解析。
@@ -188,6 +185,55 @@ class FFmpegDownloader(BaseDownloader):
         return next_duration, total_size_bytes, progress_value
 
     @classmethod
+    def _observed_output_seconds(cls, line_str: str) -> float | None:
+        if "=" in line_str:
+            key, value = line_str.split("=", 1)
+            key = key.strip()
+            value = value.strip()
+            if key == "out_time":
+                return cls._parse_clock_to_seconds(value)
+            if key in {"out_time_ms", "out_time_us"}:
+                try:
+                    raw_out_time = int(value)
+                except ValueError:
+                    return None
+                if key == "out_time_ms" and raw_out_time < 1_000_000:
+                    return raw_out_time / 1000
+                return raw_out_time / 1_000_000
+        current_time = re.search(r"time=(\d{2}:\d{2}:\d{2}(?:\.\d+)?)", line_str)
+        if current_time:
+            return cls._parse_clock_to_seconds(current_time.group(1))
+        return None
+
+    def _require_ffmpeg_output_consistent(
+        self,
+        temp_path: str,
+        *,
+        expected_duration: float | None,
+        expected_size_bytes: int | None,
+        observed_duration: float | None,
+    ) -> None:
+        """退出码 0 且文件非空还不够；有预期时长或大小时必须一致。"""
+        try:
+            actual_size = os.path.getsize(temp_path)
+        except OSError as exc:
+            raise ExternalToolError(f"ffmpeg 输出无法读取: {exc}") from exc
+        if actual_size <= 0:
+            raise ExternalToolError("ffmpeg 输出为空文件")
+        if expected_size_bytes and not sizes_consistent(actual_size, expected_size_bytes):
+            raise ExternalToolError(
+                f"ffmpeg 输出大小与预期不一致: expected {expected_size_bytes}, got {actual_size}"
+            )
+        try:
+            FFmpegExternalTool.assert_duration_if_expected(
+                temp_path,
+                expected_duration,
+                observed_duration=observed_duration,
+            )
+        except DomainPolicyViolation as exc:
+            raise ExternalToolError(f"ffmpeg 输出时长与预期不一致: {exc}") from exc
+
+    @classmethod
     def is_available(cls) -> bool:
         
         return FFmpegExternalTool.is_available()
@@ -251,7 +297,6 @@ class FFmpegDownloader(BaseDownloader):
         if not ffmpeg:
             raise ExternalToolNotFoundError("未找到 ffmpeg.exe")
         proxy = video_item.meta.get("proxy")
-        proxies = requests_proxy_mapping(proxy)
         request_timeout = cfg.get("download", "request_timeout", 60)
         self._raise_if_stopped(check_stop_func)
         domain_policy = self._domain_policy_for_item(video_item)
@@ -259,55 +304,12 @@ class FFmpegDownloader(BaseDownloader):
             domain_policy.require_public_url(original_url)
         expected_duration = None
         raw_duration = video_item.meta.get("duration")
-        if isinstance(raw_duration, (int, float)) and raw_duration > 0:
+        if isinstance(raw_duration, (int, float)) and not isinstance(raw_duration, bool) and raw_duration > 0:
             expected_duration = float(raw_duration)
         expected_size_bytes = None
-        def _resolve_stream_url(source_url: str) -> tuple[str, int | None]:
-            """跟随一次重定向并读取 content-length，给 ffmpeg 进度估算提供基准。"""
-            resolved_url = source_url
-            resolved_size = expected_size_bytes
-            try:
-                request_kwargs = self._domain_policy_request_kwargs(domain_policy, source_url)
-                resp = requests.head(
-                    source_url,
-                    headers=headers,
-                    timeout=request_timeout,
-                    allow_redirects=True,
-                    proxies=proxies,
-                    **request_kwargs,
-                )
-                real_url = resp.url
-                content_length = resp.headers.get("content-length")
-                if content_length:
-                    try:
-                        resolved_size = int(content_length)
-                    except ValueError:
-                        resolved_size = None
-                try:
-                    debug_logger.log_api(
-                        component="FFmpegDownloader",
-                        api_name="head_redirect",
-                        request={"url": source_url},
-                        response_summary={
-                            "real_url": real_url,
-                            "content_length": resp.headers.get("content-length"),
-                        },
-                        message="ffmpeg 下载前检查真实地址",
-                        status_code=resp.status_code,
-                        trace_id=trace_id,
-                    )
-                except BaseException as exc:
-                    self._log_exception_best_effort("head_redirect_log_api", exc)
-                if real_url != source_url:
-                    resolved_url = real_url
-            except requests.RequestException as exc:
-                self._log_exception_best_effort(
-                    "head_redirect",
-                    exc,
-                    context={"url": source_url},
-                    trace_id=trace_id,
-                )
-            return resolved_url, resolved_size
+        raw_size = video_item.meta.get("size_bytes")
+        if type(raw_size) is int and raw_size > 0:
+            expected_size_bytes = raw_size
 
         startupinfo = build_hidden_startupinfo()
 
@@ -332,31 +334,17 @@ class FFmpegDownloader(BaseDownloader):
             stderr_pipe_closed = threading.Event()
             try:
                 # 每轮在任何 DNS、代理或子进程副作用之前重新线性化取消。
+                # 无论有没有任务级公网策略，都不把原始 URL 直接交给 ffmpeg。
                 self._raise_if_stopped(check_stop_func)
-                if domain_policy is None:
-                    current_url, current_expected_size = _resolve_stream_url(
-                        original_url
-                    )
-                else:
-                    # 额外的 HEAD 预检会在受控代理之外重新打开 DNS 与重定向链路，
-                    # 既破坏已完成的地址校验，也不会增加安全性，因此直接省略。
-                    current_url, current_expected_size = original_url, None
-                url = current_url
-                if current_expected_size:
-                    expected_size_bytes = current_expected_size
-                command_headers = headers
-                command_proxy = proxy
+                local_proxy = self._start_validated_media_proxy(
+                    video_item,
+                    headers,
+                    proxy,
+                )
                 self._raise_if_stopped(check_stop_func)
-                if domain_policy is not None:
-                    local_proxy = self._start_validated_media_proxy(
-                        video_item,
-                        headers,
-                        proxy,
-                    )
-                    self._raise_if_stopped(check_stop_func)
-                    url = local_proxy.url
-                    command_headers = {"User-Agent": user_agent}
-                    command_proxy = None
+                url = local_proxy.url
+                command_headers = {"User-Agent": user_agent}
+                command_proxy = None
                 cmd = FFmpegExternalTool.build_download_command(
                     ffmpeg,
                     url,
@@ -396,6 +384,7 @@ class FFmpegDownloader(BaseDownloader):
                 )
                 last_progress_time = time.time()
                 last_progress = 0
+                observed_out_time: float | None = None
                 stderr_queue: queue.Queue[bytes | None] = queue.Queue(
                     maxsize=self.STDERR_QUEUE_MAX_LINES
                 )
@@ -463,6 +452,9 @@ class FFmpegDownloader(BaseDownloader):
                         expected_duration=expected_duration,
                         expected_size_bytes=expected_size_bytes,
                     )
+                    observed_seconds = self._observed_output_seconds(line_str)
+                    if observed_seconds is not None:
+                        observed_out_time = observed_seconds
                     if parsed_progress is not None and parsed_progress > last_progress:
                         last_progress = parsed_progress
                         try:
@@ -473,6 +465,12 @@ class FFmpegDownloader(BaseDownloader):
                 process.wait(timeout=self.PROCESS_WAIT_TIMEOUT_SEC)
                 self._raise_if_stopped(check_stop_func)
                 if process.returncode == 0 and os.path.exists(temp_path) and os.path.getsize(temp_path) > 0:
+                    self._require_ffmpeg_output_consistent(
+                        temp_path,
+                        expected_duration=expected_duration,
+                        expected_size_bytes=expected_size_bytes,
+                        observed_duration=observed_out_time,
+                    )
                     # Cancellation can race with the filesystem checks above;
                     # check again at the atomic publication boundary.
                     self._raise_if_stopped(check_stop_func)

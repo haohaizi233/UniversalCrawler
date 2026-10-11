@@ -4,14 +4,17 @@ from __future__ import annotations
 
 import os
 import subprocess
+import urllib.parse
 import time
 
 from app.config import DEFAULT_USER_AGENT, cfg
 from app.debug_logger import debug_logger
 from app.exceptions import DownloaderStoppedError
 from app.utils.runtime_paths import resolve_tool_file
+from shared.runtime_options import DomainPolicyViolation
+from shared.subprocess_env import isolated_media_subprocess_env
 
-from .base import ProgressCallback, StopCheck
+from .base import ProgressCallback, StopCheck, durations_consistent, reject_control_characters, validate_header_token
 
 def build_hidden_startupinfo():
     if os.name != "nt" or not hasattr(subprocess, "STARTUPINFO"):
@@ -134,6 +137,16 @@ class FFmpegExternalTool:
     def is_available(cls) -> bool:
         return cls.resolve_executable() is not None
 
+    @staticmethod
+    def _require_http_input(url: str) -> str:
+        """ffmpeg 输入只接受 http/https，拒绝 file:/concat:/subfile:/data: 等协议。"""
+        text = str(url or "").strip()
+        reject_control_characters("ffmpeg input", text)
+        parts = urllib.parse.urlsplit(text)
+        if parts.scheme.lower() not in {"http", "https"} or not parts.netloc:
+            raise DomainPolicyViolation("ffmpeg input must be http or https")
+        return text
+
     @classmethod
     def build_download_command(
         cls,
@@ -144,6 +157,14 @@ class FFmpegExternalTool:
         proxy: str | None = None,
         timeout_seconds: int | None = None,
     ) -> list[str]:
+        media_url = cls._require_http_input(url)
+        user_agent = reject_control_characters(
+            "User-Agent",
+            str(headers.get("User-Agent") or DEFAULT_USER_AGENT),
+        )
+        referer = reject_control_characters("Referer", str(headers.get("Referer") or ""))
+        if proxy:
+            reject_control_characters("proxy", str(proxy))
         timeout_us = str(max(1, int(timeout_seconds or _configured_request_timeout())) * 1_000_000)
         cmd = [
             executable,
@@ -152,9 +173,9 @@ class FFmpegExternalTool:
             "-progress",
             "pipe:2",
             "-user_agent",
-            headers.get("User-Agent", DEFAULT_USER_AGENT),
+            user_agent,
             "-headers",
-            f"Referer: {headers.get('Referer', '')}\r\n",
+            f"Referer: {referer}\r\n",
             "-reconnect",
             "1",
             "-reconnect_at_eof",
@@ -172,7 +193,7 @@ class FFmpegExternalTool:
             cmd.extend(["-http_proxy", proxy])
         cmd.extend([
             "-i",
-            url,
+            media_url,
             "-c",
             "copy",
             "-bsf:a",
@@ -194,18 +215,110 @@ class FFmpegExternalTool:
         video_path: str,
         audio_path: str | None,
         save_path: str,
+        *,
+        preserve_embedded_audio: bool = False,
     ) -> list[str]:
-        """构造音视频合并命令，纯视频场景下不会追加音频输入。"""
+        """构造音视频合并命令。单段已含音画时保留全部流，分离视频才只映射视频。"""
         command = [executable, "-y", "-nostdin", "-hide_banner", "-loglevel", "error", "-i", video_path]
         if audio_path:
             command.extend(["-i", audio_path])
             command.extend(["-map", "0:v:0", "-map", "1:a:0?"])
+        elif preserve_embedded_audio:
+            command.extend(["-map", "0"])
         else:
             command.extend(["-map", "0:v:0?"])
         # Bilibili 先写入 ``*.mp4.merging`` 再原子替换最终文件。该临时后缀无法让
         # ffmpeg 自动推断容器，因此必须显式指定 MP4 muxer。
         command.extend(["-c", "copy", "-movflags", "+faststart", "-f", "mp4", save_path])
         return command
+
+    @classmethod
+    def probe_duration_seconds(cls, media_path: str) -> tuple[bool, float | None]:
+        """返回 (ffprobe 是否可用, 时长秒)。工具缺失时第一项为 False。"""
+        executable = ExternalToolRunner.resolve_executable("ffprobe.exe", "ffprobe", ["-version"])
+        if not executable:
+            return False, None
+        try:
+            completed = subprocess.run(
+                [
+                    executable,
+                    "-v",
+                    "error",
+                    "-show_entries",
+                    "format=duration",
+                    "-of",
+                    "default=noprint_wrappers=1:nokey=1",
+                    media_path,
+                ],
+                check=False,
+                capture_output=True,
+                timeout=30,
+                env=isolated_media_subprocess_env(),
+            )
+        except (OSError, subprocess.SubprocessError):
+            return True, None
+        if completed.returncode != 0:
+            return True, None
+        text = completed.stdout.decode("utf-8", errors="replace").strip()
+        try:
+            duration = float(text)
+        except ValueError:
+            return True, None
+        if duration < 0:
+            return True, None
+        return True, duration
+
+    @classmethod
+    def probe_contains_audio(cls, media_path: str) -> tuple[bool, bool]:
+        """返回 (ffprobe 是否可用, 文件里是否有音频流)。"""
+        executable = ExternalToolRunner.resolve_executable("ffprobe.exe", "ffprobe", ["-version"])
+        if not executable:
+            return False, False
+        try:
+            completed = subprocess.run(
+                [
+                    executable,
+                    "-v",
+                    "error",
+                    "-select_streams",
+                    "a",
+                    "-show_entries",
+                    "stream=codec_type",
+                    "-of",
+                    "csv=p=0",
+                    media_path,
+                ],
+                check=False,
+                capture_output=True,
+                timeout=30,
+                env=isolated_media_subprocess_env(),
+            )
+        except (OSError, subprocess.SubprocessError):
+            return True, False
+        if completed.returncode != 0:
+            return True, False
+        text = completed.stdout.decode("utf-8", errors="replace").lower()
+        return True, "audio" in text
+
+    @classmethod
+    def assert_duration_if_expected(
+        cls,
+        media_path: str,
+        expected_duration: float | None,
+        *,
+        observed_duration: float | None = None,
+    ) -> None:
+        """有预期时长时必须由 ffprobe 核对。工具不可用或读不到时长都不能当成功。"""
+        del observed_duration
+        if not isinstance(expected_duration, (int, float)) or isinstance(expected_duration, bool):
+            return
+        if expected_duration <= 0:
+            return
+        available, probed = cls.probe_duration_seconds(media_path)
+        if not available or probed is None:
+            raise DomainPolicyViolation("ffprobe 无法核对媒体时长")
+        if not durations_consistent(float(probed), float(expected_duration)):
+            raise DomainPolicyViolation("媒体时长与预期不一致")
 
 class NM3U8DLREExternalTool:
     EXE_PATH = "N_m3u8DL-RE.exe"
@@ -252,10 +365,20 @@ class NM3U8DLREExternalTool:
         return cls.resolve_executable() is not None
 
     @classmethod
-    def is_m3u8_url(cls, url: str) -> bool:
-        """粗略判断一个 URL 是否指向 m3u8 播放列表。"""
-        url_lower = url.lower()
-        return ".m3u8" in url_lower or "m3u8" in url_lower
+    def is_m3u8_url(cls, url: str, content_type: str | None = None) -> bool:
+        """路径以 .m3u8 结尾，或 Content-Type 是 mpegurl，才视为 HLS。
+
+        URL 里仅仅出现字符串 m3u8 不算。没有该后缀但类型是 mpegurl 的流
+        也不能当成普通文件保存成功。
+        """
+        lowered_type = str(content_type or "").lower()
+        if "mpegurl" in lowered_type or "m3u8" in lowered_type:
+            return True
+        try:
+            path = urllib.parse.urlsplit(str(url or "")).path
+        except ValueError:
+            return False
+        return path.lower().endswith(".m3u8")
 
     @classmethod
     def _m3u8_thread_count(cls) -> str:
@@ -278,6 +401,8 @@ class NM3U8DLREExternalTool:
         save_dir = os.path.dirname(save_path)
         save_name_no_ext = os.path.splitext(os.path.basename(save_path))[0]
         headers = cls._normalized_headers(user_agent, referer, extra_headers)
+        if proxy:
+            reject_control_characters("proxy", str(proxy))
         thread_count_text = str(thread_count or cls._m3u8_thread_count())
         retry_count_text = str(_configured_retry_count())
         request_timeout_text = str(_configured_request_timeout())
@@ -334,9 +459,16 @@ class NM3U8DLREExternalTool:
             lowered = key_text.lower()
             if lowered.startswith(":") or lowered in blocked_headers:
                 continue
-            canonical = "-".join(part[:1].upper() + part[1:].lower() for part in lowered.split("-"))
-            headers[canonical] = value_text
-        headers["User-Agent"] = headers.get("User-Agent") or str(user_agent or DEFAULT_USER_AGENT)
+            canonical, safe_value = validate_header_token(key_text, value_text)
+            canonical = "-".join(part[:1].upper() + part[1:].lower() for part in canonical.lower().split("-"))
+            headers[canonical] = safe_value
+        headers["User-Agent"] = validate_header_token(
+            "User-Agent",
+            headers.get("User-Agent") or str(user_agent or DEFAULT_USER_AGENT),
+        )[1]
         if referer:
-            headers["Referer"] = headers.get("Referer") or str(referer)
+            headers["Referer"] = validate_header_token(
+                "Referer",
+                headers.get("Referer") or str(referer),
+            )[1]
         return headers

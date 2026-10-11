@@ -90,7 +90,7 @@ class ChunkedDownloaderIntegrityTests(unittest.TestCase):
     ) -> None:
         mocked_cfg_get.side_effect = self._cfg_get
         mocked_head.return_value = self._head_response(etag='"v2"')
-        mocked_get.return_value = self._stream_response([b"fresh-data"])
+        mocked_get.return_value = self._stream_response([b"\x00\x00\x00\x18ftyp!!"])
         item = VideoItem(url="https://example.com/video.mp4", title="demo", source="douyin")
 
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -99,7 +99,7 @@ class ChunkedDownloaderIntegrityTests(unittest.TestCase):
 
             ChunkedDownloader().download(item, str(target), lambda *_args, **_kwargs: None, lambda: False)
 
-            self.assertEqual(target.read_bytes(), b"fresh-data")
+            self.assertEqual(target.read_bytes(), b"\x00\x00\x00\x18ftyp!!")
             self.assertFalse(Path(temp_dir, ".demo.mp4.parts.json").exists())
 
         mocked_get.assert_called_once()

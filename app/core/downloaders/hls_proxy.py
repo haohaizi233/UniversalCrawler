@@ -20,11 +20,11 @@ from typing import TYPE_CHECKING, Any
 
 from app.debug_logger import debug_logger
 from app.exceptions import ExternalToolError
-from shared.network.pinned_transport import (
-    canonicalize_request_target,
-    curl_resolve_options as _pinned_curl_resolve_options,
-)
+from shared.network.pinned_transport import canonicalize_request_target
 from shared.runtime_options import DomainPolicyViolation
+
+from .base import validate_header_token
+from .hls_curl_request import curl_resolve_options, prepare_hls_curl_request  # noqa: F401
 
 if TYPE_CHECKING:
     from shared.runtime_options import DomainPolicyEngine
@@ -58,6 +58,28 @@ _RANGE = re.compile(r"bytes=(\d*)-(\d*)\Z")
 _CURL_WRITEFUNC_ERROR = 0xFFFFFFFF
 _ALWAYS_DROP_UPSTREAM_HEADERS = frozenset({"host", "proxy-authorization"})
 _CROSS_ORIGIN_CREDENTIAL_HEADERS = frozenset({"authorization", "cookie"})
+_CROSS_ORIGIN_ALLOWED_HEADERS = frozenset(
+    {
+        "user-agent",
+        "accept",
+        "accept-language",
+        "accept-encoding",
+        "referer",
+        "origin",
+        "range",
+        "if-range",
+        "cache-control",
+        "pragma",
+        "priority",
+        "sec-fetch-dest",
+        "sec-fetch-mode",
+        "sec-fetch-site",
+        "sec-fetch-user",
+        "sec-ch-ua",
+        "sec-ch-ua-mobile",
+        "sec-ch-ua-platform",
+    }
+)
 _FORBIDDEN_PLAYLIST_TAGS = ("#EXT-X-CONTENT-STEERING", "#EXT-X-DEFINE")
 _URI_RESOURCE_TAGS = frozenset(
     {
@@ -181,20 +203,28 @@ def _hls_proxy_cleanup_scope(cleanup: Callable[[], None] | None) -> Iterator[Non
                 pass
 
 
+def _hls_path_ends_with_m3u8(url: str) -> bool:
+    try:
+        path = urllib.parse.urlsplit(str(url or "")).path
+    except ValueError:
+        return False
+    return path.lower().endswith(".m3u8")
+
+
 def looks_like_hls_playlist(url: str, content_type: str, body: bytes) -> bool:
-    if b"#EXTM3U" in body[:4096]:
+    if b"#EXTM3U" in bytes(body or b"")[:4096]:
         return True
     lowered_type = str(content_type or "").lower()
     if "mpegurl" in lowered_type or "m3u8" in lowered_type:
         return True
-    return ".m3u8" in str(url or "").lower()
+    return _hls_path_ends_with_m3u8(url)
 
 
 def looks_like_hls_playlist_url(url: str, content_type: str) -> bool:
     lowered_type = str(content_type or "").lower()
     if "mpegurl" in lowered_type or "m3u8" in lowered_type:
         return True
-    return ".m3u8" in str(url or "").lower()
+    return _hls_path_ends_with_m3u8(url)
 
 
 def _hls_response_budget(upstream_url: str) -> int | None:
@@ -213,11 +243,29 @@ def _local_hls_proxy_thread_count(thread_count: str | int | None) -> int:
     return max(1, min(requested, _MAX_CONCURRENT_REQUESTS))
 
 
+def filter_hls_outbound_headers(
+    headers: dict[str, str],
+    *,
+    cross_origin: bool,
+) -> dict[str, str]:
+    """出站头拒绝控制字符。跨源只保留明确允许的头，去掉鉴权和 Host。"""
+    filtered: dict[str, str] = {}
+    for key, value in headers.items():
+        name, text = validate_header_token(str(key), str(value))
+        lowered = name.lower()
+        if lowered in _ALWAYS_DROP_UPSTREAM_HEADERS:
+            continue
+        if cross_origin and lowered not in _CROSS_ORIGIN_ALLOWED_HEADERS:
+            continue
+        filtered[name] = text
+    return filtered
+
+
 def build_hls_proxy_upstream_headers(
     upstream_url: str,
     headers: dict[str, str],
 ) -> dict[str, str]:
-    upstream_headers = dict(headers)
+    upstream_headers = filter_hls_outbound_headers(dict(headers), cross_origin=False)
     if looks_like_hls_playlist_url(upstream_url, ""):
         return upstream_headers
     upstream_headers.pop("Origin", None)
@@ -364,37 +412,6 @@ def response_iter_bytes(response, chunk_size: int = 256 * 1024):
             except TypeError:
                 yield from iter_content(chunk_size)
                 return
-
-
-def curl_resolve_options(url: str, addresses: tuple[str, ...]) -> dict[Any, Any]:
-    """把 curl 固定到已通过策略校验的公网地址，防止解析结果漂移。"""
-    target = canonicalize_request_target(url)
-    options = _pinned_curl_resolve_options(target, addresses, disable_proxy=True)
-    from curl_cffi.const import CurlOpt
-
-    options.update(
-        {
-            CurlOpt.NOSIGNAL: 1,
-            CurlOpt.FRESH_CONNECT: 1,
-            CurlOpt.FORBID_REUSE: 1,
-        }
-    )
-    return options
-
-
-def prepare_hls_curl_request(
-    url: str,
-    domain_policy: "DomainPolicyEngine | None",
-    upstream_proxy: str | None,
-) -> tuple[str, dict[Any, Any] | None]:
-    request_url = canonicalize_request_target(url).url
-    if domain_policy is None:
-        return request_url, None
-    if upstream_proxy:
-        domain_policy.require_public_url(request_url)
-        return request_url, None
-    addresses = domain_policy.resolve_public_addresses(request_url)
-    return request_url, curl_resolve_options(request_url, addresses)
 
 
 class _HlsResponseHeaders:
@@ -1272,10 +1289,7 @@ class _LocalHlsProxy:
         canonical = self._require_active_member(upstream_url).url
         headers = self.downloader._headers_for_hls_proxy_upstream(canonical, self.headers)
         cross_origin = self._url_origin(canonical) != self._credential_origin
-        blocked = set(_ALWAYS_DROP_UPSTREAM_HEADERS)
-        if cross_origin:
-            blocked.update(_CROSS_ORIGIN_CREDENTIAL_HEADERS)
-        return {key: value for key, value in headers.items() if key.lower() not in blocked}
+        return filter_hls_outbound_headers(headers, cross_origin=cross_origin)
 
     def fetch(self, upstream_url: str) -> tuple[int, str, bytes]:
         requested_url = self._require_active_member(upstream_url).url

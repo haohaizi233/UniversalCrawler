@@ -6,6 +6,7 @@ import os
 import subprocess
 import threading
 import time
+import urllib.parse
 
 import requests
 
@@ -23,7 +24,13 @@ from app.utils.bilibili_wbi import BILIBILI_WBI_SIGNER
 from shared.network_proxy import explicit_requests_proxies, requests_proxy_mapping
 from shared.runtime_options import DomainPolicyViolation
 
-from .base import BaseDownloader, ProgressCallback, StopCheck, TransferRateLimiter
+from .base import (
+    BaseDownloader,
+    ProgressCallback,
+    StopCheck,
+    TransferRateLimiter,
+    assert_publishable_media,
+)
 from .external import FFmpegExternalTool, build_hidden_startupinfo
 
 class BilibiliDownloader(BaseDownloader):
@@ -97,6 +104,41 @@ class BilibiliDownloader(BaseDownloader):
                 )
                 continue
         return None, None
+
+    @staticmethod
+    def _cdn_request_headers(headers: dict[str, str]) -> dict[str, str]:
+        """CDN 请求不携带 SESSDATA 等会话 Cookie。"""
+        return {
+            str(key): str(value)
+            for key, value in headers.items()
+            if str(key).lower() != "cookie"
+        }
+
+    @staticmethod
+    def _completion_labels(*, audio_present: bool) -> dict[str, str]:
+        if not audio_present:
+            raise StreamDownloadError("Bilibili DASH 缺少音频轨，不能以完成结束")
+        return {
+            "phase_message": "Bilibili 音视频合并完成",
+            "merge_status": "合并完成",
+            "log": "Bilibili 音视频合并完成",
+        }
+
+    @staticmethod
+    def _single_segment_has_audio_and_video(video_item: VideoItem, media_path: str) -> bool:
+        """单段 durl 自带音画可以完成；DASH 缺音频不行。"""
+        kind = str(video_item.meta.get("bilibili_stream") or "").strip().lower()
+        if kind == "durl":
+            return True
+        if kind == "dash":
+            return False
+        available, has_audio = FFmpegExternalTool.probe_contains_audio(media_path)
+        if has_audio:
+            return True
+        if available:
+            return False
+        path = urllib.parse.urlsplit(str(video_item.url or "")).path.lower()
+        return not path.endswith(".m4s")
 
     def download(
         self,
@@ -275,7 +317,7 @@ class BilibiliDownloader(BaseDownloader):
                 try:
                     request_kwargs = self._domain_policy_request_kwargs(domain_policy, url)
                     existing_size = os.path.getsize(path) if resume_enabled and os.path.exists(path) else 0
-                    request_headers = dict(headers)
+                    request_headers = self._cdn_request_headers(headers)
                     if existing_size > 0:
                         # 每个流独立续传；服务端若不返回 206，下面会回退为覆盖写。
                         request_headers["Range"] = f"bytes={existing_size}-"
@@ -446,8 +488,13 @@ class BilibiliDownloader(BaseDownloader):
                 raise StreamDownloadError("Bilibili 视频流写入失败或文件为空")
             if audio_url and (not os.path.exists(temp_a) or os.path.getsize(temp_a) <= 0):
                 raise StreamDownloadError("Bilibili 音频流写入失败或文件为空")
+            muxed_single = False
+            if not audio_url:
+                if not self._single_segment_has_audio_and_video(video_item, temp_v):
+                    raise StreamDownloadError("Bilibili DASH 缺少音频轨，不能以完成结束")
+                muxed_single = True
 
-            # 到这里仅代表两个分流落盘成功；最终文件必须等 ffmpeg 合并完成后才算成功。
+            # 到这里仅代表分流落盘成功；最终文件必须等 ffmpeg 合并完成后才算成功。
             total_bytes = sum(item["total"] for item in stream_stats.values() if item["total"] > 0)
             downloaded_bytes = sum(item["downloaded"] for item in stream_stats.values())
             self._emit_progress(
@@ -465,12 +512,14 @@ class BilibiliDownloader(BaseDownloader):
                 temp_v,
                 temp_a if audio_url else None,
                 merging_path,
+                preserve_embedded_audio=muxed_single,
             )
+            audio_present = bool(audio_url) or muxed_single
             debug_logger.log_command(
                 component="BilibiliDownloader",
                 tool_name="ffmpeg",
                 command_args=cmd_merge,
-                message="准备合并 Bilibili 音视频流",
+                message="准备合并 Bilibili 音视频流" if audio_present else "准备封装 Bilibili 仅视频流",
                 context={"title": video_item.title, "save_path": save_path},
                 trace_id=trace_id,
             )
@@ -480,9 +529,9 @@ class BilibiliDownloader(BaseDownloader):
                 bytes_downloaded=downloaded_bytes or None,
                 bytes_total=total_bytes or None,
                 phase="merging",
-                phase_message="ffmpeg 合并音视频中",
+                phase_message="ffmpeg 合并音视频中" if audio_present else "缺少音频轨，正在封装仅视频",
                 write_status="写入完成",
-                merge_status="合并中",
+                merge_status="合并中" if audio_present else "仅视频降级",
             )
             self._run_merge_process(
                 cmd_merge,
@@ -496,28 +545,33 @@ class BilibiliDownloader(BaseDownloader):
                 trace_id=trace_id,
             )
             if not os.path.exists(merging_path) or os.path.getsize(merging_path) <= 0:
-                raise MergeError("Bilibili 音视频合并完成后未生成有效文件")
+                raise MergeError(
+                    "Bilibili 音视频合并完成后未生成有效文件"
+                    if audio_present
+                    else "Bilibili 仅视频封装后未生成有效文件"
+                )
             self._publish_merged_file(
                 merging_path,
                 save_path,
                 check_stop_func=check_stop_func,
             )
             cleanup_temp_files()
+            completion = self._completion_labels(audio_present=audio_present)
             self._emit_progress(
                 progress_callback,
                 100,
                 bytes_downloaded=total_bytes or downloaded_bytes or None,
                 bytes_total=total_bytes or downloaded_bytes or None,
                 phase="completed",
-                phase_message="Bilibili 音视频合并完成",
+                phase_message=completion["phase_message"],
                 write_status="写入完成",
-                merge_status="合并完成",
+                merge_status=completion["merge_status"],
             )
             debug_logger.log(
                 component="BilibiliDownloader",
                 action="merge_finished",
-                message="Bilibili 音视频合并完成",
-                status_code="BILI_MERGE_OK",
+                message=completion["log"],
+                status_code="BILI_MERGE_OK" if audio_url else "BILI_VIDEO_ONLY",
                 details={"title": video_item.title, "save_path": save_path},
                 trace_id=trace_id,
             )
@@ -689,6 +743,7 @@ class BilibiliDownloader(BaseDownloader):
         """完整合并后再原子发布文件，发布成功前不触碰旧目标。"""
         if check_stop_func is not None and check_stop_func():
             raise DownloaderStoppedError("User stopped download before Bilibili publication")
+        assert_publishable_media(merging_path, save_path)
         os.replace(merging_path, save_path)
 
     @staticmethod

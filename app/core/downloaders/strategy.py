@@ -12,6 +12,8 @@ from app.exceptions import DownloaderStoppedError, StreamDownloadError
 from app.models import VideoItem
 from app.models.download_context import DownloadContext
 
+from .base import HlsPlaylistResponse, single_file_http_forbidden
+
 @dataclass(slots=True)
 class DownloadRequest:
     """下载策略链共享的请求上下文，避免每个策略重复解析 VideoItem/meta。"""
@@ -60,6 +62,8 @@ class StrategyCapableDownloader(Protocol):
         proxy: str | None = None,
         trace_id: str | None = None,
         domain_policy=None,
+        expected_size_bytes: int | None = None,
+        expected_duration: float | None = None,
     ) -> None:
         ...
 
@@ -77,7 +81,11 @@ class M3U8DownloadStrategy:
     def execute(self, downloader: StrategyCapableDownloader, request: DownloadRequest) -> bool:
         from .m3u8 import N_m3u8DL_RE_Downloader
 
-        if request.explicit_strategy != self.name and not N_m3u8DL_RE_Downloader.is_m3u8_url(request.video_item.url):
+        content_type = str(request.video_item.meta.get("content_type") or "")
+        if request.explicit_strategy != self.name and not N_m3u8DL_RE_Downloader.is_m3u8_url(
+            request.video_item.url,
+            content_type,
+        ):
             return False
         if not N_m3u8DL_RE_Downloader.is_available():
             return False
@@ -149,21 +157,51 @@ class HttpDownloadStrategy:
     name = "http"
 
     def execute(self, downloader: StrategyCapableDownloader, request: DownloadRequest) -> bool:
-        downloader._download_http_file(
-            url=request.video_item.url,
-            save_path=request.save_path,
-            headers=request.headers,
-            check_stop_func=request.check_stop_func,
-            progress_callback=request.progress_callback,
-            max_retries=request.max_retries,
-            timeout=request.timeout,
-            chunk_size=request.chunk_size,
-            support_resume=request.support_resume,
-            error_message=request.error_message,
-            proxy=request.context.proxy,
-            trace_id=request.context.trace_id,
-            domain_policy=downloader._domain_policy_for_item(request.video_item),
-        )
+        if single_file_http_forbidden(request.video_item.url):
+            raise StreamDownloadError("分片或播放列表不能按单文件 HTTP 成功保存")
+        meta = request.video_item.meta if isinstance(request.video_item.meta, dict) else {}
+        raw_size = meta.get("size_bytes")
+        expected_size = raw_size if type(raw_size) is int and raw_size > 0 else None
+        raw_duration = meta.get("duration")
+        expected_duration = None
+        if isinstance(raw_duration, (int, float)) and not isinstance(raw_duration, bool) and raw_duration > 0:
+            expected_duration = float(raw_duration)
+        try:
+            downloader._download_http_file(
+                url=request.video_item.url,
+                save_path=request.save_path,
+                headers=request.headers,
+                check_stop_func=request.check_stop_func,
+                progress_callback=request.progress_callback,
+                max_retries=request.max_retries,
+                timeout=request.timeout,
+                chunk_size=request.chunk_size,
+                support_resume=request.support_resume,
+                error_message=request.error_message,
+                proxy=request.context.proxy,
+                trace_id=request.context.trace_id,
+                domain_policy=downloader._domain_policy_for_item(request.video_item),
+                expected_size_bytes=expected_size,
+                expected_duration=expected_duration,
+            )
+        except HlsPlaylistResponse:
+            # 显式 http 也不能把播放列表正文当成成功结束。无论策略顺序如何，
+            # 响应体仍是 m3u8 时都继续走 HLS，而不是发布该正文。
+            request.video_item.meta["content_type"] = (
+                str(request.video_item.meta.get("content_type") or "")
+                or "application/vnd.apple.mpegurl"
+            )
+            from .m3u8 import N_m3u8DL_RE_Downloader
+
+            if not N_m3u8DL_RE_Downloader.is_available():
+                return False
+            N_m3u8DL_RE_Downloader().download(
+                request.video_item,
+                request.save_path,
+                request.progress_callback,
+                request.check_stop_func,
+            )
+            return True
         return True
 
 class DownloadStrategyChain:
@@ -175,7 +213,15 @@ class DownloadStrategyChain:
     def execute(self, downloader: StrategyCapableDownloader, request: DownloadRequest) -> None:
         downloader._apply_runtime_headers(request.video_item, request.headers)
         last_error: Exception | None = None
-        for strategy in self._ordered_strategies(request.explicit_strategy):
+        strategies = self._ordered_strategies(request.explicit_strategy)
+        if (
+            request.explicit_strategy
+            and request.explicit_strategy != "http"
+            and single_file_http_forbidden(request.video_item.url)
+        ):
+            # 显式策略失败后，不要再回退到普通 HTTP 把分片或播放列表存成成功文件。
+            strategies = [strategy for strategy in strategies if strategy.name != "http"]
+        for strategy in strategies:
             try:
                 if strategy.execute(downloader, request):
                     return

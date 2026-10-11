@@ -6,7 +6,7 @@ import base64
 import io
 import os
 import re
-import shutil
+import stat
 import subprocess
 import tempfile
 import time
@@ -22,10 +22,16 @@ from shared import playwright_network_guard
 from app.exceptions import DownloaderStoppedError, ExternalToolError, ExternalToolNotFoundError
 from app.models import VideoItem
 from shared.network.pinned_transport import PinnedTransport, canonicalize_request_target
-from shared.runtime_options import PUBLIC_DOMAIN_POLICY, DomainPolicyEngine
+from shared.runtime_options import PUBLIC_DOMAIN_POLICY, DomainPolicyEngine, DomainPolicyViolation
 from shared.subprocess_env import isolated_media_subprocess_env
 
-from .base import BaseDownloader, ProgressCallback, StopCheck, TransferRateLimiter
+from .base import (
+    BaseDownloader,
+    ProgressCallback,
+    StopCheck,
+    TransferRateLimiter,
+    assert_publishable_media,
+)
 from . import hls_proxy as hls_proxy_utils
 from .hls_proxy import _LocalHlsProxy
 from .nm3u8_progress import _Nm3u8OutputProgress
@@ -36,6 +42,7 @@ from .external import (
     build_hidden_startupinfo,
     build_no_window_flags,
 )
+from .m3u8_ytdlp import Nm3u8YtDlpSupport
 
 try:
     from playwright.sync_api import Error as PlaywrightError
@@ -43,11 +50,74 @@ except ImportError:  # pragma: no cover - 可选浏览器回退路径
     PlaywrightError = RuntimeError
 
 
-class N_m3u8DL_RE_Downloader(BaseDownloader):
+class N_m3u8DL_RE_Downloader(Nm3u8YtDlpSupport, BaseDownloader):
     """使用 N_m3u8DL-RE 下载 HLS；遇到限制更严的 MissAV CDN 时启用兜底链路。"""
 
     NM3U8_TEMP_ROOT_NAME = ".ucp-nm3u8-tmp"
     NM3U8_TEMP_DIR_PREFIX = "ucp-"
+    NM3U8_SWEEP_ENTRY_LIMIT = 4096
+    _OWNED_MARKER_NAME = ".ucp-owned"
+    _OWNED_MARKER_TEXT = "universal-crawler-pro\n"
+
+    @staticmethod
+    def _is_reparse_point(path: Path) -> bool:
+        """lstat 识别符号链接、重解析点和目录联接，不跟随目标。"""
+        try:
+            st = os.lstat(path)
+        except OSError:
+            return True
+        if stat.S_ISLNK(st.st_mode):
+            return True
+        attributes = int(getattr(st, "st_file_attributes", 0) or 0)
+        reparse_flag = int(getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
+        if attributes & reparse_flag:
+            return True
+        isjunction = getattr(os.path, "isjunction", None)
+        if callable(isjunction):
+            try:
+                if isjunction(path):
+                    return True
+            except OSError:
+                return True
+        return False
+
+    @classmethod
+    def _remove_owned_tree(cls, path: Path) -> None:
+        """删除普通目录树。遇到重解析点或目录联接时拒绝，避免 shutil.rmtree 跟进去。"""
+        if cls._is_reparse_point(path):
+            raise OSError(f"refuse reparse point: {path}")
+        st = os.lstat(path)
+        if not stat.S_ISDIR(st.st_mode):
+            os.remove(path)
+            return
+        with os.scandir(path) as entries:
+            children = [Path(entry.path) for entry in entries]
+        for child in children:
+            if cls._is_reparse_point(child):
+                raise OSError(f"refuse reparse point: {child}")
+            cls._remove_owned_tree(child)
+        os.rmdir(path)
+
+    @classmethod
+    def _mark_owned_workspace(cls, path: Path) -> None:
+        marker = path / cls._OWNED_MARKER_NAME
+        marker.write_text(cls._OWNED_MARKER_TEXT, encoding="ascii")
+
+    @classmethod
+    def _has_owned_marker(cls, path: Path) -> bool:
+        marker = path / cls._OWNED_MARKER_NAME
+        try:
+            if cls._is_reparse_point(marker):
+                return False
+            st = os.lstat(marker)
+        except OSError:
+            return False
+        if not stat.S_ISREG(st.st_mode):
+            return False
+        try:
+            return marker.read_text(encoding="ascii") == cls._OWNED_MARKER_TEXT
+        except OSError:
+            return False
 
     @classmethod
     def is_available(cls) -> bool:
@@ -63,8 +133,8 @@ class N_m3u8DL_RE_Downloader(BaseDownloader):
         return True
 
     @classmethod
-    def is_m3u8_url(cls, url: str) -> bool:
-        return NM3U8DLREExternalTool.is_m3u8_url(url)
+    def is_m3u8_url(cls, url: str, content_type: str | None = None) -> bool:
+        return NM3U8DLREExternalTool.is_m3u8_url(url, content_type)
 
     def download(
         self,
@@ -392,20 +462,24 @@ class N_m3u8DL_RE_Downloader(BaseDownloader):
     def _create_nm3u8_temp_workspace(cls, save_path: str) -> Path:
         target = Path(save_path).expanduser()
         parent = target.parent if str(target.parent) else Path.cwd()
-        root = parent.resolve(strict=False) / cls.NM3U8_TEMP_ROOT_NAME
+        root = parent / cls.NM3U8_TEMP_ROOT_NAME
         root.mkdir(parents=True, exist_ok=True)
+        if cls._is_reparse_point(root):
+            raise OSError(f"refuse reparse point: {root}")
         # 工作目录名带目标 stem，便于人工排查；真正的删除判断仍依赖父目录和前缀白名单。
         safe_stem = re.sub(r"[^0-9A-Za-z_.-]+", "_", target.stem).strip("._-")[:36] or "download"
-        return Path(tempfile.mkdtemp(prefix=f"{cls.NM3U8_TEMP_DIR_PREFIX}{safe_stem}-", dir=str(root))).resolve(
-            strict=False
-        )
+        created = Path(tempfile.mkdtemp(prefix=f"{cls.NM3U8_TEMP_DIR_PREFIX}{safe_stem}-", dir=str(root)))
+        cls._mark_owned_workspace(created)
+        return created
 
     @classmethod
     def _is_owned_nm3u8_temp_workspace(cls, temp_dir: str | os.PathLike[str] | None) -> bool:
         if not temp_dir:
             return False
         try:
-            path = Path(temp_dir).resolve(strict=False)
+            path = Path(temp_dir)
+            if cls._is_reparse_point(path) or cls._is_reparse_point(path.parent):
+                return False
         except (OSError, RuntimeError, TypeError, ValueError):
             return False
         return path.parent.name == cls.NM3U8_TEMP_ROOT_NAME and path.name.startswith(cls.NM3U8_TEMP_DIR_PREFIX)
@@ -436,8 +510,14 @@ class N_m3u8DL_RE_Downloader(BaseDownloader):
         last_error: OSError | None = None
         for attempt in range(3):
             try:
-                if path.exists():
-                    shutil.rmtree(path)
+                if cls._is_reparse_point(path):
+                    raise OSError(f"refuse reparse point: {path}")
+                try:
+                    os.lstat(path)
+                except FileNotFoundError:
+                    last_error = None
+                    break
+                cls._remove_owned_tree(path)
                 last_error = None
                 break
             except OSError as exc:
@@ -459,6 +539,18 @@ class N_m3u8DL_RE_Downloader(BaseDownloader):
             pass
 
     @classmethod
+    def _scandir_temp_root(cls, path: Path) -> list[Path]:
+        """列举临时根。超过条目上限或列举失败时必须让调用方看到失败。"""
+        children: list[Path] = []
+        limit = cls.NM3U8_SWEEP_ENTRY_LIMIT
+        with os.scandir(path) as entries:
+            for entry in entries:
+                if len(children) >= limit:
+                    raise OSError(f"HLS temp root has more than {limit} entries: {path}")
+                children.append(Path(entry.path))
+        return children
+
+    @classmethod
     def sweep_orphaned_workspaces(cls, download_dirs: list[str | os.PathLike[str]]) -> int:
         """应用启动后、任务运行前清理一次遗留的 HLS 工作目录。"""
         cleaned_count = 0
@@ -478,16 +570,16 @@ class N_m3u8DL_RE_Downloader(BaseDownloader):
                 continue
 
             try:
-                if not base_dir.exists() or not base_dir.is_dir():
+                if cls._is_reparse_point(base_dir):
                     continue
-                # 既扫统一根目录，也扫旧版回退路径（fallback）留在目标目录下的 *_hls 目录。
+                try:
+                    base_stat = os.lstat(base_dir)
+                except FileNotFoundError:
+                    continue
+                if not stat.S_ISDIR(base_stat.st_mode):
+                    continue
+                # 只扫本程序的受控根目录。不以 _curl_cffi_hls/_playwright_hls 结尾作为删除条件。
                 candidates = [base_dir / cls.NM3U8_TEMP_ROOT_NAME]
-                candidates.extend(
-                    child
-                    for child in base_dir.iterdir()
-                    if child.is_dir()
-                    and (child.name.endswith("_curl_cffi_hls") or child.name.endswith("_playwright_hls"))
-                )
             except OSError as exc:
                 errors.append({"path": str(base_dir), "error": str(exc)})
                 debug_logger.log_exception(
@@ -500,21 +592,55 @@ class N_m3u8DL_RE_Downloader(BaseDownloader):
 
             for path in candidates:
                 try:
-                    if not path.exists() or not path.is_dir():
+                    if cls._is_reparse_point(path):
+                        errors.append({"path": str(path), "error": "refuse reparse point"})
                         continue
-                    shutil.rmtree(path, ignore_errors=True)
-                    if path.exists():
-                        errors.append({"path": str(path), "error": "directory still exists after cleanup"})
+                    try:
+                        root_stat = os.lstat(path)
+                    except FileNotFoundError:
                         continue
-                    cleaned_count += 1
+                    if not stat.S_ISDIR(root_stat.st_mode):
+                        continue
                 except OSError as exc:
                     errors.append({"path": str(path), "error": str(exc)})
                     debug_logger.log_exception(
                         "N_m3u8DL_RE_Downloader",
-                        "orphan_workspace_sweep_remove_error",
+                        "orphan_workspace_sweep_stat_error",
                         exc,
                         details={"path": str(path)},
                     )
+                    continue
+                children = cls._scandir_temp_root(path)
+                for child in children:
+                    try:
+                        if cls._is_reparse_point(child):
+                            errors.append({"path": str(child), "error": "refuse reparse point"})
+                            continue
+                        try:
+                            child_stat = os.lstat(child)
+                        except OSError as exc:
+                            errors.append({"path": str(child), "error": str(exc)})
+                            continue
+                        if not stat.S_ISDIR(child_stat.st_mode):
+                            continue
+                        if not child.name.startswith(cls.NM3U8_TEMP_DIR_PREFIX) or not cls._has_owned_marker(child):
+                            continue
+                        cls._remove_owned_tree(child)
+                        cleaned_count += 1
+                    except OSError as exc:
+                        errors.append({"path": str(child), "error": str(exc)})
+                        debug_logger.log_exception(
+                            "N_m3u8DL_RE_Downloader",
+                            "orphan_workspace_sweep_remove_error",
+                            exc,
+                            details={"path": str(child)},
+                        )
+                remaining = cls._scandir_temp_root(path)
+                if not remaining and not cls._is_reparse_point(path):
+                    try:
+                        os.rmdir(path)
+                    except OSError:
+                        pass
 
         debug_logger.log(
             component="N_m3u8DL_RE_Downloader",
@@ -538,40 +664,26 @@ class N_m3u8DL_RE_Downloader(BaseDownloader):
         progress_callback: ProgressCallback,
         check_stop_func: StopCheck,
     ) -> None:
-        if self._should_use_local_hls_proxy(video_item):
-            local_proxy = self._start_local_hls_proxy(video_item, headers, proxy)
-            with hls_proxy_utils._hls_proxy_cleanup_scope(local_proxy.stop):
-                local_headers = {"User-Agent": str(user_agent or DEFAULT_USER_AGENT)}
-                self._run_nm3u8_external_command(
-                    video_item,
-                    save_path,
-                    executable,
-                    local_proxy.url,
-                    user_agent,
-                    "",
-                    None,
-                    local_headers,
-                    hls_proxy_utils._local_hls_proxy_thread_count(thread_count),
-                    progress_callback,
-                    check_stop_func,
-                    local_proxy=True,
-                    progress_provider=local_proxy.progress_snapshot,
-                )
-            return
-        self._run_nm3u8_external_command(
-            video_item,
-            save_path,
-            executable,
-            video_item.url,
-            user_agent,
-            referer,
-            proxy,
-            headers,
-            thread_count,
-            progress_callback,
-            check_stop_func,
-            local_proxy=False,
-        )
+        # 没有任务级公网策略时也不能把原始 URL 交给 N_m3u8DL-RE，它会自己做 DNS。
+        del referer
+        local_proxy = self._start_local_hls_proxy(video_item, headers, proxy)
+        with hls_proxy_utils._hls_proxy_cleanup_scope(local_proxy.stop):
+            local_headers = {"User-Agent": str(user_agent or DEFAULT_USER_AGENT)}
+            self._run_nm3u8_external_command(
+                video_item,
+                save_path,
+                executable,
+                local_proxy.url,
+                user_agent,
+                "",
+                None,
+                local_headers,
+                hls_proxy_utils._local_hls_proxy_thread_count(thread_count),
+                progress_callback,
+                check_stop_func,
+                local_proxy=True,
+                progress_provider=local_proxy.progress_snapshot,
+            )
 
     def _run_nm3u8_external_command(
         self,
@@ -596,16 +708,20 @@ class N_m3u8DL_RE_Downloader(BaseDownloader):
         output_reader: threading.Thread | None = None
         try:
             temp_workspace = self._create_nm3u8_temp_workspace(save_path)
+            fragment_dir = temp_workspace / "fragments"
+            fragment_dir.mkdir()
+            suffix = Path(save_path).suffix or ".mp4"
+            staged_output = temp_workspace / f"ucp-media{suffix}"
             cmd = NM3U8DLREExternalTool.build_download_command(
                 executable,
                 source_url,
-                save_path,
+                str(staged_output),
                 user_agent,
                 referer,
                 proxy=proxy,
                 extra_headers=headers,
                 thread_count=thread_count,
-                tmp_dir=str(temp_workspace),
+                tmp_dir=str(fragment_dir),
             )
             debug_logger.log_command(
                 component="N_m3u8DL_RE_Downloader",
@@ -629,20 +745,74 @@ class N_m3u8DL_RE_Downloader(BaseDownloader):
             combined_provider = self._combine_progress_providers(progress_provider, output_progress.snapshot)
             self._wait_external_process_with_file_progress(
                 process,
-                save_path,
+                str(staged_output),
                 check_stop_func,
                 progress_callback,
                 0,
                 progress_provider=combined_provider,
-                temp_paths=[temp_workspace],
+                temp_paths=[fragment_dir],
             )
             if process.returncode != 0:
                 raise ExternalToolError(f"N_m3u8DL-RE exited abnormally (Code: {process.returncode})")
+            produced = self._locate_staged_media(staged_output)
+            self._assert_nm3u8_output(produced, video_item)
+            assert_publishable_media(str(produced), save_path)
+            Path(save_path).parent.mkdir(parents=True, exist_ok=True)
+            os.replace(produced, save_path)
         finally:
             self._join_nm3u8_output_reader(output_reader)
             if process is not None and process.poll() is None:
                 ExternalToolRunner.terminate_process(process)
             self._cleanup_nm3u8_temp_workspace(temp_workspace, trace_id=trace_id)
+
+    @classmethod
+    def _locate_staged_media(cls, staged: Path) -> Path:
+        if not cls._is_reparse_point(staged):
+            try:
+                st = os.lstat(staged)
+            except FileNotFoundError:
+                st = None
+            if st is not None and stat.S_ISREG(st.st_mode) and st.st_size > 0:
+                return staged
+        matches: list[Path] = []
+        try:
+            children = list(staged.parent.iterdir())
+        except OSError as exc:
+            raise ExternalToolError("N_m3u8DL-RE 退出码为 0，但没有非空输出") from exc
+        for child in children:
+            if cls._is_reparse_point(child) or not child.name.startswith(staged.stem):
+                continue
+            if child.suffix.lower() != ".mp4":
+                continue
+            try:
+                child_stat = os.lstat(child)
+            except OSError:
+                continue
+            if stat.S_ISREG(child_stat.st_mode) and child_stat.st_size > 0:
+                matches.append(child)
+        if not matches:
+            raise ExternalToolError("N_m3u8DL-RE 退出码为 0，但输出不存在或为空文件")
+        return max(matches, key=lambda item: os.lstat(item).st_size)
+
+    @staticmethod
+    def _assert_nm3u8_output(produced: Path, video_item: VideoItem) -> None:
+        try:
+            size = os.lstat(produced).st_size
+        except OSError as exc:
+            raise ExternalToolError("N_m3u8DL-RE 输出无法读取") from exc
+        if size <= 0:
+            raise ExternalToolError("N_m3u8DL-RE 退出码为 0，但输出为空文件")
+        available, probed = FFmpegExternalTool.probe_duration_seconds(str(produced))
+        if available and (probed is None or probed <= 0):
+            raise ExternalToolError("ffprobe 未能确认 N_m3u8DL-RE 输出时长")
+        expected = video_item.meta.get("duration") if isinstance(video_item.meta, dict) else None
+        try:
+            FFmpegExternalTool.assert_duration_if_expected(
+                str(produced),
+                float(expected) if isinstance(expected, (int, float)) and not isinstance(expected, bool) else None,
+            )
+        except DomainPolicyViolation as exc:
+            raise ExternalToolError(f"N_m3u8DL-RE 输出时长与预期不一致: {exc}") from exc
 
     @staticmethod
     def _combine_progress_providers(
@@ -881,7 +1051,7 @@ class N_m3u8DL_RE_Downloader(BaseDownloader):
         """读取单个 HLS 资源，并在跟随前逐跳校验每次重定向。"""
         current_url = canonicalize_request_target(str(upstream_url)).url
         redirect_chain = [current_url]
-        request_headers = dict(headers)
+        request_headers = hls_proxy_utils.filter_hls_outbound_headers(dict(headers), cross_origin=False)
         for redirect_count in range(max(0, int(max_redirects)) + 1):
             request_url, curl_options = hls_proxy_utils.prepare_hls_curl_request(
                 current_url, domain_policy, upstream_proxy
@@ -920,11 +1090,10 @@ class N_m3u8DL_RE_Downloader(BaseDownloader):
                 raise
 
             if self._url_origin(request_url) != self._url_origin(target_url):
-                request_headers = {
-                    key: value
-                    for key, value in request_headers.items()
-                    if str(key).lower() not in {"authorization", "cookie", "host", "proxy-authorization"}
-                }
+                request_headers = hls_proxy_utils.filter_hls_outbound_headers(
+                    request_headers,
+                    cross_origin=True,
+                )
             self._close_hls_proxy_response(response, request_url)
             current_url = target_url
             redirect_chain.append(target_url)
@@ -1183,12 +1352,9 @@ class N_m3u8DL_RE_Downloader(BaseDownloader):
 
         target = Path(save_path)
         target.parent.mkdir(parents=True, exist_ok=True)
-        temp_dir = target.parent / f"{target.stem}_curl_cffi_hls"
-        if temp_dir.exists():
-            shutil.rmtree(temp_dir, ignore_errors=True)
-        temp_dir.mkdir(parents=True, exist_ok=True)
+        temp_dir = self._create_nm3u8_temp_workspace(save_path)
         # Python 回退路径（fallback）先合并成裸 TS，再根据目标后缀决定是否 remux，失败时可整目录清理。
-        raw_path = temp_dir / f"{target.stem}.ts"
+        raw_path = temp_dir / "ucp-media.ts"
         domain_policy = self._domain_policy_for_item(video_item)
         session = self._make_curl_cffi_session(
             curl_requests,
@@ -1245,7 +1411,7 @@ class N_m3u8DL_RE_Downloader(BaseDownloader):
                 session.close()
             except (OSError, RuntimeError, AttributeError) as exc:
                 debug_logger.log_exception("M3U8Downloader", "close_curl_cffi_session", exc)
-            shutil.rmtree(temp_dir, ignore_errors=True)
+            self._cleanup_nm3u8_temp_workspace(temp_dir)
 
     def _download_with_playwright_hls(
         self,
@@ -1265,12 +1431,9 @@ class N_m3u8DL_RE_Downloader(BaseDownloader):
 
         target = Path(save_path)
         target.parent.mkdir(parents=True, exist_ok=True)
-        temp_dir = target.parent / f"{target.stem}_playwright_hls"
-        if temp_dir.exists():
-            shutil.rmtree(temp_dir, ignore_errors=True)
-        temp_dir.mkdir(parents=True, exist_ok=True)
+        temp_dir = self._create_nm3u8_temp_workspace(save_path)
         # Playwright 回退路径（fallback）也使用独立目录，避免浏览器上下文失败时污染最终输出路径。
-        raw_path = temp_dir / f"{target.stem}.ts"
+        raw_path = temp_dir / "ucp-media.ts"
         storage_state = video_item.meta.get("browser_storage_state")
         referer = str(video_item.meta.get("referer") or headers.get("Referer") or "")
         user_agent = str(video_item.meta.get("ua") or headers.get("User-Agent") or DEFAULT_USER_AGENT)
@@ -1356,7 +1519,7 @@ class N_m3u8DL_RE_Downloader(BaseDownloader):
                 try:
                     browser.close()
                 finally:
-                    shutil.rmtree(temp_dir, ignore_errors=True)
+                    self._cleanup_nm3u8_temp_workspace(temp_dir)
 
     @classmethod
     def _playwright_capture_playlist_from_referer(cls, page, referer: str, playlist_url: str) -> dict[str, str]:
@@ -1750,21 +1913,24 @@ class N_m3u8DL_RE_Downloader(BaseDownloader):
         max_response_bytes: int = 64 * 1024 * 1024,
     ):
         """使用 curl_cffi 发起请求，但仍由本项目掌控并逐跳校验重定向。"""
+        policy = domain_policy or PUBLIC_DOMAIN_POLICY
         if domain_policy is not None:
             return PinnedTransport(
-                policy=domain_policy,
+                policy=policy,
                 timeout=timeout,
                 max_response_bytes=max_response_bytes,
             ).request("GET", url, headers=headers, max_redirects=max_redirects)
         current_url = str(url)
-        request_headers = dict(headers)
+        request_headers = hls_proxy_utils.filter_hls_outbound_headers(dict(headers), cross_origin=False)
         for redirect_count in range(max(0, int(max_redirects)) + 1):
+            request_url, curl_options = hls_proxy_utils.prepare_hls_curl_request(current_url, policy, None)
             request_kwargs: dict[str, Any] = {
                 "headers": request_headers,
                 "timeout": timeout,
                 "allow_redirects": False,
             }
-            request_url = current_url
+            if curl_options:
+                request_kwargs["curl_options"] = curl_options
             response = session.get(request_url, **request_kwargs)
             status = int(getattr(response, "status_code", 0) or 0)
             response_headers = getattr(response, "headers", {}) or {}
@@ -1781,11 +1947,10 @@ class N_m3u8DL_RE_Downloader(BaseDownloader):
                 raise
 
             if cls._url_origin(current_url) != cls._url_origin(target_url):
-                request_headers = {
-                    key: value
-                    for key, value in request_headers.items()
-                    if str(key).lower() not in {"authorization", "cookie", "host", "proxy-authorization"}
-                }
+                request_headers = hls_proxy_utils.filter_hls_outbound_headers(
+                    request_headers,
+                    cross_origin=True,
+                )
             cls._close_hls_proxy_response(response, current_url)
             current_url = target_url
         raise ExternalToolError("curl_cffi HLS redirect limit exceeded")
@@ -1824,14 +1989,14 @@ class N_m3u8DL_RE_Downloader(BaseDownloader):
         return max(variants, key=score)
 
     def _finalize_curl_cffi_hls_output(self, raw_path: Path, target: Path, check_stop_func: StopCheck) -> None:
-        if target.exists():
-            target.unlink()
         if target.suffix.lower() != ".mp4":
-            shutil.move(str(raw_path), str(target))
+            assert_publishable_media(str(raw_path), str(target))
+            os.replace(raw_path, target)
             return
         ffmpeg = FFmpegExternalTool.resolve_executable()
         if not ffmpeg:
             raise ExternalToolNotFoundError("ffmpeg executable not found for MissAV HLS remux")
+        staging = raw_path.with_name(f"ucp-remux{target.suffix}")
         command = [
             ffmpeg,
             "-y",
@@ -1841,7 +2006,7 @@ class N_m3u8DL_RE_Downloader(BaseDownloader):
             "copy",
             "-bsf:a",
             "aac_adtstoasc",
-            str(target),
+            str(staging),
         ]
         process = subprocess.Popen(
             command,
@@ -1854,182 +2019,11 @@ class N_m3u8DL_RE_Downloader(BaseDownloader):
         ExternalToolRunner.wait_process(process, check_stop_func, None, None, poll_interval=0.2)
         if process.returncode != 0:
             raise ExternalToolError(f"ffmpeg remux failed (Code: {process.returncode})")
-        if not target.exists() or target.stat().st_size <= 0:
+        try:
+            staging_size = os.lstat(staging).st_size
+        except OSError:
+            staging_size = 0
+        if staging_size <= 0:
             raise ExternalToolError("ffmpeg remux did not create a valid output file")
-
-    def _download_with_yt_dlp_fallback(
-        self,
-        video_item: VideoItem,
-        save_path: str,
-        headers: dict[str, str],
-        proxy: str | None,
-        progress_callback: ProgressCallback,
-        check_stop_func: StopCheck,
-    ) -> None:
-        try:
-            from yt_dlp.utils import YoutubeDLError
-        except ImportError as exc:
-            raise ExternalToolNotFoundError("yt-dlp is unavailable; cannot run MissAV m3u8 fallback") from exc
-
-        target = Path(save_path)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        ydl_headers = self._headers_for_yt_dlp(headers)
-
-        def progress_hook(status: dict[str, Any]) -> None:
-            if check_stop_func():
-                raise DownloaderStoppedError("Download stopped by user")
-            if status.get("status") == "downloading":
-                downloaded = float(status.get("downloaded_bytes") or 0)
-                total = float(status.get("total_bytes") or status.get("total_bytes_estimate") or 0)
-                if total > 0:
-                    value = min(95, max(10, int(downloaded * 90 / total)))
-                    self._emit_progress(progress_callback, value)
-            elif status.get("status") == "finished":
-                self._emit_progress(progress_callback, 95)
-
-        local_proxy: _LocalHlsProxy | None = None
-        source_url = video_item.url
-        yt_dlp_proxy = proxy
-        if self._should_use_local_hls_proxy(video_item):
-            local_proxy = self._start_local_hls_proxy(video_item, headers, proxy)
-            source_url = local_proxy.url
-            yt_dlp_proxy = None
-            ydl_headers = {"User-Agent": str(headers.get("User-Agent") or DEFAULT_USER_AGENT)}
-
-        params = self._yt_dlp_params(str(target), ydl_headers, yt_dlp_proxy, progress_hook)
-        with hls_proxy_utils._hls_proxy_cleanup_scope(
-            local_proxy.stop if local_proxy is not None else None
-        ):
-            try:
-                self._run_yt_dlp(source_url, dict(params))
-            except YoutubeDLError as exc:
-                params.pop("impersonate", None)
-                try:
-                    self._run_yt_dlp(source_url, dict(params))
-                except YoutubeDLError as retry_exc:
-                    raise ExternalToolError(f"yt-dlp fallback failed: {retry_exc}") from retry_exc
-                else:
-                    debug_logger.log(
-                        component="N_m3u8DL_RE_Downloader",
-                        action="yt_dlp_impersonation_retry",
-                        message="yt-dlp fallback succeeded without impersonation",
-                        status_code="M3U8_YTDLP_RETRY_OK",
-                        details={"initial_error": str(exc)},
-                        trace_id=video_item.meta.get("trace_id"),
-                    )
-            if not target.exists() or target.stat().st_size <= 0:
-                raise ExternalToolError("yt-dlp fallback did not create a valid output file")
-
-    @staticmethod
-    def _headers_for_yt_dlp(headers: dict[str, str]) -> dict[str, str]:
-        blocked = {
-            "host",
-            "content-length",
-            "connection",
-            "transfer-encoding",
-        }
-        result: dict[str, str] = {}
-        for key, value in (headers or {}).items():
-            key_text = str(key or "").strip()
-            value_text = str(value or "").strip()
-            if not key_text or not value_text:
-                continue
-            lowered = key_text.lower()
-            if lowered in blocked or lowered.startswith(":"):
-                continue
-            result[key_text] = value_text
-        return result
-
-    @staticmethod
-    def _yt_dlp_params(
-        save_path: str,
-        headers: dict[str, str],
-        proxy: str | None,
-        progress_hook,
-    ) -> dict[str, Any]:
-        retry_count = BaseDownloader._coerce_retry_count(cfg.get("download", "max_retries", 3))
-        resume_enabled = BaseDownloader._coerce_bool_setting(cfg.get("download", "resume_enabled", True))
-        try:
-            speed_limit_kb = max(0, int(cfg.get("download", "speed_limit_kb", 0) or 0))
-        except (TypeError, ValueError):
-            speed_limit_kb = 0
-        params = {
-            "quiet": True,
-            "no_warnings": True,
-            "noprogress": True,
-            "outtmpl": {"default": save_path},
-            "paths": {"home": str(Path(save_path).parent)},
-            "http_headers": headers,
-            "proxy": proxy or None,
-            "retries": retry_count,
-            "fragment_retries": retry_count,
-            "continuedl": resume_enabled,
-            "nopart": not resume_enabled,
-            "merge_output_format": "mp4",
-            "progress_hooks": [progress_hook],
-            "impersonate": "",
-        }
-        if speed_limit_kb > 0:
-            # yt-dlp 的 ratelimit 单位是 bytes/s，和配置页的 KB/s 做一次显式换算。
-            params["ratelimit"] = speed_limit_kb * 1024
-        return params
-
-    @staticmethod
-    def _run_yt_dlp(url: str, params: dict[str, Any]) -> None:
-        from yt_dlp import YoutubeDL
-
-        with YoutubeDL(params) as ydl:
-            ydl.download([url])
-
-    @staticmethod
-    def _headers_from_meta(video_item: VideoItem, user_agent: str, referer: str) -> dict[str, str]:
-        headers: dict[str, str] = {}
-        meta_headers = video_item.meta.get("headers")
-        if isinstance(meta_headers, dict):
-            headers.update({str(key): str(value) for key, value in meta_headers.items() if value})
-        headers.setdefault("User-Agent", str(user_agent or DEFAULT_USER_AGENT))
-        if referer:
-            headers.setdefault("Referer", str(referer))
-        if (
-            str(video_item.source or "").lower() == "missav"
-            and not video_item.meta.get("missav_use_browser_headers")
-            and not video_item.meta.get("missav_include_cookies")
-        ):
-            return {
-                key: headers[key]
-                for key in ("User-Agent", "Referer")
-                if headers.get(key)
-            }
-        cookie_dict = video_item.meta.get("cookies")
-        if isinstance(cookie_dict, dict) and cookie_dict:
-            headers.setdefault("Cookie", "; ".join(f"{key}={value}" for key, value in cookie_dict.items()))
-        elif isinstance(video_item.meta.get("cookie"), str) and video_item.meta.get("cookie"):
-            headers.setdefault("Cookie", str(video_item.meta["cookie"]))
-        return headers
-
-    @staticmethod
-    def _cleanup_external_temp_files(save_path: str) -> None:
-        target = Path(save_path)
-        parent = target.parent
-        stem = target.stem
-        # 只按目标文件 stem 清理外部工具常见副产物，避免误删同目录其他任务。
-        candidates = {
-            target,
-            parent / f"{target.name}.tmp",
-            parent / f"{target.name}.part",
-            parent / f"{target.name}.aria2",
-            parent / f"{stem}.tmp",
-            parent / f"{stem}.part",
-            parent / f"{stem}.aria2",
-            parent / f"{stem}.ts",
-            parent / f"{stem}_tmp",
-            parent / f"{stem}.download",
-        }
-        for path in candidates:
-            try:
-                if path.is_dir():
-                    shutil.rmtree(path, ignore_errors=True)
-                elif path.exists():
-                    path.unlink()
-            except OSError:
-                continue
+        assert_publishable_media(str(staging), str(target))
+        os.replace(staging, target)

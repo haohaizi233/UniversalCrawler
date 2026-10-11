@@ -47,7 +47,7 @@ class DownloadStrategyChainTests(unittest.TestCase):
         _mocked_is_m3u8_url,
         _mocked_is_available,
     ):
-        item = VideoItem(url="https://example.com/live/index.m3u8", title="demo", source="douyin")
+        item = VideoItem(url="https://example.com/video.mp4", title="demo", source="douyin")
         item.meta.update({"download_strategy": "http", "size_mb": 500, "duration": 3600})
         downloader = _ProbeDownloader()
 
@@ -71,7 +71,7 @@ class DownloadStrategyChainTests(unittest.TestCase):
     @patch("app.core.downloaders.m3u8.N_m3u8DL_RE_Downloader.is_m3u8_url", return_value=True)
     @patch("app.core.downloaders.chunked.ChunkedDownloader.should_use", return_value=False)
     @patch("app.core.downloaders.ffmpeg.FFmpegDownloader.should_use", return_value=False)
-    def test_explicit_m3u8_strategy_falls_back_to_http_when_tool_missing(
+    def test_explicit_m3u8_strategy_does_not_save_playlist_via_http(
         self,
         _mocked_ffmpeg_should_use,
         _mocked_chunked_should_use,
@@ -82,18 +82,19 @@ class DownloadStrategyChainTests(unittest.TestCase):
         item.meta["download_strategy"] = "m3u8"
         downloader = _ProbeDownloader()
 
-        downloader._download_with_strategy_fallback(
-            video_item=item,
-            save_path="demo.mp4",
-            headers={"User-Agent": "ua"},
-            progress_callback=lambda _value: None,
-            check_stop_func=lambda: False,
-            max_retries=3,
-            timeout=10,
-            chunk_size=1024,
-        )
+        with self.assertRaises(StreamDownloadError):
+            downloader._download_with_strategy_fallback(
+                video_item=item,
+                save_path="demo.mp4",
+                headers={"User-Agent": "ua"},
+                progress_callback=lambda _value: None,
+                check_stop_func=lambda: False,
+                max_retries=3,
+                timeout=10,
+                chunk_size=1024,
+            )
 
-        self.assertEqual(len(downloader.http_calls), 1)
+        self.assertEqual(downloader.http_calls, [])
 
     @patch("app.core.downloaders.chunked.ChunkedDownloader.download", side_effect=StreamDownloadError("chunked failed"))
     @patch("app.core.downloaders.chunked.ChunkedDownloader.should_use", return_value=True)

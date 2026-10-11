@@ -8,6 +8,7 @@ from unittest.mock import patch
 from app.core.download_manager import DownloadWorker
 from app.core.downloaders import ChunkedDownloader
 from app.core.downloaders.bilibili import BilibiliDownloader
+from app.exceptions import DownloaderStoppedError
 from app.models import VideoItem
 
 
@@ -110,7 +111,7 @@ class DownloadAtomicityAndStateTests(unittest.TestCase):
             first = Path(temp_dir, "first.part")
             second = Path(temp_dir, "second.part")
             destination = Path(temp_dir, "video.mp4")
-            first.write_bytes(b"abc")
+            first.write_bytes(b"\x00\x00\x00\x18ftypisom\x00\x00\x00\x00")
             second.write_bytes(b"def")
             destination.write_bytes(b"old")
 
@@ -119,14 +120,17 @@ class DownloadAtomicityAndStateTests(unittest.TestCase):
                 os.fspath(destination),
             )
 
-            self.assertEqual(destination.read_bytes(), b"abcdef")
+            self.assertEqual(
+                destination.read_bytes(),
+                b"\x00\x00\x00\x18ftypisom\x00\x00\x00\x00def",
+            )
             self.assertFalse(Path(f"{destination}.merging").exists())
 
     def test_chunk_merge_failure_preserves_existing_destination(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             part = Path(temp_dir, "first.part")
             destination = Path(temp_dir, "video.mp4")
-            part.write_bytes(b"new")
+            part.write_bytes(b"\x00\x00\x00\x18ftypisom\x00\x00\x00\x00")
             destination.write_bytes(b"old")
 
             with patch("app.core.downloaders.chunked.os.replace", side_effect=OSError("replace failed")):
@@ -143,7 +147,7 @@ class DownloadAtomicityAndStateTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             merging = Path(temp_dir, "video.mp4.merging")
             destination = Path(temp_dir, "video.mp4")
-            merging.write_bytes(b"new")
+            merging.write_bytes(b"\x00\x00\x00\x18ftypisom\x00\x00\x00\x00")
             destination.write_bytes(b"old")
 
             with patch("app.core.downloaders.bilibili.os.replace", side_effect=OSError("replace failed")):
@@ -154,6 +158,56 @@ class DownloadAtomicityAndStateTests(unittest.TestCase):
                     )
 
             self.assertEqual(destination.read_bytes(), b"old")
+
+    def test_successful_download_still_finishes_after_stop_clears_running(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            item = VideoItem(url="https://example.com/a.mp4", title="a", source="test")
+            worker = DownloadWorker(item, temp_dir)
+            finished: list[str] = []
+            errors: list[str] = []
+            reasons: list[str] = []
+
+            class StopAfterWrite:
+                @staticmethod
+                def download(*, save_path, **_kwargs):
+                    Path(save_path).write_bytes(b"\x00\x00\x00\x20ftypisom")
+                    worker.stop()
+                    return save_path
+
+            worker.sig_finished.connect(finished.append)
+            worker.sig_error.connect(lambda *_args: errors.append("error"))
+            worker._completion_callback = lambda _worker, reason: reasons.append(reason)
+            with patch.object(worker, "_select_downloader", return_value=StopAfterWrite()):
+                worker.run()
+
+            self.assertEqual(finished, [item.id])
+            self.assertEqual(errors, [])
+            self.assertEqual(reasons, ["task_finished"])
+            self.assertTrue(Path(item.local_path).is_file())
+
+    def test_user_stop_before_completion_does_not_emit_error(self):
+        class StoppedDownloader:
+            @staticmethod
+            def download(**_kwargs):
+                raise DownloaderStoppedError("用户停止下载")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            item = VideoItem(url="https://example.com/a.mp4", title="a", source="test")
+            worker = DownloadWorker(item, temp_dir)
+            finished: list[str] = []
+            errors: list[str] = []
+            reasons: list[str] = []
+            worker.sig_finished.connect(finished.append)
+            worker.sig_error.connect(lambda *_args: errors.append("error"))
+            worker._completion_callback = lambda _worker, reason: reasons.append(reason)
+
+            with patch.object(worker, "_select_downloader", return_value=StoppedDownloader()):
+                worker.run()
+
+            self.assertEqual(finished, [])
+            self.assertEqual(errors, [])
+            self.assertEqual(reasons, ["task_cancelled"])
+            self.assertEqual(item.local_path, "")
 
 
 if __name__ == "__main__":

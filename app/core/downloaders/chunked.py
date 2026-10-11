@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 import tempfile
 import threading
 import time
@@ -17,7 +18,7 @@ from app.models import VideoItem
 from shared.network_proxy import requests_proxy_mapping
 from shared.runtime_options import DomainPolicyViolation
 
-from .base import BaseDownloader, ProgressCallback, StopCheck, TransferRateLimiter
+from .base import BaseDownloader, ProgressCallback, StopCheck, TransferRateLimiter, assert_publishable_media
 
 class ChunkedDownloader(BaseDownloader):
     """适用于大文件的 Range 分块下载器，支持每个分片独立续传和重试。"""
@@ -133,8 +134,20 @@ class ChunkedDownloader(BaseDownloader):
         error_holder: list[Exception] = []
 
         def cleanup_temp_files() -> None:
-            """只清理本次分配出的分片文件，避免误删同目录其他下载缓存。"""
+            """只清理本次分配出的普通分片文件，拒绝重解析点。"""
             for temp_file in [*temp_files, manifest_file]:
+                try:
+                    st = os.lstat(temp_file)
+                except FileNotFoundError:
+                    continue
+                except OSError:
+                    continue
+                attributes = int(getattr(st, "st_file_attributes", 0) or 0)
+                reparse_flag = int(getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
+                if stat.S_ISLNK(st.st_mode) or attributes & reparse_flag:
+                    continue
+                if not stat.S_ISREG(st.st_mode):
+                    continue
                 try:
                     os.remove(temp_file)
                 except OSError:
@@ -410,6 +423,7 @@ class ChunkedDownloader(BaseDownloader):
                 os.fsync(output_fp.fileno())
             if should_stop():
                 raise DownloaderStoppedError("User stopped download before chunk publication")
+            assert_publishable_media(merging_path, save_path)
             os.replace(merging_path, save_path)
         finally:
             try:

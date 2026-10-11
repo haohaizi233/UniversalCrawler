@@ -4,8 +4,22 @@ from __future__ import annotations
 
 import functools
 import importlib.util
+import sys
+import tempfile
 
 import pytest
+
+if sys.platform == "win32":
+    _TemporaryDirectory = tempfile.TemporaryDirectory
+
+    class _WindowsTemporaryDirectory(_TemporaryDirectory):
+        """Approved directory capabilities keep a handle until the session ends."""
+
+        def __init__(self, *args, **kwargs):
+            kwargs.setdefault("ignore_cleanup_errors", True)
+            super().__init__(*args, **kwargs)
+
+    tempfile.TemporaryDirectory = _WindowsTemporaryDirectory
 
 
 def _qt_runtime_available() -> bool:

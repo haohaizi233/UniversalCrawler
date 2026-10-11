@@ -751,10 +751,11 @@ class DirListChangeTests(unittest.TestCase):
             self.assertIn("subdirs", data)
 
     def test_dir_list_nonexistent_path(self):
-        """Z:\\__definitely_not_exist_12345__ 应当返回 error 字段。"""
-        path = "Z:\\__definitely_not_exist_12345__"
-        self.client._ucrawl_context.approve_directory(path)
-        r = self.client.get(f"/api/dir/list?path={path}")
+        """缺失的子目录应当返回 error 字段，且不依赖本机不存在的盘符。"""
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            self.client._ucrawl_context.approve_directory(tmp)
+            path = os.path.join(tmp, "__definitely_not_exist_12345__")
+            r = self.client.get(f"/api/dir/list?path={path}")
         self.assertEqual(r.status_code, 200)
         data = r.json()
         self.assertIn("error", data)
@@ -766,11 +767,11 @@ class DirListChangeTests(unittest.TestCase):
         self.assertTrue(_is_error_response(r.json()))
 
     def test_dir_change_nonexistent(self):
-        """不存在的目录可能由 os.path.exists 解释为存在（Windows 路径兼容），
-        所以只验证返回是合法 dict 不崩溃。"""
-        path = "Z:\\__definitely_not_exist_12345__\\foo"
-        self.client._ucrawl_context.approve_directory(path)
-        r = self.client.post("/api/dir/change", json={"directory": path})
+        """不存在的子目录应返回合法 dict，且不依赖本机不存在的盘符。"""
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            self.client._ucrawl_context.approve_directory(tmp)
+            path = os.path.join(tmp, "__definitely_not_exist_12345__", "foo")
+            r = self.client.post("/api/dir/change", json={"directory": path})
         self.assertEqual(r.status_code, 200)
         self.assertIn("status", r.json())
 

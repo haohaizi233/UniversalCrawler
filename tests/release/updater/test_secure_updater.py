@@ -158,14 +158,15 @@ def _signed_manifest(
 ) -> tuple[Path, Path, str]:
     key = key or ECC.generate(curve="Ed25519")
     public_pem = key.public_key().export_key(format="PEM")
+    published_at = datetime.now(timezone.utc).replace(microsecond=0)
     payload = {
         "schema": 1,
         "appId": "ucrawl.universalcrawlerpro",
         "channel": "stable",
         "version": "3.7.0",
         "tag": "v3.7.0",
-        "publishedAt": "2026-07-09T00:00:00Z",
-        "expiresAt": (datetime.now(timezone.utc) + timedelta(days=2)).isoformat().replace("+00:00", "Z"),
+        "publishedAt": published_at.isoformat().replace("+00:00", "Z"),
+        "expiresAt": (published_at + timedelta(days=2)).isoformat().replace("+00:00", "Z"),
         "minClientVersion": "3.0.0",
         "mandatory": False,
         "notes": "release notes",

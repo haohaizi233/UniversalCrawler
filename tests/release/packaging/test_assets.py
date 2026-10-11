@@ -20,6 +20,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -1275,7 +1276,7 @@ class ReleaseUpdateManifestToolTests(unittest.TestCase):
                 ],
                 notes="release notes",
                 expires_days=30,
-                published_at="2026-07-10T00:00:00Z",
+                published_at=datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
                 verify_with_config=False,
             )
 

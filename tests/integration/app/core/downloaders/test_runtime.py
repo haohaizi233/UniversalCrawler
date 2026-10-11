@@ -6080,13 +6080,19 @@ https://cdn.example.com/seg2.ts
         manager._workers_lock = threading.Lock()
         worker = Mock()
         worker.video = VideoItem(url="https://example.com/1.mp4", title="demo", source="douyin")
-        worker.wait.return_value = False
+        worker.wait.side_effect = [False, True]
         manager.workers = [worker]
 
         manager.stop_all()
 
         worker.stop.assert_called_once()
-        worker.wait.assert_called_once_with(DownloadManager.WORKER_STOP_TIMEOUT_MS)
+        self.assertEqual(
+            [item.args for item in worker.wait.call_args_list],
+            [
+                (DownloadManager.WORKER_STOP_TIMEOUT_MS,),
+                (DownloadManager.WORKER_STOP_TIMEOUT_MS,),
+            ],
+        )
         manager.dispatcher_thread.join.assert_called_once_with(timeout=2)
 
     def test_download_manager_release_slot_is_idempotent(self):

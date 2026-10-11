@@ -80,10 +80,11 @@ class DownloadManagerDispatchTests(unittest.TestCase):
         self.assertEqual(worker.sig_progress.targets, [manager._emit_task_progress])
         self.assertEqual(worker.sig_finished.targets[1:], [manager._emit_task_finished])
         self.assertEqual(worker.sig_error.targets[1:], [manager._emit_task_error])
+        generation = manager._download_recovery_store.register_task.return_value
         worker.sig_finished.targets[0](item.id)
-        manager._download_recovery_store.delete_task.assert_called_once_with(item.id)
+        manager._download_recovery_store.delete_task.assert_called_once_with(item.id, generation)
         worker.sig_error.targets[0](item.id, "network")
-        manager._download_recovery_store.handoff_failed_task.assert_called_once_with(item.id)
+        manager._download_recovery_store.handoff_failed_task.assert_called_once_with(item.id, generation)
         self.assertEqual(len(worker.finished.targets), 1)
         worker.start.assert_called_once()
 

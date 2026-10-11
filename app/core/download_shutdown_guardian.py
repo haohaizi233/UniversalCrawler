@@ -56,15 +56,50 @@ def stop_download_manager(manager: Any) -> bool:
                     pass
             _REAL_SLEEP(seconds)
 
+    def log_discarded_items(items: Any) -> None:
+        if not isinstance(items, (list, tuple)) or not items:
+            return
+        video_ids: list[Any] = []
+        for item in items:
+            try:
+                video_ids.append(getattr(item[0], "id", None))
+            except Exception:
+                video_ids.append(None)
+        log_safely(
+            component="DownloadManager",
+            action="stop_all_discard_unstarted",
+            level="WARN",
+            message="Discarded queued downloads that were not started",
+            status_code="DL_STOP_DISCARD_UNSTARTED",
+            details={"count": len(items), "video_ids": video_ids},
+        )
+
     def drain_fallback() -> None:
+        discarded: list[Any] = []
         while True:
             try:
-                manager.queue.get_nowait()
+                discarded.append(manager.queue.get_nowait())
             except queue.Empty:
+                log_discarded_items(discarded)
                 return
             except BaseException as exc:
                 remember("stop_all.queue_fallback", exc)
+                log_discarded_items(discarded)
                 return
+
+    def drain_queue(action: str) -> None:
+        found, drain = attempt(
+            f"{action}_lookup",
+            lambda: getattr(manager.queue, "drain", None),
+        )
+        if found and callable(drain):
+            drained, items = attempt(action, drain)
+            if drained:
+                log_discarded_items(items)
+                return
+            drain_fallback()
+            return
+        drain_fallback()
 
     def log_worker_timeout(worker: Any) -> None:
         video_id = trace_id = None
@@ -106,13 +141,9 @@ def stop_download_manager(manager: Any) -> bool:
             status_code="DL_STOP_ALL",
             details={"active_workers": len(workers_snapshot)},
         )
-        found, drain = attempt("stop_all.queue_drain_lookup", lambda: getattr(manager.queue, "drain", None))
-        if found and callable(drain):
-            drained, _ = attempt("stop_all.queue_drain", drain)
-            if not drained:
-                drain_fallback()
-        else:
-            drain_fallback()
+        # 排空之后禁止再入队。调度线程里已取出但未启动的任务不能再 queue.put。
+        manager._downloads_queue_closed = True
+        drain_queue("stop_all.queue_drain")
 
     for worker in workers_snapshot:
         attempt("stop_all.worker_stop", lambda worker=worker: worker.stop())
@@ -162,6 +193,9 @@ def stop_download_manager(manager: Any) -> bool:
             dispatcher_timeout_logged = True
         pause(dispatcher_delay)
         dispatcher_delay = min(_MAX_RETRY_SECONDS, dispatcher_delay * 2.0)
+
+    # 调度线程退出后可能还有它在 join 前塞回的任务，再排空一次。
+    drain_queue("stop_all.queue_drain_after_join")
 
     if first_failure is not None:
         raise first_failure

@@ -357,6 +357,7 @@ class DownloadManagerCoreTests(unittest.TestCase):
     def test_dispatch_persists_path_before_worker_and_deletes_it_on_completion(self):
         manager = _CoreManager()
         recovery_store = Mock()
+        recovery_store.register_task.return_value = "generation-1"
         manager._download_recovery_store = recovery_store
         video = VideoItem(
             url="https://example.com/video.mp4",
@@ -376,7 +377,7 @@ class DownloadManagerCoreTests(unittest.TestCase):
                 trace_id="trace-1",
                 platform="bilibili",
             )
-            recovery_store.delete_task.assert_called_once_with(video.id)
+            recovery_store.delete_task.assert_called_once_with(video.id, "generation-1")
             self.assertEqual(video.meta["save_directory"], "downloads")
         finally:
             manager.stop_all()
@@ -394,12 +395,16 @@ class DownloadManagerCoreTests(unittest.TestCase):
             title="video",
             source="bilibili",
         )
+        video.meta["recovery_generation"] = "generation-1"
         worker = _FakeWorker(video, "downloads")
 
         manager._connect_worker_callbacks(worker)
         worker.sig_error.emit(video.id, "network")
 
-        manager._download_recovery_store.handoff_failed_task.assert_called_once_with(video.id)
+        manager._download_recovery_store.handoff_failed_task.assert_called_once_with(
+            video.id,
+            "generation-1",
+        )
 
     def test_dispatch_persists_the_exact_collection_directory_before_worker_start(self):
         with patch.object(
@@ -463,6 +468,7 @@ class DownloadManagerCoreTests(unittest.TestCase):
         ):
             manager = _CoreManager()
         manager._download_recovery_store = Mock()
+        manager._download_recovery_store.register_task.return_value = "generation-1"
         manager._create_worker = Mock(side_effect=RuntimeError("worker init failed"))
         video = VideoItem(
             url="https://example.com/video.mp4",
@@ -475,7 +481,10 @@ class DownloadManagerCoreTests(unittest.TestCase):
             self.assertTrue(manager.error_event.wait(timeout=1.0))
 
             manager._download_recovery_store.register_task.assert_called_once()
-            manager._download_recovery_store.handoff_failed_task.assert_called_once_with(video.id)
+            manager._download_recovery_store.handoff_failed_task.assert_called_once_with(
+                video.id,
+                "generation-1",
+            )
         finally:
             manager.stop_all()
 
@@ -831,12 +840,17 @@ class DownloadManagerCoreTests(unittest.TestCase):
             return video, save_dir
 
         manager.queue.get = get_and_stop
-        # 模拟“刚取出队列项，管理器随即停止”的竞态，任务必须放回队列而不是丢失。
-        manager._dispatch_loop()
+        # 已取出但未启动的任务不能塞回内存队列，否则 stop_all 排空后会丢。
+        with patch("app.core.download_manager_core.debug_logger.log") as log:
+            manager._dispatch_loop()
 
-        self.assertEqual(manager.queue.snapshot_video_ids(), {item.id})
+        self.assertEqual(manager.queue.snapshot_video_ids(), set())
         self.assertEqual(manager.workers, [])
         manager._create_worker.assert_not_called()
+        self.assertIn(
+            "discard_unstarted_task",
+            [call.kwargs.get("action") for call in log.call_args_list],
+        )
 
     def test_stop_all_fallback_drains_queue_without_empty_probe(self):
         class QueueWithoutReliableEmpty:
@@ -1206,6 +1220,361 @@ class DownloadManagerCoreTests(unittest.TestCase):
         self.assertEqual(manager._slot_capacity(), 3)
         self.assertFalse(manager._has_any_dispatch_capacity())
         self.assertFalse(manager._has_capacity_for(next_image))
+
+    def test_drain_closes_the_queue_against_later_puts(self):
+        pending = PendingDownloadQueue()
+        item = VideoItem(url="https://example.com/queued.mp4", title="queued", source="douyin")
+        pending.put((item, "downloads"))
+
+        drained = pending.drain()
+
+        self.assertEqual([video.id for video, _save_dir in drained], [item.id])
+        self.assertTrue(pending.closed)
+        with self.assertRaises(RuntimeError):
+            pending.put((item, "downloads"))
+
+    def test_stop_all_drains_again_after_the_dispatcher_joins(self):
+        class LateQueue:
+            def __init__(self):
+                self.items = ["first"]
+                self.drain_calls = 0
+
+            def drain(self):
+                self.drain_calls += 1
+                items = list(self.items)
+                self.items.clear()
+                if self.drain_calls == 1:
+                    self.items.append("late")
+                return items
+
+        queue_owner = LateQueue()
+        manager = self._stop_manager(queue_owner, [])
+
+        with patch("app.core.download_shutdown_guardian.debug_logger.log"):
+            stopped = manager.stop_all()
+
+        self.assertIs(stopped, True)
+        self.assertEqual(queue_owner.items, [])
+        self.assertEqual(queue_owner.drain_calls, 2)
+        self.assertTrue(manager._downloads_queue_closed)
+
+    def test_capacity_requeue_drops_the_task_when_the_manager_has_stopped(self):
+        manager = DownloadManagerCore.__new__(DownloadManagerCore)
+        manager.queue = PendingDownloadQueue()
+        manager._start_stop_lock = threading.RLock()
+        manager.is_running = True
+        video = VideoItem(url="https://example.com/capacity.mp4", title="capacity", source="douyin")
+
+        self.assertTrue(manager._requeue_unstarted_task(video, "downloads", "capacity"))
+        self.assertEqual(manager.queue.snapshot_video_ids(), {video.id})
+        manager.queue.get_nowait()
+        manager.is_running = False
+
+        with patch("app.core.download_manager_core.debug_logger.log") as log:
+            requeued = manager._requeue_unstarted_task(video, "downloads", "capacity")
+
+        self.assertFalse(requeued)
+        self.assertTrue(manager.queue.empty())
+        self.assertIn(
+            "discard_unstarted_task",
+            [call.kwargs.get("action") for call in log.call_args_list],
+        )
+
+    def test_cancelled_completion_does_not_handoff_a_newer_registration(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            save_dir = root / "downloads"
+            save_dir.mkdir()
+            store = DownloadRecoveryStore(db_path=root / "recovery.sqlite3")
+            video = VideoItem(url="https://example.com/cancel.mp4", title="cancel", source="douyin")
+            first = store.register_task(video_id=video.id, save_directory=save_dir)
+            second = store.register_task(video_id=video.id, save_directory=save_dir)
+            manager = DownloadManagerCore.__new__(DownloadManagerCore)
+            manager._download_recovery_store = store
+            manager._workers_lock = threading.RLock()
+            manager.workers = []
+            manager._slot_semaphore_lock = threading.RLock()
+            manager.slot_semaphore = threading.BoundedSemaphore(1)
+            manager._dispatch_slot_gate = threading.Event()
+            worker = SimpleNamespace(
+                video=video,
+                _recovery_generation=first,
+                _slot_released=True,
+            )
+
+            manager._handle_worker_completion(worker, "task_cancelled")
+
+            self.assertNotEqual(first, second)
+            self.assertIsNotNone(store.task_path(video.id))
+            self.assertEqual(store.recovery_counts(), {"active": 1, "pending_cleanup": 0})
+
+    def test_delete_failure_retries_and_then_leaves_the_row_for_confirmation(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            save_dir = root / "downloads"
+            save_dir.mkdir()
+            store = DownloadRecoveryStore(db_path=root / "recovery.sqlite3")
+            video = VideoItem(url="https://example.com/retry.mp4", title="retry", source="douyin")
+            generation = store.register_task(video_id=video.id, save_directory=save_dir)
+            manager = DownloadManagerCore.__new__(DownloadManagerCore)
+            manager._download_recovery_store = store
+            calls = {"n": 0}
+            original = store.delete_task
+
+            def flaky(video_id, task_generation=None):
+                calls["n"] += 1
+                if calls["n"] < 3:
+                    raise OSError("busy")
+                return original(video_id, task_generation)
+
+            store.delete_task = flaky
+            manager._mark_download_recovery_state(video.id, "completed", generation)
+
+            self.assertEqual(calls["n"], 3)
+            self.assertIsNone(store.task_path(video.id))
+
+            replacement = store.register_task(video_id=video.id, save_directory=save_dir)
+
+            def always_fail(*_args, **_kwargs):
+                raise OSError("still busy")
+
+            store.delete_task = always_fail
+            with patch("app.core.download_manager_core.debug_logger.log_exception"):
+                manager._mark_download_recovery_state(video.id, "cancelled", replacement)
+
+            self.assertIsNotNone(store.task_path(video.id))
+            self.assertEqual(store.recovery_counts(), {"active": 1, "pending_cleanup": 0})
+
+    def test_confirmed_acquire_is_preserved_when_concurrency_increases(self):
+        manager = DownloadManagerCore.__new__(DownloadManagerCore)
+        manager.max_concurrent = 1
+        manager.image_respects_concurrency = True
+        manager.image_fast_lane_limit = 10
+        manager._start_stop_lock = threading.RLock()
+        manager._slot_semaphore_lock = threading.RLock()
+        manager._dispatch_slot_gate = threading.Event()
+        manager._slot_semaphore_capacity = 1
+        manager.slot_semaphore = threading.BoundedSemaphore(1)
+        manager.is_running = True
+
+        self.assertTrue(manager._acquire_dispatch_slot(0.2))
+        manager.set_max_concurrent(5)
+
+        available = 0
+        while manager.slot_semaphore.acquire(blocking=False):
+            available += 1
+        self.assertEqual(available, 4)
+        self.assertEqual(manager._slot_semaphore_capacity, 5)
+
+    def test_overlapping_acquire_and_rebuild_do_not_lose_a_slot(self):
+        manager = DownloadManagerCore.__new__(DownloadManagerCore)
+        manager.max_concurrent = 1
+        manager.image_respects_concurrency = True
+        manager.image_fast_lane_limit = 10
+        manager._start_stop_lock = threading.RLock()
+        manager._slot_semaphore_lock = threading.RLock()
+        manager._dispatch_slot_gate = threading.Event()
+        manager._dispatch_slot_gate.set()
+        manager._slot_semaphore_capacity = 1
+        manager.slot_semaphore = threading.BoundedSemaphore(1)
+        manager.is_running = True
+        stop = threading.Event()
+
+        def hammer():
+            while not stop.is_set():
+                if manager._acquire_dispatch_slot(0.05):
+                    manager._release_dispatch_slot("test")
+
+        threads = [threading.Thread(target=hammer) for _ in range(4)]
+        for thread in threads:
+            thread.start()
+        try:
+            for value in (5, 1, 5, 3, 5):
+                manager.set_max_concurrent(value)
+        finally:
+            stop.set()
+            for thread in threads:
+                thread.join(timeout=2)
+
+        self.assertTrue(all(not thread.is_alive() for thread in threads))
+        available = 0
+        while manager.slot_semaphore.acquire(blocking=False):
+            available += 1
+        self.assertEqual(available, manager._slot_semaphore_capacity)
+
+    def test_startup_sweep_leaves_recovery_paths_outside_the_save_root(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            save_root = base / "save"
+            outside = base / "outside"
+            save_root.mkdir()
+            outside.mkdir()
+            inside_temp = save_root / "keep.mp4.downloading"
+            outside_temp = outside / "leave.mp4.downloading"
+            inside_temp.write_bytes(b"inside")
+            outside_temp.write_bytes(b"outside")
+            store = DownloadRecoveryStore(db_path=base / "recovery.sqlite3")
+            store.register_task(video_id="inside", save_directory=save_root)
+            store.handoff_failed_task("inside")
+            store.register_task(video_id="outside", save_directory=outside)
+            store.handoff_failed_task("outside")
+            store.mark_legacy_sweep_complete(save_root)
+            manager = DownloadManagerCore.__new__(DownloadManagerCore)
+            manager._download_recovery_store = store
+            maintenance_root = os.path.normcase(os.path.abspath(save_root))
+            DownloadManagerCore._STARTUP_MAINTENANCE_ROOTS.discard(maintenance_root)
+
+            with patch("app.core.download_manager_core.cfg.get", return_value=str(save_root)):
+                stats = manager._sweep_m3u8_orphan_workspaces_on_startup()
+
+            self.assertFalse(inside_temp.exists())
+            self.assertTrue(outside_temp.exists())
+            self.assertEqual(stats["recovery_records_consumed"], 1)
+            self.assertEqual(store.recovery_counts(), {"active": 0, "pending_cleanup": 1})
+            self.assertEqual(store.directories(), [os.path.normcase(str(outside.resolve()))])
+
+    def test_startup_sweep_does_not_consume_when_enumeration_fails(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            save_root = base / "save"
+            outside = base / "outside"
+            save_root.mkdir()
+            outside.mkdir()
+            outside_temp = outside / "leave.mp4.downloading"
+            outside_temp.write_bytes(b"outside")
+
+            class BrokenStore:
+                def recovery_batch(self):
+                    raise OSError("unreadable ledger")
+
+                def consume_recovery_records(self, *_args, **_kwargs):
+                    raise AssertionError("enumeration failure must not consume")
+
+            manager = DownloadManagerCore.__new__(DownloadManagerCore)
+            manager._download_recovery_store = BrokenStore()
+            maintenance_root = os.path.normcase(os.path.abspath(save_root))
+            DownloadManagerCore._STARTUP_MAINTENANCE_ROOTS.discard(maintenance_root)
+
+            with patch("app.core.download_manager_core.cfg.get", return_value=str(save_root)):
+                stats = manager._sweep_m3u8_orphan_workspaces_on_startup()
+
+            self.assertEqual(stats["recovery_records_consumed"], 0)
+            self.assertTrue(outside_temp.exists())
+
+    def test_startup_sweep_keeps_a_record_when_its_directory_scan_fails(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            save_root = base / "save"
+            good = save_root / "good"
+            bad = save_root / "bad"
+            good.mkdir(parents=True)
+            bad.mkdir()
+            store = DownloadRecoveryStore(db_path=base / "recovery.sqlite3")
+            store.register_task(video_id="good", save_directory=good)
+            store.handoff_failed_task("good")
+            store.register_task(video_id="bad", save_directory=bad)
+            store.handoff_failed_task("bad")
+            store.mark_legacy_sweep_complete(save_root)
+            manager = DownloadManagerCore.__new__(DownloadManagerCore)
+            manager._download_recovery_store = store
+            maintenance_root = os.path.normcase(os.path.abspath(save_root))
+            DownloadManagerCore._STARTUP_MAINTENANCE_ROOTS.discard(maintenance_root)
+
+            def scan(directory, *_args, **_kwargs):
+                if "bad" in str(directory):
+                    return SimpleNamespace(
+                        removed_count=0,
+                        error="denied",
+                        children=[],
+                        truncated=False,
+                        scanned_entries=0,
+                    )
+                return SimpleNamespace(
+                    removed_count=0,
+                    error="",
+                    children=[],
+                    truncated=False,
+                    scanned_entries=1,
+                )
+
+            with patch("app.core.download_manager_core.cfg.get", return_value=str(save_root)), patch(
+                "app.services.file_service.MediaLibraryService.sweep_orphan_download_temp_directory",
+                side_effect=scan,
+            ):
+                stats = manager._sweep_m3u8_orphan_workspaces_on_startup()
+
+            self.assertEqual(stats["recovery_records_consumed"], 1)
+            self.assertEqual(store.recovery_counts(), {"active": 0, "pending_cleanup": 1})
+            self.assertEqual(store.directories(), [os.path.normcase(str(bad.resolve()))])
+
+    def test_startup_sweep_rejects_a_drive_root(self):
+        manager = DownloadManagerCore.__new__(DownloadManagerCore)
+        drive_root = Path(tempfile.gettempdir()).anchor
+
+        with patch("app.core.download_manager_core.cfg.get", return_value=drive_root), patch(
+            "app.core.downloaders.m3u8.N_m3u8DL_RE_Downloader.sweep_orphaned_workspaces"
+        ) as hls_sweep, patch(
+            "app.services.file_service.MediaLibraryService.sweep_orphan_download_temp_directory"
+        ) as directory_sweep, patch(
+            "app.services.file_service.MediaLibraryService.sweep_orphan_download_temp_artifacts"
+        ) as artifact_sweep:
+            stats = manager._sweep_m3u8_orphan_workspaces_on_startup()
+
+        self.assertTrue(stats["rejected_drive_root"])
+        hls_sweep.assert_not_called()
+        directory_sweep.assert_not_called()
+        artifact_sweep.assert_not_called()
+
+    def test_startup_listing_limit_does_not_consume_or_delete(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            save_root = base / "save"
+            save_root.mkdir()
+            leftover = save_root / "clip.mp4.downloading"
+            leftover.write_bytes(b"partial")
+            (save_root / "other.bin").write_bytes(b"x")
+            store = DownloadRecoveryStore(db_path=base / "recovery.sqlite3")
+            store.register_task(video_id="partial", save_directory=save_root)
+            store.handoff_failed_task("partial")
+            store.mark_legacy_sweep_complete(save_root)
+            manager = DownloadManagerCore.__new__(DownloadManagerCore)
+            manager._download_recovery_store = store
+            maintenance_root = os.path.normcase(os.path.abspath(save_root))
+            DownloadManagerCore._STARTUP_MAINTENANCE_ROOTS.discard(maintenance_root)
+
+            with patch("app.core.download_manager_core.cfg.get", return_value=str(save_root)), patch(
+                "app.core.download_path_policy.STARTUP_DIRECTORY_ENTRY_LIMIT",
+                1,
+            ):
+                stats = manager._sweep_m3u8_orphan_workspaces_on_startup()
+
+            self.assertTrue(leftover.exists())
+            self.assertEqual(stats["recovery_records_consumed"], 0)
+            self.assertEqual(store.recovery_counts(), {"active": 0, "pending_cleanup": 1})
+
+    def test_startup_hls_listing_failure_does_not_consume(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            save_root = base / "save"
+            save_root.mkdir()
+            store = DownloadRecoveryStore(db_path=base / "recovery.sqlite3")
+            store.register_task(video_id="partial", save_directory=save_root)
+            store.handoff_failed_task("partial")
+            store.mark_legacy_sweep_complete(save_root)
+            manager = DownloadManagerCore.__new__(DownloadManagerCore)
+            manager._download_recovery_store = store
+            maintenance_root = os.path.normcase(os.path.abspath(save_root))
+            DownloadManagerCore._STARTUP_MAINTENANCE_ROOTS.discard(maintenance_root)
+
+            with patch("app.core.download_manager_core.cfg.get", return_value=str(save_root)), patch(
+                "app.core.downloaders.m3u8.N_m3u8DL_RE_Downloader.sweep_orphaned_workspaces",
+                side_effect=OSError("hls listing failed"),
+            ):
+                stats = manager._sweep_m3u8_orphan_workspaces_on_startup()
+
+            self.assertEqual(stats["recovery_records_consumed"], 0)
+            self.assertEqual(store.recovery_counts(), {"active": 0, "pending_cleanup": 1})
+
 
 if __name__ == "__main__":
     unittest.main()

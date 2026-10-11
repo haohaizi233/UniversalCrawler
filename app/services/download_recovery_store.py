@@ -20,6 +20,8 @@ class _RecoveryBatch:
     directories: tuple[str, ...]
     active_records: tuple[tuple[str, str], ...]
     pending_records: tuple[tuple[str, str], ...]
+    # video_id, save_directory, generation。销账和启动清理都靠它确认“还是这一次任务”。
+    active_directories: tuple[tuple[str, str, str], ...] = ()
 
 
 class DownloadRecoveryStore:
@@ -72,8 +74,12 @@ class DownloadRecoveryStore:
         source_url: str = "",
         trace_id: str = "",
         platform: str = "",
-    ) -> None:
-        """调度 worker 前提交任务归属；返回时 SQLite 已完成持久化提交。"""
+    ) -> str:
+        """调度 worker 前提交任务归属；返回时 SQLite 已完成持久化提交。
+
+        返回值是本次写入的 generation。之后的删账必须带上它，避免先完成的任务
+        删掉后注册的同一 video_id。
+        """
         normalized_video_id = str(video_id or "").strip()
         if not normalized_video_id:
             raise ValueError("video_id is empty")
@@ -107,44 +113,68 @@ class DownloadRecoveryStore:
                     generation,
                 ),
             )
+        return generation
 
-    def handoff_failed_task(self, video_id: str) -> bool:
-        """在同一事务中把活动任务移入去重清理队列，避免目录归属在两步之间丢失。"""
+    def handoff_failed_task(self, video_id: str, generation: str | None = None) -> bool:
+        """在同一事务中把活动任务移入去重清理队列，避免目录归属在两步之间丢失。
+
+        传入 generation 时，只有该行仍是这一次任务才移交；后注册的同 video_id 会留下。
+        """
         normalized_video_id = str(video_id or "").strip()
         if not normalized_video_id:
             return False
-        generation = uuid.uuid4().hex
+        pending_generation = uuid.uuid4().hex
         self._ensure_initialized()
+        if generation is None:
+            predicate = "video_id = ?"
+            select_params: tuple[Any, ...] = (
+                float(self._clock()),
+                pending_generation,
+                normalized_video_id,
+            )
+            delete_params: tuple[Any, ...] = (normalized_video_id,)
+        else:
+            predicate = "video_id = ? AND generation = ?"
+            select_params = (
+                float(self._clock()),
+                pending_generation,
+                normalized_video_id,
+                str(generation),
+            )
+            delete_params = (normalized_video_id, str(generation))
         with closing(self._connect()) as conn, conn:
             cursor = conn.execute(
-                """
+                f"""
                 INSERT INTO pending_cleanup_directories(save_directory, updated_at, generation)
                 SELECT save_directory, ?, ?
                 FROM download_task_paths
-                WHERE video_id = ?
+                WHERE {predicate}
                 ON CONFLICT(save_directory) DO UPDATE SET
                     updated_at = excluded.updated_at,
                     generation = excluded.generation
                 """,
-                (float(self._clock()), generation, normalized_video_id),
+                select_params,
             )
             conn.execute(
-                "DELETE FROM download_task_paths WHERE video_id = ?",
-                (normalized_video_id,),
+                f"DELETE FROM download_task_paths WHERE {predicate}",
+                delete_params,
             )
             return int(cursor.rowcount or 0) > 0
 
-    def delete_task(self, video_id: str) -> bool:
-        """成功任务立即删账，不把已完成目录保留成长期历史索引。"""
+    def delete_task(self, video_id: str, generation: str | None = None) -> bool:
+        """成功或取消的任务删账。带 generation 时，只有该行仍是这一次任务才删除。"""
         normalized_video_id = str(video_id or "").strip()
         if not normalized_video_id:
             return False
         self._ensure_initialized()
+        if generation is None:
+            statement = "DELETE FROM download_task_paths WHERE video_id = ?"
+            params: tuple[Any, ...] = (normalized_video_id,)
+        else:
+            statement = "DELETE FROM download_task_paths WHERE video_id = ? AND generation = ?"
+            params = (normalized_video_id, str(generation))
         with closing(self._connect()) as conn, conn:
-            cursor = conn.execute(
-                "DELETE FROM download_task_paths WHERE video_id = ?",
-                (normalized_video_id,),
-            )
+            cursor = conn.execute(statement, params)
             return int(cursor.rowcount or 0) > 0
 
     def consume_recovery_records(self, batch: _RecoveryBatch | None = None) -> int:
@@ -221,16 +251,97 @@ class DownloadRecoveryStore:
         )
         ordered_entries.sort()
         directories = tuple(dict.fromkeys(entry[1] for entry in ordered_entries))
+        active_directories = tuple(
+            (str(video_id), str(save_directory), str(generation))
+            for video_id, save_directory, generation, _updated_at in active_rows
+        )
         return _RecoveryBatch(
             directories=directories,
             active_records=tuple(
-                (str(video_id), str(generation))
-                for video_id, _save_directory, generation, _updated_at in active_rows
+                (video_id, generation) for video_id, _save_directory, generation in active_directories
             ),
             pending_records=tuple(
                 (str(save_directory), str(generation))
                 for save_directory, generation, _updated_at in pending_rows
             ),
+            active_directories=active_directories,
+        )
+
+    def normalize_directory(self, directory: str | os.PathLike[str]) -> str:
+        return self._normalize_directory(directory)
+
+    def directory_still_in_snapshot(self, directory: str | os.PathLike[str], batch: _RecoveryBatch) -> bool:
+        """删除临时文件前再确认：该目录仍有一条快照里的 generation 没被后来的任务替换。"""
+        try:
+            normalized = self._normalize_directory(directory)
+        except (OSError, RuntimeError, TypeError, ValueError):
+            return False
+        self._ensure_initialized()
+        with closing(self._connect()) as conn:
+            for video_id, save_directory, generation in batch.active_directories:
+                if save_directory != normalized:
+                    continue
+                row = conn.execute(
+                    """
+                    SELECT 1 FROM download_task_paths
+                    WHERE video_id = ? AND generation = ?
+                    """,
+                    (video_id, generation),
+                ).fetchone()
+                if row is not None:
+                    return True
+            for save_directory, generation in batch.pending_records:
+                if save_directory != normalized:
+                    continue
+                row = conn.execute(
+                    """
+                    SELECT 1 FROM pending_cleanup_directories
+                    WHERE save_directory = ? AND generation = ?
+                    """,
+                    (save_directory, generation),
+                ).fetchone()
+                if row is not None:
+                    return True
+        return False
+
+    def filter_recovery_batch(
+        self,
+        batch: _RecoveryBatch,
+        *,
+        allowed_directories: Iterable[str | os.PathLike[str]],
+    ) -> _RecoveryBatch:
+        """只保留目录仍在允许集合内的快照行，供条件确认时跳过截断、失败和根外路径。"""
+        allowed: set[str] = set()
+        for directory in allowed_directories:
+            try:
+                allowed.add(self._normalize_directory(directory))
+            except (OSError, RuntimeError, TypeError, ValueError):
+                continue
+        active_directories = tuple(
+            (video_id, save_directory, generation)
+            for video_id, save_directory, generation in batch.active_directories
+            if save_directory in allowed
+        )
+        pending_records = tuple(
+            (save_directory, generation)
+            for save_directory, generation in batch.pending_records
+            if save_directory in allowed
+        )
+        directories = tuple(
+            dict.fromkeys(
+                [
+                    *(save_directory for _video_id, save_directory, _generation in active_directories),
+                    *(save_directory for save_directory, _generation in pending_records),
+                ]
+            )
+        )
+        return _RecoveryBatch(
+            directories=directories,
+            active_records=tuple(
+                (video_id, generation) for video_id, _save_directory, generation in active_directories
+            ),
+            pending_records=pending_records,
+            active_directories=active_directories,
         )
 
     def directories(self) -> list[str]:

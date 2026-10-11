@@ -229,3 +229,23 @@ def test_preparing_a_new_legacy_root_discards_unused_old_frontier() -> None:
             os.path.normcase(str(new_root.resolve())),
             0,
         )
+
+
+def test_delete_and_handoff_keep_a_later_registration_for_the_same_video() -> None:
+    with tempfile.TemporaryDirectory() as temp_dir:
+        root = Path(temp_dir)
+        save_dir = root / "downloads"
+        save_dir.mkdir()
+        store = DownloadRecoveryStore(db_path=root / "recovery.sqlite3")
+
+        first = store.register_task(video_id="video-1", save_directory=save_dir)
+        second = store.register_task(video_id="video-1", save_directory=save_dir)
+
+        assert first != second
+        assert store.delete_task("video-1", first) is False
+        assert store.task_path("video-1") is not None
+        assert store.handoff_failed_task("video-1", first) is False
+        assert store.recovery_counts() == {"active": 1, "pending_cleanup": 0}
+        assert store.handoff_failed_task("video-1", second) is True
+        assert store.task_path("video-1") is None
+        assert store.recovery_counts() == {"active": 0, "pending_cleanup": 1}

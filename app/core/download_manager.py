@@ -11,11 +11,20 @@ from app.core.download_manager_core import DownloadManagerCore
 from app.core.download_path_policy import resolve_task_save_directory
 from app.core.downloaders import BaseDownloader
 from app.core.downloaders.registry import downloader_registry
-from app.exceptions import DownloaderStoppedError
+from app.exceptions import DownloaderStoppedError, StreamDownloadError
 from app.models import VideoItem
 from app.utils import sanitize_filename
 from app.utils.callback_signal import CallbackSignal
 from app.debug_logger import debug_logger
+
+def _header_is_rejected_payload(header: bytes) -> bool:
+    """可执行文件和网页正文不能借媒体后缀发布。"""
+
+    stripped = header.lstrip().lower()
+    if header.startswith(b"MZ"):
+        return True
+    return stripped.startswith((b"<!doctype", b"<html", b"<?xml", b"<script"))
+
 
 class DownloadWorker(threading.Thread):
     """执行单个下载任务，并把进度、完成、失败事件回传给管理器。"""
@@ -100,6 +109,8 @@ class DownloadWorker(threading.Thread):
         completion_reason = "thread_finished"
         try:
             if not self.is_running:
+                # 还没开始传输就被停止。不发失败信号，完成回调按取消销账。
+                completion_reason = "task_cancelled"
                 return
 
             # 先把保存目录和目标文件名计算清楚，下载器只负责真正的传输逻辑。
@@ -134,20 +145,29 @@ class DownloadWorker(threading.Thread):
                 progress_callback=self._emit_progress_if_changed(),
                 check_stop_func=lambda: not self.is_running
             )
-            if not self.is_running:
-                return
+            # download() 已经正常返回。即使用户刚清掉 is_running，产物在就仍算完成，
+            # 不能直接 return，否则活动账本会留在库里。
 
             # 兼容仍通过 VideoItem 回报产物的自定义下载器；内置下载器优先使用返回值，
             # 从而让 local_path 只在整个下载成功后对 GUI/Web 可见。
             legacy_reported_output = self.video.local_path
             self.video.local_path = ""
-            output_path = self._resolve_completed_output_path(
-                filepath,
-                reported_output or legacy_reported_output,
-            )
+            try:
+                output_path = self._resolve_completed_output_path(
+                    filepath,
+                    reported_output or legacy_reported_output,
+                )
+            except FileNotFoundError:
+                if not self.is_running:
+                    completion_reason = "task_cancelled"
+                    self._log_download_stopped()
+                    return
+                raise
             if output_path == filepath:
                 # 某些站点返回的资源扩展名并不可信，下载完成后再按文件签名二次校正。
                 actual_ext = self._detect_actual_file_type(filepath)
+                if actual_ext is None:
+                    raise StreamDownloadError("下载文件不存在或无法读取，不能按当前扩展名完成任务")
                 if actual_ext and actual_ext != self._final_ext:
                     new_filepath = self._ensure_unique_path(filepath.rsplit('.', 1)[0] + actual_ext)
                     try:
@@ -176,37 +196,27 @@ class DownloadWorker(threading.Thread):
                             trace_id=self._trace_id(),
                         )
 
-            if self.is_running:
-                self.video.local_path = output_path
-                debug_logger.log(
-                    component="DownloadWorker",
-                    action="download_finished",
-                    message="下载任务完成",
-                    status_code="DL_FINISH",
-                    context=self._log_context(),
-                    details=debug_logger.pick_used(
-                        {"title": self.video.title, "local_path": self.video.local_path},
-                        "title", "local_path",
-                    ),
-                    trace_id=self._trace_id(),
-                )
-                completion_reason = "task_finished"
-                self.is_running = False
-                self.sig_finished.emit(self.video.id)
-        except DownloaderStoppedError:
-            completion_reason = "task_error"
+            self.video.local_path = output_path
             debug_logger.log(
                 component="DownloadWorker",
-                action="download_stopped",
-                level="WARN",
-                message="下载任务被用户停止",
-                status_code="DL_STOPPED",
+                action="download_finished",
+                message="下载任务完成",
+                status_code="DL_FINISH",
                 context=self._log_context(),
-                details=debug_logger.pick_used({"title": self.video.title}, "title"),
+                details=debug_logger.pick_used(
+                    {"title": self.video.title, "local_path": self.video.local_path},
+                    "title", "local_path",
+                ),
                 trace_id=self._trace_id(),
             )
+            completion_reason = "task_finished"
             self.is_running = False
-            self.sig_error.emit(self.video.id, "用户已停止")
+            self.sig_finished.emit(self.video.id)
+        except DownloaderStoppedError:
+            # 用户停止且文件未完成：取消，不写失败终态，也不发 sig_error。
+            completion_reason = "task_cancelled"
+            self._log_download_stopped()
+            self.is_running = False
         except Exception as e:
             completion_reason = "task_error"
             debug_logger.log_exception(
@@ -230,6 +240,18 @@ class DownloadWorker(threading.Thread):
                     self._completion_callback(self, completion_reason)
             finally:
                 self.finished.emit()
+
+    def _log_download_stopped(self) -> None:
+        debug_logger.log(
+            component="DownloadWorker",
+            action="download_stopped",
+            level="WARN",
+            message="下载任务被用户停止",
+            status_code="DL_STOPPED",
+            context=self._log_context(),
+            details=debug_logger.pick_used({"title": self.video.title}, "title"),
+            trace_id=self._trace_id(),
+        )
 
     @staticmethod
     def _resolve_completed_output_path(planned_path: str, reported_path: object = None) -> str:
@@ -497,20 +519,20 @@ class DownloadWorker(threading.Thread):
                     if header.startswith(b"RIFF") and b"AVI " in header[:12]:
                         return ext
                     continue
-                if signature in (b"\x00\x00\x00 ftyp", b"\x00\x00\x00\x1cftyp", b"\x00\x00\x00\x20ftyp"):
-                    if b"ftyp" in header[:12]:
-                        return ext
-                    continue
                 if header.startswith(signature):
                     if signature == b"RIFF" and b"WEBP" not in header[:12]:
                         continue
                     return ext
 
+            if len(header) >= 8 and header[4:8] == b"ftyp":
+                return ".mp4"
             if header.startswith(b"\x1aE\xdf\xa3"):
                 return ".mkv"
-            if b"FLV" in header[:5]:
+            if header.startswith(b"FLV\x01"):
                 return ".flv"
-            return None
+            if _header_is_rejected_payload(header):
+                raise ValueError("下载内容不是受支持的媒体文件")
+            raise ValueError("无法识别媒体文件签名")
         except OSError as e:
             debug_logger.log_exception(
                 "DownloadWorker",

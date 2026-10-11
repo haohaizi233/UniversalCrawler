@@ -3,10 +3,11 @@
 import threading
 import time
 import unittest
+from types import SimpleNamespace
 from unittest.mock import Mock, call
 
 from app.controllers.application_controller import ApplicationController
-from app.controllers.desktop_host import DesktopHostAdapter
+from app.controllers.desktop_host import DesktopHostAdapter, SelectionDialogOpenError
 from app.models import VideoItem
 
 class DesktopHostAdapterTests(unittest.TestCase):
@@ -144,6 +145,27 @@ class DesktopHostAdapterTests(unittest.TestCase):
         self.assertIs(host1, host2)
         self.assertIsInstance(host1, DesktopHostAdapter)
         self.assertIs(host1.window, controller.window)
+
+    def test_dismiss_selection_dialog_forwards_when_window_implements_it(self):
+        window = Mock()
+        adapter = DesktopHostAdapter(window)
+
+        adapter.dismiss_selection_dialog()
+
+        window.dismiss_selection_dialog.assert_called_once_with()
+
+    def test_dismiss_selection_dialog_ignores_window_without_method(self):
+        adapter = DesktopHostAdapter(SimpleNamespace())
+
+        adapter.dismiss_selection_dialog()
+
+    def test_show_selection_dialog_open_failure_is_not_a_cancel_value(self):
+        window = Mock()
+        window.show_selection_dialog.side_effect = RuntimeError("dialog failed")
+        adapter = DesktopHostAdapter(window)
+
+        with self.assertRaises(SelectionDialogOpenError):
+            adapter.show_selection_dialog([object()])
 
 if __name__ == "__main__":
     unittest.main()

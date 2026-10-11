@@ -8,7 +8,14 @@ import unittest
 
 from PyQt6.QtWidgets import QApplication
 
-from app.ui.task_runtime import LongTaskHandle, LongTaskRunner, ShortTaskRunner, TaskCancelToken
+from app.ui.task_runtime import (
+    LongTaskHandle,
+    LongTaskRunner,
+    ShortTaskRunner,
+    TaskCancelToken,
+    _ShortTaskRunnable,
+    _WorkerQObject,
+)
 
 class TaskRuntimeCancelTests(unittest.TestCase):
     @classmethod
@@ -126,11 +133,59 @@ class TaskRuntimeCancelTests(unittest.TestCase):
         self.assertTrue(token.is_done())
 
         second = runner.submit(name="second", fn=lambda _token: None)
+        deadline = time.time() + 2
+        while not second.is_done() and time.time() < deadline:
+            time.sleep(0.01)
         runner.cancel_all(timeout_ms=1000)
 
         with runner._tokens_lock:
             self.assertNotIn(token, runner._tokens)
             self.assertNotIn(second, runner._tokens)
+
+    def test_short_task_cancel_all_does_not_wait_for_done(self):
+        runner = ShortTaskRunner(max_thread_count=1)
+        calls: list[int] = []
+        runner._pool.waitForDone = lambda *_args, **_kwargs: calls.append(1) or True
+        runner.submit(name="short", fn=lambda _token: None)
+        runner.cancel_all(timeout_ms=60000)
+        self.assertEqual(calls, [])
+
+    def test_cancelled_short_task_restores_without_calling_body(self):
+        token = TaskCancelToken()
+        token.cancel()
+        ran: list[int] = []
+        skipped: list[int] = []
+        runnable = _ShortTaskRunnable(
+            fn=lambda _token: ran.append(1),
+            token=token,
+            name="delete-video",
+            on_not_started=lambda: skipped.append(1),
+        )
+
+        runnable.run()
+
+        self.assertEqual(ran, [])
+        self.assertEqual(skipped, [1])
+        self.assertTrue(token.is_done())
+
+    def test_cancelled_long_task_restores_without_calling_body(self):
+        token = TaskCancelToken()
+        token.cancel()
+        ran: list[int] = []
+        skipped: list[int] = []
+        worker = _WorkerQObject(
+            lambda **_kwargs: ran.append(1),
+            (),
+            {},
+            token,
+            on_not_started=lambda: skipped.append(1),
+        )
+
+        worker.run()
+
+        self.assertEqual(ran, [])
+        self.assertEqual(skipped, [1])
+        self.assertFalse(token.is_done())
 
 if __name__ == "__main__":
     unittest.main()

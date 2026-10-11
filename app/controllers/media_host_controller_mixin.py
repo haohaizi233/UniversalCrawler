@@ -125,6 +125,9 @@ class MediaHostControllerMixin:
 
     def scan_local_dir(self, *, announce: bool = True):
         """扫描当前保存目录，并把本地媒体恢复到宿主。"""
+        if getattr(self, "_shutdown_rejects_new_work", False):
+            self._host().append_log("应用正在关闭，已拒绝扫描目录")
+            return
         host = self._host()
         directory = host.current_save_dir
         if announce:
@@ -540,12 +543,53 @@ class MediaHostControllerMixin:
         runner = self._ensure_short_task_runner()
 
         def delete_in_background(cancel_token) -> None:
-            if not self._sleep_before_delete(delay_sec, cancel_token):
+            try:
+                if not self._sleep_before_delete(delay_sec, cancel_token) or cancel_token.is_cancelled():
+                    if ui_removed:
+                        invoker.invoke(lambda: self._rollback_optimistic_delete(context, error=None))
+                    return
+                outcome = self._delete_video_context_sync(context)
+            except Exception as exc:
+                debug_logger.log_exception(
+                    "MediaHostControllerMixin",
+                    "delete_video_background",
+                    exc,
+                    details={"video_id": getattr(context, "video_id", None)},
+                )
+                message = str(exc)
+                if ui_removed:
+                    invoker.invoke(lambda message=message: self._rollback_optimistic_delete(context, error=message))
+                else:
+                    invoker.invoke(lambda message=message: self._host().report_delete_error(message))
                 return
-            outcome = self._delete_video_context_sync(context)
+            except BaseException:
+                if ui_removed:
+                    invoker.invoke(lambda: self._rollback_optimistic_delete(context, error=None))
+                raise
             invoker.invoke(lambda outcome=outcome: self._finalize_delete_video(row_idx, outcome, ui_removed=ui_removed))
 
-        runner.submit(name=f"delete-video-{context.video_id}", fn=delete_in_background)
+        def restore_removed_row() -> None:
+            if ui_removed:
+                invoker.invoke(lambda: self._rollback_optimistic_delete(context, error=None))
+
+        runner.submit(
+            name=f"delete-video-{context.video_id}",
+            fn=delete_in_background,
+            on_not_started=restore_removed_row,
+        )
+
+    def _rollback_optimistic_delete(self, context, *, error: str | None) -> None:
+        """取消或后台异常时把乐观删除的行和状态加回来。"""
+        video = getattr(context, "video", None)
+        if video is not None and self._restore_video_item_after_delete_error(video):
+            adder = getattr(self._host(), "add_video_row", None)
+            if callable(adder):
+                adder(video)
+            refresh = getattr(self._host(), "refresh_table_bindings", None)
+            if callable(refresh):
+                refresh()
+        if error:
+            self._host().report_delete_error(error)
 
     def _delete_coordination_delay(self, release_before_delete: bool) -> float:
         if not release_before_delete:
@@ -722,32 +766,63 @@ class MediaHostControllerMixin:
             return False
         return QThread.currentThread() == app.thread()
 
+    def clear_queue_blocking(self, cancel_token=None) -> dict:
+        """同步清空下载队列。取消不改状态、不发成功；同一时刻只允许一次。"""
+        if getattr(self, "_shutdown_rejects_new_work", False):
+            return {"status": "error", "removed_ids": [], "message": "shutting down"}
+        if self._clear_queue_cancel_requested(cancel_token):
+            return {"status": "cancelled", "removed_ids": []}
+        if not self._acquire_clear_queue_turn():
+            return {"status": "error", "removed_ids": [], "message": "clear already in progress"}
+        try:
+            if self._clear_queue_cancel_requested(cancel_token):
+                return {"status": "cancelled", "removed_ids": []}
+            try:
+                ids = self._queue_item_ids_for_clear()
+                expected_items = self._queue_items_for_clear(ids)
+                labels = self._queue_delete_log_labels(expected_items)
+                if self._clear_queue_cancel_requested(cancel_token):
+                    return {"status": "cancelled", "removed_ids": []}
+                if not ids:
+                    return {"status": "ok", "removed_ids": [], "labels": labels}
+                cancel_results = self._cancel_queue_items(ids, cancel_token)
+                if self._clear_queue_cancel_requested(cancel_token):
+                    self._rollback_queued_clear_cancellations(expected_items, cancel_results)
+                    return {"status": "cancelled", "removed_ids": []}
+                self._clear_queue_download_telemetry(ids)
+                if self._clear_queue_cancel_requested(cancel_token):
+                    self._restore_queue_download_telemetry(ids)
+                    self._rollback_queued_clear_cancellations(expected_items, cancel_results)
+                    return {"status": "cancelled", "removed_ids": []}
+                removed_ids = self._remove_queue_items_from_state(expected_items)
+                self._clear_queue_telemetry_snapshot = {}
+            except Exception as exc:
+                debug_logger.log_exception(
+                    "MediaHostControllerMixin",
+                    "clear_queue_blocking",
+                    exc,
+                    details={"item_count": len(locals().get("ids", set()))},
+                )
+                return {"status": "error", "removed_ids": [], "message": str(exc)}
+            return {
+                "status": "ok",
+                "removed_ids": sorted(str(video_id) for video_id in removed_ids),
+                "labels": labels,
+            }
+        finally:
+            self._release_clear_queue_turn()
+
     def on_clear_queue(self) -> None:
-        """在不阻塞 Qt 主线程的前提下移除队列项。"""
+        """在不阻塞 Qt 主线程的前提下移除队列项。提交后台任务本身不是成功。"""
+        if getattr(self, "_shutdown_rejects_new_work", False):
+            self._host().append_log("应用正在关闭，已拒绝清空下载队列")
+            return
         if self._should_clear_queue_in_background():
             invoker = self._ensure_ui_callback_invoker()
 
-            def clear_in_background(_cancel_token) -> None:
-                try:
-                    ids = self._queue_item_ids_for_clear()
-                    expected_items = self._queue_items_for_clear(ids)
-                    labels = self._queue_delete_log_labels(expected_items)
-                    if not ids:
-                        invoker.invoke(lambda: self._finalize_clear_queue_removal(set(), labels))
-                        return
-                    self._cancel_queue_items(ids)
-                    removed_ids = self._remove_queue_items_from_state(expected_items)
-                except Exception as exc:  # pragma: no cover - UI 防御性恢复路径
-                    message = str(exc)
-                    debug_logger.log_exception(
-                        "MediaHostControllerMixin",
-                        "clear_queue_background",
-                        exc,
-                        details={"item_count": len(locals().get("ids", set()))},
-                    )
-                    invoker.invoke(lambda: self._host().append_log(f"Clear queue failed: {message}"))
-                    return
-                invoker.invoke(lambda: self._finalize_clear_queue_removal(removed_ids, labels))
+            def clear_in_background(cancel_token) -> None:
+                result = self.clear_queue_blocking(cancel_token)
+                invoker.invoke(lambda result=result: self._apply_clear_queue_result(result))
 
             self._ensure_short_task_runner().submit(
                 name="clear-download-queue",
@@ -755,14 +830,38 @@ class MediaHostControllerMixin:
             )
             return
 
-        ids = self._queue_item_ids_for_clear()
-        if not ids:
+        self._apply_clear_queue_result(self.clear_queue_blocking())
+
+    def _apply_clear_queue_result(self, result: dict) -> None:
+        status = str(result.get("status") or "")
+        if status == "cancelled":
             return
-        expected_items = self._queue_items_for_clear(ids)
-        labels = self._queue_delete_log_labels(expected_items)
-        self._cancel_queue_items(ids)
-        removed_ids = self._remove_queue_items_from_state(expected_items)
+        if status != "ok":
+            message = result.get("message") or "未知错误"
+            self._host().append_log(f"Clear queue failed: {message}")
+            return
+        removed_ids = set(result.get("removed_ids") or [])
+        labels = result.get("labels") or {}
         self._finalize_clear_queue_removal(removed_ids, labels)
+
+    def _acquire_clear_queue_turn(self) -> bool:
+        lock = getattr(self, "_clear_queue_gate", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._clear_queue_gate = lock
+        return lock.acquire(blocking=False)
+
+    def _release_clear_queue_turn(self) -> None:
+        lock = getattr(self, "_clear_queue_gate", None)
+        if lock is not None:
+            lock.release()
+
+    @staticmethod
+    def _clear_queue_cancel_requested(cancel_token) -> bool:
+        if cancel_token is None:
+            return False
+        checker = getattr(cancel_token, "is_cancelled", None)
+        return bool(callable(checker) and checker())
 
     def _should_clear_queue_in_background(self) -> bool:
         app = self._qt_app_for_background_work()
@@ -861,26 +960,107 @@ class MediaHostControllerMixin:
                 ids.add(str(video_id))
         return ids
 
-    def _cancel_queue_items(self, video_ids: set[str]) -> None:
+    def _cancel_queue_items(self, video_ids: set[str], cancel_token=None) -> dict[str, str | None]:
+        if self._clear_queue_cancel_requested(cancel_token):
+            return {}
         manager_dict = getattr(self.dl_manager, "__dict__", {}) if self.dl_manager is not None else {}
         cancel_tasks = manager_dict.get("cancel_tasks") if isinstance(manager_dict, dict) else None
         if not callable(cancel_tasks):
             cancel_tasks = getattr(type(self.dl_manager), "cancel_tasks", None)
         if callable(cancel_tasks):
-            self.dl_manager.cancel_tasks(video_ids)
-        else:
-            for video_id in video_ids:
-                self.dl_manager.cancel_task(video_id)
+            result = self.dl_manager.cancel_tasks(video_ids)
+            if isinstance(result, dict):
+                return {str(video_id): status for video_id, status in result.items()}
+            return {}
+        results: dict[str, str | None] = {}
+        for video_id in video_ids:
+            if self._clear_queue_cancel_requested(cancel_token):
+                break
+            status = self.dl_manager.cancel_task(video_id)
+            results[str(video_id)] = status if isinstance(status, str) or status is None else None
+        return results
+
+    def _rollback_queued_clear_cancellations(
+        self,
+        expected_items: dict[str, VideoItem],
+        cancel_results: dict[str, str | None],
+    ) -> None:
+        """清空被取消时，把尚未真正删除的排队任务放回队列。"""
+        if getattr(self, "_shutdown_rejects_new_work", False) or not cancel_results:
+            return
+        manager = getattr(self, "dl_manager", None)
+        add_task = getattr(manager, "add_task", None)
+        if not callable(add_task):
+            return
+        for video_id, item in expected_items.items():
+            if cancel_results.get(str(video_id)) != "queued":
+                continue
+            current = self._video_lookup(video_id)
+            if current is not None and current is not item:
+                continue
+            meta = getattr(item, "meta", None)
+            save_dir = ""
+            if isinstance(meta, dict):
+                meta.pop("user_cancel_requested", None)
+                save_dir = str(meta.get("save_directory") or "")
+            if not save_dir:
+                save_dir = str(getattr(self._host(), "current_save_dir", "") or "")
+            if not save_dir:
+                continue
+            try:
+                add_task(item, save_dir)
+            except Exception as exc:
+                debug_logger.log_exception(
+                    "MediaHostControllerMixin",
+                    "rollback_queued_clear",
+                    exc,
+                    details={"video_id": video_id},
+                )
+
+    def _clear_queue_download_telemetry(self, video_ids: set[str]) -> None:
         try:
             from app.services.download_telemetry import get_download_telemetry_service
 
             telemetry = get_download_telemetry_service()
+            samples = getattr(telemetry, "_last_sample", None)
+            saved = getattr(self, "_clear_queue_telemetry_snapshot", None)
+            if not isinstance(saved, dict):
+                saved = {}
+                self._clear_queue_telemetry_snapshot = saved
+            if isinstance(samples, dict):
+                for video_id in video_ids:
+                    if video_id in samples:
+                        saved[str(video_id)] = samples[video_id]
             for video_id in video_ids:
                 telemetry.clear(video_id)
         except (RuntimeError, AttributeError) as exc:
             debug_logger.log_exception(
                 "MediaHostControllerMixin",
                 "clear_download_telemetry",
+                exc,
+                details={"video_ids": list(video_ids)},
+            )
+
+    def _restore_queue_download_telemetry(self, video_ids: set[str]) -> None:
+        saved = getattr(self, "_clear_queue_telemetry_snapshot", None)
+        self._clear_queue_telemetry_snapshot = {}
+        if not isinstance(saved, dict) or not saved:
+            return
+        try:
+            from app.services.download_telemetry import get_download_telemetry_service
+
+            telemetry = get_download_telemetry_service()
+            samples = getattr(telemetry, "_last_sample", None)
+            if not isinstance(samples, dict):
+                return
+            for video_id in video_ids:
+                sample = saved.get(str(video_id))
+                if sample is not None:
+                    samples[str(video_id)] = sample
+        except (RuntimeError, AttributeError) as exc:
+            debug_logger.log_exception(
+                "MediaHostControllerMixin",
+                "restore_download_telemetry",
                 exc,
                 details={"video_ids": list(video_ids)},
             )

@@ -3,6 +3,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from app.controllers.crawl_controller_mixin import CrawlControllerMixin
+from app.controllers.desktop_host import SelectionDialogOpenError
 from app.core.events import (
     build_crawl_state_event,
     build_item_found_event,
@@ -45,7 +46,8 @@ class _DummyCrawlController(CrawlControllerMixin, ControllerSessionMixin):
         item.progress = 0
         return item
 
-    def _store_video_item(self, item: VideoItem) -> None:
+    def _store_video_item(self, item: VideoItem, *, publish: bool = True) -> None:
+        del publish
         self.videos[item.id] = item
 
 class CrawlControllerMixinTests(unittest.TestCase):
@@ -262,6 +264,211 @@ class CrawlControllerMixinTests(unittest.TestCase):
 
         controller.host.show_selection_dialog.assert_not_called()
         controller.current_spider.resume_from_ui.assert_not_called()
+
+    def test_stop_invalidates_session_and_drops_later_items(self):
+        controller = _DummyCrawlController()
+        spider = Mock()
+        spider.interrupt_requested = False
+        controller.current_spider = spider
+        controller._active_spider_session_id = "session-a"
+        controller._active_spider_bindings = Mock()
+        item = VideoItem(url="https://example.com/video.mp4", title="demo", source="douyin")
+
+        with patch("app.controllers.crawl_controller_mixin.debug_logger", Mock()):
+            controller.on_stop_crawl()
+            event = build_items_found_event([item])
+            event.payload["session_id"] = "session-a"
+            controller._dispatch_spider_event(event)
+            controller._on_spider_items_found([item])
+
+        self.assertNotEqual(controller._active_spider_session_id, "session-a")
+        self.assertIs(controller._stopped_spider, spider)
+        controller.dl_manager.add_task.assert_not_called()
+        controller.host.add_video_row.assert_not_called()
+        self.assertNotIn(item.id, controller.videos)
+
+    def test_stopped_session_finish_still_resets_host(self):
+        controller = _DummyCrawlController()
+        spider = Mock()
+        spider.interrupt_requested = False
+        controller.current_spider = spider
+        controller._active_spider_session_id = "session-a"
+        controller._active_spider_bindings = Mock()
+
+        with patch("app.controllers.crawl_controller_mixin.debug_logger", Mock()):
+            controller.on_stop_crawl()
+            event = build_crawl_state_event(CrawlStatus.FINISHED)
+            event.payload["session_id"] = "session-a"
+            controller._dispatch_spider_event(event)
+
+        controller.host.finish_crawl.assert_called_once()
+        self.assertIsNone(controller.current_spider)
+
+    def test_selection_before_show_is_closed_when_already_stopped(self):
+        controller = _DummyCrawlController()
+        spider = Mock()
+        spider.interrupt_requested = True
+        controller.current_spider = spider
+        controller.host.show_selection_dialog.return_value = [0, 1]
+
+        with patch("app.controllers.crawl_controller_mixin.debug_logger", Mock()):
+            controller._on_spider_select_tasks([{"title": "A"}])
+
+        controller.host.show_selection_dialog.assert_not_called()
+        controller.host.dismiss_selection_dialog.assert_called_once()
+        spider.resume_from_ui.assert_called_once_with(None)
+        controller.spider_session.stop_session.assert_not_called()
+
+    def test_confirmation_after_stop_is_not_recorded(self):
+        controller = _DummyCrawlController()
+        spider = Mock()
+        spider.interrupt_requested = False
+        controller.current_spider = spider
+
+        def show_dialog(_items):
+            spider.interrupt_requested = True
+            return [1, 2]
+
+        controller.host.show_selection_dialog.side_effect = show_dialog
+
+        with patch("app.controllers.crawl_controller_mixin.debug_logger", Mock()):
+            controller._on_spider_select_tasks([{"title": "A"}])
+
+        spider.resume_from_ui.assert_called_once_with(None)
+
+    def test_selection_dialog_open_failure_is_not_user_cancel(self):
+        controller = _DummyCrawlController()
+        spider = Mock()
+        spider.interrupt_requested = False
+        controller.current_spider = spider
+        controller.host.show_selection_dialog.side_effect = SelectionDialogOpenError("dialog unavailable")
+        logger = Mock()
+
+        with patch("app.controllers.crawl_controller_mixin.debug_logger", logger):
+            controller._on_spider_select_tasks([{"title": "A"}])
+
+        spider.resume_from_ui.assert_called_once_with(None)
+        controller.spider_session.stop_session.assert_called_once()
+        actions = [call.kwargs.get("action") for call in logger.log.call_args_list]
+        self.assertIn("selection_dialog_open_failed", actions)
+        self.assertNotIn("selection_cancel_stop_crawl", actions)
+
+    def test_selection_dialog_open_failure_reason_is_not_user_cancel(self):
+        controller = _DummyCrawlController()
+        spider = Mock()
+        spider.interrupt_requested = False
+        controller.current_spider = spider
+        controller.host.show_selection_dialog.return_value = SimpleNamespace(
+            reason="open_failed",
+            error="cannot create dialog",
+            selected=None,
+        )
+        logger = Mock()
+
+        with patch("app.controllers.crawl_controller_mixin.debug_logger", logger):
+            controller._on_spider_select_tasks([{"title": "A"}])
+
+        spider.resume_from_ui.assert_called_once_with(None)
+        actions = [call.kwargs.get("action") for call in logger.log.call_args_list]
+        self.assertIn("selection_dialog_open_failed", actions)
+        self.assertNotIn("selection_cancel_stop_crawl", actions)
+
+    def test_enqueue_happens_before_ui_and_failure_retracts_row(self):
+        controller = _DummyCrawlController()
+        controller.host.current_save_dir = "downloads"
+        item = VideoItem(url="https://example.com/video.mp4", title="demo", source="douyin")
+        order = []
+        controller.dl_manager.add_task.side_effect = lambda *_args, **_kwargs: order.append("enqueue") or True
+        controller.host.add_video_row.side_effect = lambda *_args, **_kwargs: order.append("ui")
+
+        with patch("app.controllers.crawl_controller_mixin.debug_logger", Mock()):
+            controller._on_spider_item_found(item)
+
+        self.assertEqual(order, ["enqueue", "ui"])
+        self.assertIn(item.id, controller.videos)
+
+        failed = VideoItem(url="https://example.com/fail.mp4", title="fail", source="douyin")
+        controller.dl_manager.add_task.side_effect = RuntimeError("queue closed")
+
+        with patch("app.controllers.crawl_controller_mixin.debug_logger", Mock()):
+            controller._on_spider_item_found(failed)
+
+        self.assertNotIn(failed.id, controller.videos)
+        controller.host.remove_video_row.assert_called_with(-1, failed.id)
+        controller.host.append_log.assert_any_call("❌ 加入下载队列失败: queue closed", level="ERROR")
+
+    def test_enqueue_success_publishes_upsert_only_after_add_task(self):
+        controller = _DummyCrawlController()
+        timeline: list[str] = []
+        controller.app_state = SimpleNamespace(
+            _publish_change=lambda topic, _payload: timeline.append(topic),
+        )
+        controller.host.current_save_dir = "downloads"
+        item = VideoItem(url="https://example.com/video.mp4", title="demo", source="douyin")
+        controller.dl_manager.add_task.side_effect = lambda *_args, **_kwargs: timeline.append("enqueue") or True
+        controller.host.add_video_row.side_effect = lambda *_args, **_kwargs: timeline.append("ui")
+
+        with patch("app.controllers.crawl_controller_mixin.debug_logger", Mock()):
+            controller._on_spider_item_found(item)
+
+        self.assertEqual(timeline, ["enqueue", "videos.upsert", "ui"])
+        self.assertIn(item.id, controller.videos)
+
+    def test_enqueue_failure_does_not_publish_upsert(self):
+        controller = _DummyCrawlController()
+        timeline: list[str] = []
+        controller.app_state = SimpleNamespace(
+            _publish_change=lambda topic, _payload: timeline.append(topic),
+        )
+        controller.host.current_save_dir = "downloads"
+        item = VideoItem(url="https://example.com/fail.mp4", title="fail", source="douyin")
+        controller.dl_manager.add_task.side_effect = RuntimeError("queue closed")
+
+        with patch("app.controllers.crawl_controller_mixin.debug_logger", Mock()):
+            controller._on_spider_item_found(item)
+
+        self.assertNotIn("videos.upsert", timeline)
+        self.assertNotIn(item.id, controller.videos)
+
+    def test_shutdown_rejects_new_crawl_and_enqueue(self):
+        controller = _DummyCrawlController()
+        controller._shutdown_rejects_new_work = True
+        controller._create_spider = Mock()
+        item = VideoItem(url="https://example.com/video.mp4", title="demo", source="douyin")
+
+        controller.on_start_crawl("关键词", "douyin", {})
+        controller._on_spider_items_found([item])
+
+        controller._create_spider.assert_not_called()
+        controller.dl_manager.add_task.assert_not_called()
+        controller.host.append_log.assert_any_call("应用正在关闭，已拒绝开始爬取")
+
+    def test_spider_finish_is_not_success_when_run_succeeded_is_false(self):
+        controller = _DummyCrawlController()
+        spider = Mock()
+        spider.run_succeeded = False
+        controller.current_spider = spider
+        controller._active_spider_bindings = Mock()
+        logger = Mock()
+
+        with patch("app.controllers.crawl_controller_mixin.debug_logger", logger):
+            controller._on_spider_finished()
+
+        controller.host.finish_crawl.assert_not_called()
+        controller.host.report_crawl_finished_unsuccessful.assert_called_once()
+        self.assertEqual(logger.log.call_args.kwargs["status_code"], "APP_CRAWL_FINISH_FAILED")
+        self.assertIsNone(controller.current_spider)
+
+    def test_spider_finish_stays_successful_without_run_succeeded(self):
+        controller = _DummyCrawlController()
+        controller.current_spider = SimpleNamespace()
+        controller._active_spider_bindings = None
+
+        with patch("app.controllers.crawl_controller_mixin.debug_logger", Mock()):
+            controller._on_spider_finished()
+
+        controller.host.finish_crawl.assert_called_once()
+        controller.host.report_crawl_finished_unsuccessful.assert_not_called()
 
 if __name__ == "__main__":
     unittest.main()

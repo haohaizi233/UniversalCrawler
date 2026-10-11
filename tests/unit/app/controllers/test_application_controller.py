@@ -381,7 +381,7 @@ class ApplicationControllerTests(unittest.TestCase):
 
             runtime = self._start_controller_with_doubles([str(media_path)])
 
-        self.assertEqual(runtime.controller.launch_media_paths, [str(media_path.resolve())])
+        self.assertEqual(runtime.controller.launch_media_paths, [os.path.normpath(os.path.abspath(media_path))])
         self.assertIsNone(runtime.controller._pending_launch_media_path)
         runtime.timer_factory.singleShot.assert_called_once_with(
             800,
@@ -401,7 +401,48 @@ class ApplicationControllerTests(unittest.TestCase):
                 ["--mode", "gui", media_path, text_path, media_path]
             )
 
-        self.assertEqual(paths, [str(Path(media_path).resolve())])
+        self.assertEqual(paths, [os.path.normpath(os.path.abspath(media_path))])
+
+    def test_collect_launch_media_paths_keeps_symlink_and_rejects_dangling_link(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            target_dir = root / "target-dir"
+            link_dir = root / "link-dir"
+            target_dir.mkdir()
+            link_dir.mkdir()
+            target = target_dir / "real.mp4"
+            target.write_bytes(b"video")
+            link = link_dir / "alias.mp4"
+            dangling = link_dir / "missing.mp4"
+            try:
+                link.symlink_to(target)
+                dangling.symlink_to(target_dir / "absent.mp4")
+            except OSError as exc:
+                self.fail(f"file symlink creation unavailable: {exc}; enable Developer Mode or run elevated - symlink attack coverage must not be silently skipped")
+
+            with patch("app.controllers.application_controller.debug_logger") as logger:
+                paths = ApplicationController._collect_launch_media_paths([str(link), str(dangling)])
+
+            expected = os.path.normpath(os.fspath(link))
+            self.assertEqual(paths, [expected])
+            self.assertTrue(Path(expected).is_symlink())
+            self.assertEqual(os.path.dirname(expected), os.path.normpath(os.fspath(link_dir)))
+            self.assertNotEqual(os.path.dirname(expected), os.path.normpath(os.fspath(target_dir)))
+            actions = [call.kwargs.get("action") for call in logger.log.call_args_list]
+            self.assertIn("launch_media_symlink", actions)
+            self.assertIn("launch_media_symlink_rejected", actions)
+
+    def test_download_error_keeps_progress_before_failure(self):
+        self.assertIsNone(ApplicationController.DOWNLOAD_ERROR_PROGRESS)
+        controller = self._make_controller()
+        item = VideoItem(url="https://example.com/video.mp4", title="demo", source="douyin")
+        item.progress = 42
+        controller.videos[item.id] = item
+
+        controller._on_download_error(item.id, "网络超时")
+
+        self.assertEqual(item.status, "❌ 失败")
+        self.assertEqual(item.progress, 42)
 
     def test_pending_launch_video_switches_to_completed_and_plays_in_app(self):
         controller = self._make_controller()
@@ -661,6 +702,31 @@ class ApplicationControllerTests(unittest.TestCase):
         self.assertIs(controller.videos[item.id], item)
         controller.window.add_video_row.assert_called_once_with(item)
         controller.dl_manager.add_task.assert_called_once_with(item, "downloads")
+
+    def test_store_without_publish_does_not_emit_video_upsert(self):
+        controller = self._make_controller()
+        item = VideoItem(url="https://example.com/video.mp4", title="demo", source="douyin")
+
+        controller._store_video_item(item, publish=False)
+
+        controller.app_state.upsert_video.assert_not_called()
+        controller.app_state._publish_change.assert_not_called()
+        self.assertIs(controller.videos[item.id], item)
+
+    def test_spider_item_upsert_is_published_only_after_enqueue(self):
+        controller = self._make_controller()
+        controller.window.current_save_dir = "downloads"
+        timeline: list[str] = []
+        item = VideoItem(url="https://example.com/video.mp4", title="demo", source="douyin")
+        controller.dl_manager.add_task.side_effect = lambda *_args, **_kwargs: timeline.append("enqueue") or True
+        controller.app_state._publish_change.side_effect = lambda topic, _payload: timeline.append(topic)
+        controller.window.add_video_row.side_effect = lambda *_args, **_kwargs: timeline.append("ui")
+
+        with patch("app.controllers.crawl_controller_mixin.debug_logger", Mock()):
+            controller._on_spider_item_found(item)
+
+        self.assertEqual(timeline, ["enqueue", "videos.upsert", "ui"])
+        controller.app_state.upsert_video.assert_not_called()
 
     def test_on_spider_item_found_skips_image_when_video_only_enabled(self):
         controller = self._make_controller()

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import os
+import stat
 import sys
 import threading
 from pathlib import Path
@@ -65,6 +66,7 @@ class ApplicationController(
     DOWNLOAD_ERROR_STATUS_CODE = "APP_DL_ERROR"
     DOWNLOAD_FINISHED_MESSAGE = "下载任务完成"
     DOWNLOAD_ERROR_MESSAGE = "下载任务失败"
+    DOWNLOAD_ERROR_PROGRESS = None
     MEDIA_DELETE_COORDINATION_DELAY_SEC = 0.18
     MEDIA_RELEASE_POLL_INTERVAL_MS = 200
 
@@ -108,6 +110,50 @@ class ApplicationController(
             QTimer.singleShot(200, self.scan_local_dir)
         self._log_app_ready()
 
+    _FILE_ATTRIBUTE_REPARSE_POINT = 0x400
+
+    @classmethod
+    def _lexical_launch_path(cls, token: str) -> Path | None:
+        """得到不跟随符号链接和重解析点的绝对路径。"""
+        try:
+            expanded = os.path.expanduser(token)
+            path = Path(expanded)
+            if not path.is_absolute():
+                path = Path.cwd() / path
+            # normpath 只做词法折叠。abspath/resolve 在 Windows 上会跟随最终符号链接。
+            return Path(os.path.normpath(os.fspath(path)))
+        except (OSError, RuntimeError, ValueError):
+            return None
+
+    @classmethod
+    def _launch_path_is_reparse_point(cls, path: Path) -> bool:
+        try:
+            info = os.lstat(path)
+        except OSError:
+            return False
+        if stat.S_ISLNK(getattr(info, "st_mode", 0)):
+            return True
+        attributes = int(getattr(info, "st_file_attributes", 0) or 0)
+        return bool(attributes & cls._FILE_ATTRIBUTE_REPARSE_POINT)
+
+    @classmethod
+    def _log_launch_media_symlink(cls, path: Path, *, rejected: bool) -> None:
+        try:
+            debug_logger.log(
+                component="ApplicationController",
+                action="launch_media_symlink_rejected" if rejected else "launch_media_symlink",
+                level="ERROR" if rejected else "WARN",
+                message=(
+                    "关联打开拒绝符号链接，未切换到链接目标目录"
+                    if rejected
+                    else "关联打开不跟随符号链接，仅使用链接本身"
+                ),
+                status_code="APP_LAUNCH_SYMLINK_REJECTED" if rejected else "APP_LAUNCH_SYMLINK",
+                details={"path": str(path)},
+            )
+        except Exception:
+            return
+
     @classmethod
     def _collect_launch_media_paths(cls, launch_args: Sequence[str]) -> list[str]:
         """保留命令行传入且受支持的媒体路径，用于文件关联和双击打开。"""
@@ -117,20 +163,33 @@ class ApplicationController(
             token = str(arg or "").strip().strip('"')
             if not token or token.startswith("-"):
                 continue
-            path = Path(token)
-            try:
-                resolved = str(path.resolve())
-            except OSError:
-                continue
-            if not path.is_file():
+            path = cls._lexical_launch_path(token)
+            if path is None:
                 continue
             suffix = path.suffix.lower()
             if suffix not in cls.MEDIA_FILE_EXTENSIONS:
                 continue
-            if resolved in seen:
+            try:
+                info = os.lstat(path)
+            except OSError:
                 continue
-            seen.add(resolved)
-            paths.append(resolved)
+            if cls._launch_path_is_reparse_point(path):
+                try:
+                    target_exists = os.path.exists(path)
+                except OSError:
+                    target_exists = False
+                if not target_exists:
+                    cls._log_launch_media_symlink(path, rejected=True)
+                    continue
+                cls._log_launch_media_symlink(path, rejected=False)
+            elif not stat.S_ISREG(getattr(info, "st_mode", 0)):
+                continue
+            normalized = str(path)
+            identity = os.path.normcase(normalized)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            paths.append(normalized)
         return paths
 
     def _open_first_launch_media(self) -> None:
@@ -211,10 +270,10 @@ class ApplicationController(
         return None
 
     def _video_item_for_launch_path(self, file_path: str) -> VideoItem:
-        path = Path(file_path)
+        path = self._lexical_launch_path(file_path) or Path(file_path)
         item = VideoItem(url="", title=path.stem, source="local")
         self._prepare_local_item(item)
-        item.local_path = str(path.resolve())
+        item.local_path = str(path)
         suffix = path.suffix.lower()
         if suffix in self.VIDEO_EXTENSIONS:
             item.meta["content_type"] = "video"
@@ -320,29 +379,71 @@ class ApplicationController(
         with self._video_state_guard():
             return self.videos.get(video_id)
 
-    def _store_video_item(self, item: VideoItem) -> None:
+    def _store_video_item(self, item: VideoItem, *, publish: bool = True) -> None:
         app_state = getattr(self, "app_state", None)
         if app_state is not None:
-            app_state.upsert_video(item)
+            if publish:
+                app_state.upsert_video(item)
+                return
+            self._remember_videos_without_publish(app_state, [item])
             return
         with self._media_item_guard(item.id):
             with self._video_state_guard():
                 self.videos[item.id] = item
 
-    def _store_video_items(self, items: Sequence[VideoItem]) -> None:
+    def _store_video_items(self, items: Sequence[VideoItem], *, publish: bool = True) -> None:
         video_items = [item for item in list(items or []) if getattr(item, "id", None)]
         if not video_items:
             return
         app_state = getattr(self, "app_state", None)
         if app_state is not None:
+            if not publish:
+                self._remember_videos_without_publish(app_state, video_items)
+                return
             upsert_many = getattr(app_state, "upsert_videos", None)
             if callable(upsert_many):
                 upsert_many(video_items)
                 return
+            for item in video_items:
+                app_state.upsert_video(item)
+            return
         with self._media_item_lock_pool().hold_many(item.id for item in video_items):
             with self._video_state_guard():
                 for item in video_items:
                     self.videos[item.id] = item
+
+    @staticmethod
+    def _remember_videos_without_publish(app_state, video_items: Sequence[VideoItem]) -> None:
+        """先写入内存，等下载入队成功后再发布会让界面出现的变更。"""
+        videos = getattr(app_state, "videos", None)
+        if not isinstance(videos, dict):
+            return
+        video_ids = [item.id for item in video_items]
+        lock = getattr(app_state, "_lock", None)
+        locks = getattr(app_state, "_media_item_locks", None)
+        hold_many = getattr(locks, "hold_many", None)
+
+        def write() -> None:
+            for item in video_items:
+                videos[item.id] = item
+
+        if callable(hold_many):
+            context = hold_many(video_ids)
+            if callable(getattr(type(context), "__enter__", None)) and callable(
+                getattr(type(context), "__exit__", None)
+            ):
+                with context:
+                    if lock is not None:
+                        with lock:
+                            write()
+                    else:
+                        write()
+                return
+        if lock is not None:
+            with lock:
+                write()
+            return
+        write()
 
     def _remove_video_item(self, video_id: str) -> VideoItem | None:
         app_state = getattr(self, "app_state", None)

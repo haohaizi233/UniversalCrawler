@@ -41,17 +41,20 @@ class _WorkerQObject(QObject):
         args: tuple[Any, ...],
         kwargs: dict[str, Any],
         token: TaskCancelToken,
+        on_not_started: Callable[[], Any] | None = None,
     ) -> None:
         super().__init__()
         self._fn = fn
         self._args = args
         self._kwargs = kwargs
         self._token = token
+        self._on_not_started = on_not_started
         self._logger = logging.getLogger(__name__)
 
     @pyqtSlot()
     def run(self) -> None:
         if self._token.is_cancelled():
+            self._notify_not_started()
             self.finished.emit()
             return
         try:
@@ -63,6 +66,15 @@ class _WorkerQObject(QObject):
         finally:
             self._token.mark_done()
             self.finished.emit()
+
+    def _notify_not_started(self) -> None:
+        callback = self._on_not_started
+        if callback is None:
+            return
+        try:
+            callback()
+        except Exception:
+            self._logger.exception("Cancelled task could not restore work skipped before start")
 
 class _ShortTaskRunnableSignals(QObject):
     progress = pyqtSignal(object)
@@ -170,12 +182,13 @@ class LongTaskRunner(QObject):
         args: tuple[Any, ...] = (),
         kwargs: dict[str, Any] | None = None,
         resource_hooks: list[Callable[[], Any]] | None = None,
+        on_not_started: Callable[[], Any] | None = None,
     ) -> LongTaskHandle:
         kwargs = kwargs or {}
         token = TaskCancelToken()
         thread = QThread()
         thread.setObjectName(name)
-        worker = _WorkerQObject(fn, args, kwargs, token)
+        worker = _WorkerQObject(fn, args, kwargs, token, on_not_started)
         worker.moveToThread(thread)
         handle = LongTaskHandle(name=name, thread=thread, token=token, worker=worker, resource_hooks=resource_hooks)
         self._handles.add(handle)
@@ -190,30 +203,30 @@ class LongTaskRunner(QObject):
         return handle
 
     def cancel_all(self, *, timeout_ms: int) -> None:
-        """批量取消长任务；超时后转为协作式遗留跟踪，避免关闭窗口卡死。"""
+        """只发出取消。关闭窗口时不在 GUI 线程上 wait，未结束的线程留到进程退出再回收。"""
 
+        del timeout_ms
         for handle in list(self._handles):
             handle.cancel()
         for handle in list(self._handles):
-            if handle.is_running() and not handle.wait(timeout_ms):
-                handle.terminate()
-                orphan_wait_ms = min(
-                    self.ORPHANED_HANDLE_WAIT_MS,
-                    max(1000, int(timeout_ms or 0)),
-                )
-                if handle.is_running() and not handle.wait(orphan_wait_ms):
-                    release_hooks = getattr(handle, "release_resource_hooks", None)
-                    if callable(release_hooks):
-                        release_hooks()
-                    self._logger.warning(
-                        "Long task did not stop within %sms; leaving thread to exit cooperatively: %s",
-                        timeout_ms + orphan_wait_ms,
-                        handle.name,
-                    )
-                    with self._orphaned_lock:
-                        self._orphaned_handles.add(handle)
             if not handle.is_running() or handle.is_done():
                 self._discard_handle(handle)
+                continue
+            terminate = getattr(handle, "terminate", None)
+            if callable(terminate):
+                terminate()
+            if not handle.is_running() or handle.is_done():
+                self._discard_handle(handle)
+                continue
+            release_hooks = getattr(handle, "release_resource_hooks", None)
+            if callable(release_hooks):
+                release_hooks()
+            self._logger.warning(
+                "Long task is still running after cancel; leaving thread until process exit: %s",
+                handle.name,
+            )
+            with self._orphaned_lock:
+                self._orphaned_handles.add(handle)
 
     def _discard_handle(self, handle: LongTaskHandle) -> None:
         self._handles.discard(handle)
@@ -229,12 +242,14 @@ class _ShortTaskRunnable(QRunnable):
         token: TaskCancelToken,
         name: str,
         panel: QObject | None = None,
+        on_not_started: Callable[[], Any] | None = None,
     ) -> None:
         super().__init__()
         self.setAutoDelete(True)
         self._fn = fn
         self._token = token
         self._name = name
+        self._on_not_started = on_not_started
         self._logger = logging.getLogger(__name__)
         self._panel_ref = weakref.ref(panel) if panel is not None else lambda: None
         # QRunnable 不是 QObject，不能硬设 parent；弱引用还可避免任务反向延长 panel 生命周期。
@@ -250,7 +265,9 @@ class _ShortTaskRunnable(QRunnable):
     @pyqtSlot()
     def run(self) -> None:
         try:
-            if not self._token.is_cancelled():
+            if self._token.is_cancelled():
+                self._notify_not_started()
+            else:
                 if self._panel_ref() is not None:
                     self._signals.progress.emit({"name": self._name, "state": "started"})
                 self._fn(self._token)
@@ -261,6 +278,15 @@ class _ShortTaskRunnable(QRunnable):
                 self._signals.progress.emit({"name": self._name, "state": "finished"})
                 self._signals.finished.emit()
             self._token.mark_done()
+
+    def _notify_not_started(self) -> None:
+        callback = self._on_not_started
+        if callback is None:
+            return
+        try:
+            callback()
+        except Exception:
+            self._logger.exception("Cancelled short task could not restore work skipped before start: %s", self._name)
 
 class ShortTaskRunner(QObject):
     """把短耗时任务提交到 QThreadPool，适合预览/探测类后台工作。"""
@@ -279,6 +305,7 @@ class ShortTaskRunner(QObject):
         name: str,
         fn: Callable[[TaskCancelToken], Any],
         panel: QObject | None = None,
+        on_not_started: Callable[[], Any] | None = None,
     ) -> TaskCancelToken:
         token = TaskCancelToken()
         with self._tokens_lock:
@@ -289,20 +316,20 @@ class ShortTaskRunner(QObject):
             token=token,
             name=name,
             panel=panel,
+            on_not_started=on_not_started,
         )
         self._pool.start(runnable)
         return token
 
     def cancel_all(self, *, timeout_ms: int = 5000) -> None:
-        """取消所有短任务并等待线程池收敛，窗口退出时调用。"""
+        """只取消短任务。关闭窗口时不调用 waitForDone，未结束的线程留到进程退出再回收。"""
 
+        del timeout_ms
         with self._tokens_lock:
             tokens = list(self._tokens)
         for token in tokens:
             token.cancel()
-        self._pool.waitForDone(timeout_ms)
         with self._tokens_lock:
-            self._tokens.difference_update(tokens)
             self._prune_done_locked()
 
     def _discard_token(self, token: TaskCancelToken) -> None:

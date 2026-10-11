@@ -5,6 +5,10 @@ import threading
 from app.models import VideoItem
 
 
+class SelectionDialogOpenError(RuntimeError):
+    """任务选择框没有打开。调用方不能把它当成用户取消。"""
+
+
 class _UiMethodInvoker:
     """在 Qt 可用时把宿主回调排入主线程。"""
 
@@ -77,6 +81,10 @@ class DesktopHostAdapter:
         self.append_log("✅ 爬虫任务结束")
         self.set_crawl_running_state(False)
 
+    def report_crawl_finished_unsuccessful(self) -> None:
+        self.append_log("❌ 爬虫任务未成功结束", level="ERROR")
+        self.set_crawl_running_state(False)
+
     def notify_crawl_stop_requested(self) -> None:
         self.append_log("🛑 正在停止任务...")
         self._run_on_ui(self._disable_stop_button)
@@ -131,7 +139,18 @@ class DesktopHostAdapter:
         return self.window.reorder_video_row(item)
 
     def show_selection_dialog(self, items):
-        return self.window.show_selection_dialog(items)
+        try:
+            return self.window.show_selection_dialog(items)
+        except SelectionDialogOpenError:
+            raise
+        except Exception as exc:
+            raise SelectionDialogOpenError(str(exc)) from exc
+
+    def dismiss_selection_dialog(self) -> None:
+        dismiss = getattr(self.window, "dismiss_selection_dialog", None)
+        if not callable(dismiss):
+            return
+        self._run_on_ui(dismiss)
 
     def release_media_playback(self) -> None:
         self._run_on_ui(self.window.release_media_playback)

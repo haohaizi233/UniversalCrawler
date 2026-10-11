@@ -264,7 +264,7 @@ class MediaHostControllerMixinTests(unittest.TestCase):
         submitted: list[str] = []
 
         class ImmediateRunner:
-            def submit(self, *, name, fn):
+            def submit(self, *, name, fn, on_not_started=None):
                 submitted.append(name)
                 token = SimpleNamespace(is_cancelled=lambda: False)
                 fn(token)
@@ -322,7 +322,7 @@ class MediaHostControllerMixinTests(unittest.TestCase):
         )
 
         class CancelledRunner:
-            def submit(self, *, name, fn):
+            def submit(self, *, name, fn, on_not_started=None):
                 del name
                 token = SimpleNamespace(is_cancelled=lambda: True)
                 fn(token)
@@ -348,7 +348,7 @@ class MediaHostControllerMixinTests(unittest.TestCase):
         controller._rename_video_io = Mock(side_effect=RuntimeError("rename failed"))
 
         class ImmediateRunner:
-            def submit(self, *, name, fn):
+            def submit(self, *, name, fn, on_not_started=None):
                 del name
                 return fn(SimpleNamespace(is_cancelled=lambda: False))
 
@@ -391,7 +391,7 @@ class MediaHostControllerMixinTests(unittest.TestCase):
         callbacks = []
 
         class ImmediateRunner:
-            def submit(self, *, name, fn):
+            def submit(self, *, name, fn, on_not_started=None):
                 del name
                 return fn(SimpleNamespace(is_cancelled=lambda: False))
 
@@ -458,7 +458,7 @@ class MediaHostControllerMixinTests(unittest.TestCase):
         submitted: list[tuple[str, object]] = []
 
         class ImmediateRunner:
-            def submit(self, *, name, fn):
+            def submit(self, *, name, fn, on_not_started=None):
                 submitted.append((name, fn))
                 token = SimpleNamespace(is_cancelled=lambda: False, wait_cancelled=Mock(return_value=False))
                 fn(token)
@@ -498,7 +498,7 @@ class MediaHostControllerMixinTests(unittest.TestCase):
         submitted = []
 
         class DeferredRunner:
-            def submit(self, *, name, fn):
+            def submit(self, *, name, fn, on_not_started=None):
                 submitted.append((name, fn))
                 return SimpleNamespace(is_cancelled=lambda: False)
 
@@ -597,7 +597,7 @@ class MediaHostControllerMixinTests(unittest.TestCase):
         )
 
         class ImmediateRunner:
-            def submit(self, *, name, fn):
+            def submit(self, *, name, fn, on_not_started=None):
                 token = SimpleNamespace(is_cancelled=lambda: False)
                 fn(token)
                 return token
@@ -634,7 +634,7 @@ class MediaHostControllerMixinTests(unittest.TestCase):
         submitted = []
 
         class DeferredRunner:
-            def submit(self, *, name, fn):
+            def submit(self, *, name, fn, on_not_started=None):
                 submitted.append(fn)
                 return SimpleNamespace(is_cancelled=lambda: False)
 
@@ -698,7 +698,7 @@ class MediaHostControllerMixinTests(unittest.TestCase):
         submitted: list[str] = []
 
         class ImmediateRunner:
-            def submit(self, *, name, fn):
+            def submit(self, *, name, fn, on_not_started=None):
                 submitted.append(name)
                 token = SimpleNamespace(cancel=Mock(), is_cancelled=lambda: False)
                 fn(token)
@@ -981,6 +981,200 @@ class MediaHostControllerMixinTests(unittest.TestCase):
 
         self.assertEqual(controller._queue_item_ids_for_clear(), {queued.id})
         controller.frontend_state_service.get_snapshot.assert_not_called()
+
+    def _queue_controller(self):
+        controller = _DummyMediaHostController()
+        queued = VideoItem(url="https://example.com/q", title="queued", source="douyin")
+        queued.status = "⏳ 等待中"
+        controller.app_state = AppState()
+        controller.app_state.upsert_video(queued)
+        controller.videos = controller.app_state.videos
+        controller.dl_manager = Mock()
+        controller.dl_manager.cancel_task.return_value = "queued"
+        controller.frontend_state_service = Mock()
+        controller.frontend_state_service.queue_item_ids = Mock(return_value={queued.id})
+        return controller, queued
+
+    def test_clear_queue_blocking_returns_removed_ids_after_completion(self):
+        controller, queued = self._queue_controller()
+
+        result = controller.clear_queue_blocking()
+
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["removed_ids"], [queued.id])
+        self.assertNotIn(queued.id, controller.app_state.videos)
+
+    def test_clear_queue_blocking_cancel_does_not_change_state_or_emit_success(self):
+        controller, queued = self._queue_controller()
+        token = SimpleNamespace(is_cancelled=lambda: True)
+
+        result = controller.clear_queue_blocking(token)
+
+        self.assertEqual(result["status"], "cancelled")
+        self.assertEqual(result["removed_ids"], [])
+        self.assertIn(queued.id, controller.app_state.videos)
+        controller.dl_manager.cancel_task.assert_not_called()
+        controller.host.append_log.assert_not_called()
+        controller.app_state._publish_change = Mock()
+        controller._apply_clear_queue_result(result)
+        controller.app_state._publish_change.assert_not_called()
+        controller.host.append_log.assert_not_called()
+
+    def test_clear_queue_blocking_cancel_during_queue_cancel_does_not_commit_removal(self):
+        controller, queued = self._queue_controller()
+        token = SimpleNamespace(cancelled=False)
+        token.is_cancelled = lambda: token.cancelled
+        queued.meta["save_directory"] = "downloads"
+        queued.meta["user_cancel_requested"] = False
+
+        def cancel_tasks(_video_ids):
+            token.cancelled = True
+            queued.meta["user_cancel_requested"] = True
+            return {queued.id: "queued"}
+
+        controller.dl_manager.cancel_tasks = Mock(side_effect=cancel_tasks)
+        controller.dl_manager.add_task = Mock(return_value=True)
+
+        result = controller.clear_queue_blocking(token)
+
+        self.assertEqual(result["status"], "cancelled")
+        self.assertEqual(result["removed_ids"], [])
+        self.assertIs(controller.app_state.videos[queued.id], queued)
+        self.assertNotIn("user_cancel_requested", queued.meta)
+        controller.dl_manager.add_task.assert_called_once_with(queued, "downloads")
+        controller._apply_clear_queue_result(result)
+        controller.host.append_log.assert_not_called()
+
+    def test_clear_queue_blocking_rejects_a_second_clear(self):
+        controller, queued = self._queue_controller()
+        self.assertTrue(controller._acquire_clear_queue_turn())
+        try:
+            result = controller.clear_queue_blocking()
+        finally:
+            controller._release_clear_queue_turn()
+
+        self.assertEqual(result["status"], "error")
+        self.assertEqual(result["removed_ids"], [])
+        self.assertIn(queued.id, controller.app_state.videos)
+
+    def test_on_clear_queue_does_not_report_success_when_background_task_is_only_submitted(self):
+        controller, queued = self._queue_controller()
+        submitted = []
+
+        class DeferredRunner:
+            def submit(self, *, name, fn, on_not_started=None):
+                submitted.append(fn)
+                return SimpleNamespace(is_cancelled=lambda: False)
+
+        controller._should_clear_queue_in_background = Mock(return_value=True)
+        controller._ensure_short_task_runner = Mock(return_value=DeferredRunner())
+        controller._ensure_ui_callback_invoker = Mock(return_value=SimpleNamespace(invoke=lambda callback: callback()))
+
+        controller.on_clear_queue()
+
+        self.assertEqual(len(submitted), 1)
+        self.assertIn(queued.id, controller.app_state.videos)
+        controller.host.append_log.assert_not_called()
+
+        submitted[0](SimpleNamespace(is_cancelled=lambda: False))
+
+        self.assertNotIn(queued.id, controller.app_state.videos)
+        controller.host.append_log.assert_any_call("🗑️ 已清空下载队列 (1 项)")
+
+    def test_shutdown_rejects_scan_and_clear(self):
+        controller, queued = self._queue_controller()
+        controller._shutdown_rejects_new_work = True
+        controller.host.current_save_dir = "downloads"
+
+        with patch("app.controllers.media_host_controller_mixin.debug_logger", Mock()):
+            controller.scan_local_dir()
+            controller.on_clear_queue()
+            result = controller.clear_queue_blocking()
+
+        controller.host.announce_scan_start.assert_not_called()
+        self.assertIn(queued.id, controller.app_state.videos)
+        self.assertEqual(result["status"], "error")
+        controller.host.append_log.assert_any_call("应用正在关闭，已拒绝扫描目录")
+        controller.host.append_log.assert_any_call("应用正在关闭，已拒绝清空下载队列")
+
+    def test_async_delete_restores_row_when_cancelled(self):
+        controller = _DummyMediaHostController()
+        item = VideoItem(url="", title="demo", source="local")
+        item.local_path = __file__
+        controller.videos[item.id] = item
+        context = SimpleNamespace(video_id=item.id, video=item, cancel_result=None)
+
+        class ImmediateRunner:
+            def submit(self, *, name, fn, on_not_started=None):
+                fn(SimpleNamespace(is_cancelled=lambda: True, wait_cancelled=Mock(return_value=True)))
+                return SimpleNamespace(is_cancelled=lambda: True)
+
+        controller._should_delete_media_asynchronously = Mock(return_value=True)
+        controller._prepare_delete_video = Mock(return_value=context)
+        controller._delete_video_context_sync = Mock(side_effect=AssertionError("cancelled delete must not touch the file"))
+        controller._ensure_short_task_runner = Mock(return_value=ImmediateRunner())
+        controller._ensure_ui_callback_invoker = Mock(return_value=SimpleNamespace(invoke=lambda callback: callback()))
+
+        controller.on_delete_video(5, item.id)
+
+        self.assertIs(controller.videos[item.id], item)
+        controller.host.add_video_row.assert_called_once_with(item)
+        controller.host.report_delete_error.assert_not_called()
+        controller._delete_video_context_sync.assert_not_called()
+
+    def test_async_delete_restores_row_when_background_raises(self):
+        controller = _DummyMediaHostController()
+        item = VideoItem(url="", title="demo", source="local")
+        item.local_path = __file__
+        controller.videos[item.id] = item
+        context = SimpleNamespace(video_id=item.id, video=item, cancel_result=None)
+
+        class ImmediateRunner:
+            def submit(self, *, name, fn, on_not_started=None):
+                fn(SimpleNamespace(is_cancelled=lambda: False, wait_cancelled=Mock(return_value=False)))
+                return SimpleNamespace(is_cancelled=lambda: False)
+
+        controller._should_delete_media_asynchronously = Mock(return_value=True)
+        controller._prepare_delete_video = Mock(return_value=context)
+        controller._delete_video_context_sync = Mock(side_effect=RuntimeError("disk vanished"))
+        controller._ensure_short_task_runner = Mock(return_value=ImmediateRunner())
+        controller._ensure_ui_callback_invoker = Mock(return_value=SimpleNamespace(invoke=lambda callback: callback()))
+
+        with patch("app.controllers.media_host_controller_mixin.debug_logger", Mock()):
+            controller.on_delete_video(5, item.id)
+
+        self.assertIs(controller.videos[item.id], item)
+        controller.host.add_video_row.assert_called_once_with(item)
+        controller.host.report_delete_error.assert_called_once_with("disk vanished")
+
+    def test_optimistic_delete_restores_row_when_task_never_starts(self):
+        controller = _DummyMediaHostController()
+        item = VideoItem(url="", title="demo", source="local")
+        item.local_path = __file__
+        controller.videos[item.id] = item
+        context = SimpleNamespace(video_id=item.id, video=item, cancel_result=None)
+
+        class SkipRunner:
+            def submit(self, *, name, fn, on_not_started=None):
+                del name, fn
+                self.assertIsNotNone(on_not_started)
+                on_not_started()
+                return SimpleNamespace(is_cancelled=lambda: True)
+
+        runner = SkipRunner()
+        runner.assertIsNotNone = self.assertIsNotNone
+        controller._should_delete_media_asynchronously = Mock(return_value=True)
+        controller._prepare_delete_video = Mock(return_value=context)
+        controller._delete_video_context_sync = Mock(side_effect=AssertionError("cancelled delete must not touch the file"))
+        controller._ensure_short_task_runner = Mock(return_value=runner)
+        controller._ensure_ui_callback_invoker = Mock(return_value=SimpleNamespace(invoke=lambda callback: callback()))
+
+        controller.on_delete_video(5, item.id)
+
+        self.assertIs(controller.videos[item.id], item)
+        controller.host.add_video_row.assert_called_once_with(item)
+        controller.host.report_delete_error.assert_not_called()
+        controller._delete_video_context_sync.assert_not_called()
 
 if __name__ == "__main__":
     unittest.main()

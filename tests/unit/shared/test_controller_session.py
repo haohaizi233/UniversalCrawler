@@ -111,3 +111,18 @@ class ControllerSessionMixinTests(unittest.TestCase):
         self.assertTrue(any("下载失败" in item["message"] for item in controller.logs))
         self.assertEqual(controller.logs[-1]["level"], "ERROR")
         self.assertEqual(controller.logs[-1]["trace_id"], "trace-error")
+
+    def test_download_error_keeps_progress_when_policy_is_none(self):
+        controller = _DummyController()
+        item = VideoItem(url="https://example.com/video.mp4", title="demo", source="douyin")
+        item.progress = 41
+        controller.videos[item.id] = item
+        self.assertIsNone(ControllerSessionMixin.DOWNLOAD_ERROR_PROGRESS)
+
+        fake_logger = SimpleNamespace(log=lambda **_kwargs: None)
+        with patch.object(session_mixin, "debug_logger", fake_logger):
+            controller._on_task_error(item.id, "网络超时")
+
+        self.assertEqual(item.status, "❌ 失败")
+        self.assertEqual(item.progress, 41)
+        self.assertEqual(controller.state_updates[-1], (item.id, "❌ 失败", None))

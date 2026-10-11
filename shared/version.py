@@ -1,6 +1,6 @@
 """无 UI 依赖的项目版本契约。"""
 
-__version__ = "3.6.22"
+__version__ = "3.7.0"
 
 
 def format_version_label(value: object, *, fallback: str = "v?") -> str:

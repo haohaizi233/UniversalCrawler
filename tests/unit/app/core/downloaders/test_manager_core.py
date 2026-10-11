@@ -873,6 +873,206 @@ class DownloadManagerCoreTests(unittest.TestCase):
             [call.kwargs.get("action") for call in log.call_args_list],
         )
 
+    def test_stop_all_preserves_queue_failure_after_stopping_workers_and_dispatcher(self):
+        primary = KeyboardInterrupt("queue drain interrupted")
+        queue_owner = Mock()
+        queue_owner.drain.side_effect = primary
+        queue_owner.get_nowait.side_effect = queue.Empty
+        first = Mock()
+        first.stop.return_value = None
+        first.wait.return_value = True
+        second = Mock()
+        second.stop.return_value = None
+        second.wait.return_value = True
+        manager = self._stop_manager(queue_owner, [first, second])
+
+        with (
+            patch("app.core.download_manager_core.debug_logger.log"),
+            self.assertRaises(KeyboardInterrupt) as caught,
+        ):
+            manager.stop_all()
+
+        self.assertIs(caught.exception, primary)
+        first.stop.assert_called_once_with()
+        first.wait.assert_called_once_with(manager.WORKER_STOP_TIMEOUT_MS)
+        second.stop.assert_called_once_with()
+        second.wait.assert_called_once_with(manager.WORKER_STOP_TIMEOUT_MS)
+        manager.dispatcher_thread.join.assert_called_once_with(timeout=2)
+        manager.dispatcher_thread.is_alive.assert_called_once_with()
+
+    def test_stop_all_preserves_first_worker_failure_and_attempts_every_step(self):
+        primary = SystemExit("first worker stop failed")
+        secondary = KeyboardInterrupt("first worker wait failed")
+        first = Mock()
+        first.stop.side_effect = primary
+        first.wait.side_effect = [secondary, True]
+        second = Mock()
+        second.stop.return_value = None
+        second.wait.return_value = True
+        manager = self._stop_manager(Mock(), [first, second])
+        manager.queue.drain.return_value = []
+
+        with (
+            patch("app.core.download_manager_core.debug_logger.log"),
+            self.assertRaises(SystemExit) as caught,
+        ):
+            manager.stop_all()
+
+        self.assertIs(caught.exception, primary)
+        first.stop.assert_called_once_with()
+        self.assertGreaterEqual(first.wait.call_count, 2)
+        second.stop.assert_called_once_with()
+        second.wait.assert_called_once_with(manager.WORKER_STOP_TIMEOUT_MS)
+        manager.dispatcher_thread.join.assert_called_once_with(timeout=2)
+        manager.dispatcher_thread.is_alive.assert_called_once_with()
+
+    def test_stop_all_wait_false_uses_bounded_backoff_and_single_timeout_log(self):
+        class HostileVideo:
+            def __getattribute__(self, _name):
+                raise KeyboardInterrupt("telemetry lookup failed")
+
+        first = SimpleNamespace(
+            stop=Mock(return_value=None),
+            wait=Mock(side_effect=[False, False, False, False, True]),
+            video=HostileVideo(),
+        )
+        second = Mock()
+        second.stop.return_value = None
+        second.wait.return_value = True
+        manager = self._stop_manager(Mock(), [first, second])
+        manager.queue.drain.return_value = []
+
+        with (
+            patch("app.core.download_shutdown_guardian.time.sleep") as retry_sleep,
+            patch("app.core.download_shutdown_guardian.debug_logger.log") as log,
+        ):
+            stopped = manager.stop_all()
+
+        self.assertIs(stopped, True)
+        self.assertEqual(first.wait.call_count, 5)
+        self.assertEqual(
+            [call.args[0] for call in retry_sleep.call_args_list],
+            [0.01, 0.02, 0.04, 0.08],
+        )
+        timeout_logs = [
+            call
+            for call in log.call_args_list
+            if call.kwargs.get("action") == "stop_all_worker_timeout"
+        ]
+        self.assertEqual(len(timeout_logs), 1)
+        second.stop.assert_called_once_with()
+        second.wait.assert_called_once_with(manager.WORKER_STOP_TIMEOUT_MS)
+        manager.dispatcher_thread.join.assert_called_once_with(timeout=2)
+
+    def test_stop_all_keeps_waiting_for_dispatcher_after_initial_timeout(self):
+        manager = self._stop_manager(Mock(), [])
+        manager.queue.drain.return_value = []
+        manager.dispatcher_thread.is_alive.side_effect = [True, False]
+
+        with patch("app.core.download_manager_core.debug_logger.log"):
+            stopped = manager.stop_all()
+
+        self.assertIs(stopped, True)
+        self.assertEqual(manager.dispatcher_thread.join.call_count, 2)
+        manager.dispatcher_thread.join.assert_called_with(timeout=2)
+
+    def test_stop_all_wait_exception_uses_liveness_probe_and_bounded_backoff(self):
+        primary = RuntimeError("worker wait failed")
+
+        class PermanentlyFailingWaitWorker:
+            def __init__(self):
+                self.stop = Mock()
+                self.wait_calls = 0
+                self.liveness_calls = 0
+                self.ident = 7
+
+            def wait(self, _timeout_ms):
+                self.wait_calls += 1
+                if self.wait_calls > 3:
+                    return True
+                raise primary
+
+            def is_alive(self):
+                self.liveness_calls += 1
+                return self.liveness_calls < 3
+
+        worker = PermanentlyFailingWaitWorker()
+        manager = self._stop_manager(Mock(), [worker])
+        manager.queue.drain.return_value = []
+
+        with (
+            patch("app.core.download_manager_core.debug_logger.log"),
+            patch("app.core.download_manager_core.debug_logger.log_exception") as log_exception,
+            patch("app.core.download_manager_core.time.sleep") as retry_sleep,
+            self.assertRaises(RuntimeError) as caught,
+        ):
+            manager.stop_all()
+
+        self.assertIs(caught.exception, primary)
+        self.assertEqual(worker.wait_calls, 3)
+        self.assertEqual(worker.liveness_calls, 3)
+        self.assertEqual([call.args[0] for call in retry_sleep.call_args_list], [0.01, 0.02])
+        self.assertEqual(log_exception.call_count, 1)
+        manager.dispatcher_thread.join.assert_called_once_with(timeout=2)
+
+    def test_stop_all_broadcasts_stop_to_every_worker_before_waiting(self):
+        first_wait_entered = threading.Event()
+        release_first = threading.Event()
+        second_stop_received = threading.Event()
+
+        first = Mock()
+        first.stop.return_value = None
+
+        def wait_for_release(_timeout_ms):
+            first_wait_entered.set()
+            release_first.wait(2.0)
+            return True
+
+        first.wait.side_effect = wait_for_release
+        second = Mock()
+        second.stop.side_effect = lambda: second_stop_received.set()
+        second.wait.return_value = True
+        manager = self._stop_manager(Mock(), [first, second])
+        manager.queue.drain.return_value = []
+        failures = []
+
+        def stop_all():
+            try:
+                manager.stop_all()
+            except BaseException as exc:
+                failures.append(exc)
+
+        caller = threading.Thread(target=stop_all, daemon=False)
+        try:
+            with patch("app.core.download_manager_core.debug_logger.log"):
+                caller.start()
+                self.assertTrue(first_wait_entered.wait(1.0))
+                self.assertTrue(second_stop_received.wait(0.2))
+        finally:
+            release_first.set()
+            caller.join(timeout=2.0)
+
+        self.assertFalse(caller.is_alive())
+        self.assertEqual(failures, [])
+        first.stop.assert_called_once_with()
+        second.stop.assert_called_once_with()
+        manager.dispatcher_thread.join.assert_called_once_with(timeout=2)
+
+    @staticmethod
+    def _stop_manager(queue_owner, workers):
+        manager = DownloadManagerCore.__new__(DownloadManagerCore)
+        manager.queue = queue_owner
+        manager.workers = list(workers)
+        manager._workers_lock = threading.RLock()
+        manager._start_stop_lock = threading.RLock()
+        manager._dispatch_slot_gate = threading.Event()
+        manager._startup_maintenance_done = threading.Event()
+        manager.dispatcher_thread = Mock()
+        manager.dispatcher_thread.join.return_value = None
+        manager.dispatcher_thread.is_alive.return_value = False
+        manager.is_running = True
+        return manager
+
     def test_cancel_task_uses_pending_queue_public_remove_api(self):
         manager = DownloadManagerCore.__new__(DownloadManagerCore)
         manager.queue = PendingDownloadQueue()

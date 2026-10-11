@@ -10,6 +10,7 @@ from typing import Any, Callable
 from fastapi import HTTPException, Request
 
 from app.web.api_result import error_result
+from app.web.controller_config_service import DIRECTORY_NOT_AUTHORIZED_MESSAGE
 from app.web.logging_utils import log_web_event
 
 _VIDEO_ID_PATTERN = re.compile(r"^[a-zA-Z0-9_-]+$")
@@ -51,7 +52,18 @@ class WebControllerRouteService:
             video_id = require_valid_video_id(video_id)
         except HTTPException:
             return error_result("invalid video_id", http_status=400)
-        result = await context.controller.async_delete_video(video_id, context.approved_roots_snapshot())
+        try:
+            with context.lease_approved_root_grants_snapshot() as grants:
+                result = await context.controller.async_delete_video(
+                    video_id,
+                    grants,
+                )
+        except PermissionError:
+            return error_result(
+                DIRECTORY_NOT_AUTHORIZED_MESSAGE,
+                http_status=403,
+                code="directory_not_authorized",
+            )
         return result if isinstance(result, dict) else {"status": "ok"}
 
     async def rename_video(self, request: Request, body: dict) -> dict:
@@ -64,4 +76,16 @@ class WebControllerRouteService:
             video_id = require_valid_video_id(video_id)
         except HTTPException:
             return error_result("invalid video_id", http_status=400)
-        return await context.controller.async_rename_video(video_id, new_title, context.approved_roots_snapshot())
+        try:
+            with context.lease_approved_root_grants_snapshot() as grants:
+                return await context.controller.async_rename_video(
+                    video_id,
+                    new_title,
+                    grants,
+                )
+        except PermissionError:
+            return error_result(
+                DIRECTORY_NOT_AUTHORIZED_MESSAGE,
+                http_status=403,
+                code="directory_not_authorized",
+            )

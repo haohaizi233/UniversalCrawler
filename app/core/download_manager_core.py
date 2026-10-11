@@ -15,6 +15,7 @@ from app.debug_logger import debug_logger
 from app.exceptions import AppError
 from app.core.media_filter import is_image_like_resource, should_skip_for_video_only
 from app.core.download_path_policy import resolve_task_save_directory
+from app.core.download_shutdown_guardian import stop_download_manager
 from app.models import VideoItem
 from app.services.download_recovery_store import DownloadRecoveryStore
 
@@ -1430,61 +1431,4 @@ class DownloadManagerCore:
         """供宿主适配器清理线程对象的扩展钩子。"""
 
     def stop_all(self):
-        """尽力停止当前下载，丢弃排队任务，并执行有界等待。
-
-        每个工作线程最多等待 ``WORKER_STOP_TIMEOUT_MS``，分发线程最多等待两秒；
-        本方法返回时不保证所有工作线程或分发线程都已经退出。
-        """
-        with self._start_stop_guard():
-            self.is_running = False
-            startup_maintenance_done = getattr(self, "_startup_maintenance_done", None)
-            if startup_maintenance_done is not None:
-                startup_maintenance_done.set()
-            self._get_dispatch_slot_gate().set()
-            with self._workers_lock:
-                active_workers = len(self.workers)
-            debug_logger.log(
-                component="DownloadManager",
-                action="stop_all",
-                level="WARN",
-                message="Download manager stopping, draining queue and workers",
-                status_code="DL_STOP_ALL",
-                details={"active_workers": active_workers},
-            )
-            drain = getattr(self.queue, "drain", None)
-            if callable(drain):
-                drain()
-            else:
-                # 兼容旧 queue 实现：没有 drain 时逐个取空，确保关闭后不会再派发任务。
-                while True:
-                    try:
-                        self.queue.get_nowait()
-                    except queue.Empty:
-                        break
-            with self._workers_lock:
-                workers_snapshot = list(self.workers)
-        for worker in workers_snapshot:
-            worker.stop()
-            try:
-                _wait_ok = worker.wait(self.WORKER_STOP_TIMEOUT_MS)
-            except RuntimeError:
-                _wait_ok = True
-            if not _wait_ok:
-                debug_logger.log(
-                    component="DownloadManager",
-                    action="stop_all_worker_timeout",
-                    level="WARN",
-                    message="Worker stop timeout reached; forcing shutdown cleanup",
-                    status_code="DL_STOP_TIMEOUT",
-                    details={"video_id": worker.video.id, "timeout_ms": self.WORKER_STOP_TIMEOUT_MS},
-                    trace_id=worker.video.meta.get("trace_id"),
-                )
-        self.dispatcher_thread.join(timeout=2)
-        if self.dispatcher_thread.is_alive():
-            debug_logger.log(
-                component="DownloadManager",
-                action="stop_all_dispatcher_timeout",
-                level="WARN",
-                message="Dispatcher thread failed to stop within 2 seconds",
-                status_code="DL_DISPATCHER_STOP_TIMEOUT",
-            )
+        return stop_download_manager(self)

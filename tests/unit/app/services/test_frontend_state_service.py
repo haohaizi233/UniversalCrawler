@@ -1862,8 +1862,9 @@ class FrontendStateServiceTests(unittest.TestCase):
             def queue_upsert(self, records):
                 self.calls.append([dict(record) for record in records])
 
-            def shutdown(self) -> None:
-                return None
+            def shutdown(self, *, timeout: float = 1.0) -> bool:
+                del timeout
+                return True
 
         store = CollectingFailedRecordStore()
         item = VideoItem(url="https://example.com", title="failed", source="bilibili")
@@ -1891,8 +1892,9 @@ class FrontendStateServiceTests(unittest.TestCase):
             def queue_upsert(self, records):
                 self.calls.append([dict(record) for record in records])
 
-            def shutdown(self) -> None:
-                return None
+            def shutdown(self, *, timeout: float = 1.0) -> bool:
+                del timeout
+                return True
 
         store = CollectingFailedRecordStore()
         item = VideoItem(url="https://example.com", title="failed", source="bilibili")
@@ -1977,8 +1979,9 @@ class FrontendStateServiceTests(unittest.TestCase):
             def snapshot_total_count(self):
                 return len(self._rows)
 
-            def shutdown(self) -> None:
-                return None
+            def shutdown(self, *, timeout: float = 1.0) -> bool:
+                del timeout
+                return True
 
         store = SnapshotFailedRecordStore()
         service = FrontendStateService(SimpleNamespace(videos={}), failed_record_store=store)
@@ -2105,6 +2108,7 @@ class FrontendStateServiceTests(unittest.TestCase):
         store.delete_record.return_value = True
         store.records_snapshot.return_value = []
         store.snapshot_total_count = 0
+        store.shutdown.return_value = True
         service = FrontendStateService(controller, failed_record_store=store)
         try:
             result = service.handle_action("delete_failed_record", {"id": item.id})
@@ -2166,6 +2170,7 @@ class FrontendStateServiceTests(unittest.TestCase):
         store.clear_records.return_value = 2
         store.records_snapshot.return_value = []
         store.snapshot_total_count = 0
+        store.shutdown.return_value = True
         service = FrontendStateService(controller, failed_record_store=store)
         try:
             result = service.handle_action("clear_failed_records", {})

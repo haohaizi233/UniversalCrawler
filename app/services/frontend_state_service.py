@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import functools
 import os
 import threading
 import time
@@ -49,6 +50,8 @@ from app.services.metadata_probe_queue import MetadataProbeQueue
 from app.services.metadata_retry_tracker import MetadataRetryTracker
 from app.services.tool_runner_service import ToolRunnerService
 from app.services.frontend_action_result import FrontendActionResult
+from app.services.frontend_link_candidate_admission import handle_frontend_link_candidate_admission
+from app.services.frontend_state_shutdown import destroy_frontend_state_service
 from app.services.frontend_toolbox_state import FrontendToolboxStateMixin
 from app.utils.filenames import sanitize_filename
 from app.utils.safe_slot import safe_slot
@@ -92,7 +95,6 @@ class FrontendStateService(FrontendToolboxStateMixin):
     APP_STATE_PENDING_EVENTS_LIMIT = 4096
     APP_STATE_ASYNC_DELIVERY_TIMEOUT_SECONDS = 0.2
     GUI_RUNTIME_APPLY_TIMEOUT_SECONDS = 1.0
-
     def __init__(
         self,
         controller: Any | None = None,
@@ -110,6 +112,7 @@ class FrontendStateService(FrontendToolboxStateMixin):
         tool_runner_service: ToolRunnerService | None = None,
         execution_profile: ExecutionProfile | None = None,
         execution_profile_provider: Callable[[], ExecutionProfile] | None = None,
+        link_candidate_admission_coordinator: Any | None = None,
     ) -> None:
         self.controller = controller
         self.config = config_manager
@@ -127,6 +130,9 @@ class FrontendStateService(FrontendToolboxStateMixin):
         self.media_metadata_service = media_metadata_service or MediaMetadataService()
         self._frontend_event_emitter = frontend_event_emitter
         self._destroyed = False
+        self._destroy_lock = threading.RLock()
+        self._shutdown_completed = False
+        self._shutdown_completed_steps: set[str] = set()
         self.failed_record_store = failed_record_store or FailedRecordStore()
         self._failed_record_write_signatures: dict[str, tuple[Any, ...]] = {}
         self._failed_log_excerpt_cache: dict[str, tuple[tuple[str, str, str], list[dict[str, Any]]]] = {}
@@ -159,6 +165,7 @@ class FrontendStateService(FrontendToolboxStateMixin):
                 "media_metadata_service": self.media_metadata_service,
             },
         )
+        self._link_candidate_admission_coordinator = link_candidate_admission_coordinator
         # AppState 可能异步投递事件；先排队，再在构建快照/增量前统一落到聚合器。
         self._pending_app_state_events: deque[Any] = deque()
         self._pending_app_state_events_overflowed = False
@@ -349,67 +356,11 @@ class FrontendStateService(FrontendToolboxStateMixin):
         with self._delta_lock:
             self._event_aggregator.reset()
 
-    def destroy(self) -> None:
-        """退订所有 EventBus 订阅，释放资源。应在 FSS 不再使用时调用。"""
-        self._destroyed = True
-        if self._app_state_event_handler is not None:
-            try:
-                self.app_state.event_bus.unsubscribe("app_state.changed", self._app_state_event_handler)
-            except Exception as exc:
-                debug_logger.log_exception(
-                    "FrontendStateService",
-                    "destroy.unsubscribe.app_state",
-                    exc,
-                )
-            self._app_state_event_handler = None
-        if self._config_event_handler is not None:
-            unsubscribe = getattr(self.config, "unsubscribe", None)
-            if callable(unsubscribe):
-                try:
-                    unsubscribe("config.changed", self._config_event_handler)
-                except Exception as exc:
-                    debug_logger.log_exception(
-                        "FrontendStateService",
-                        "destroy.unsubscribe.config",
-                        exc,
-                    )
-            self._config_event_handler = None
-        if self._config_external_sync_started:
-            stop_external_sync = getattr(self.config, "stop_external_sync", None)
-            if callable(stop_external_sync):
-                try:
-                    stop_external_sync()
-                except Exception as exc:
-                    debug_logger.log_exception(
-                        "FrontendStateService",
-                        "destroy.stop_external_config_sync",
-                        exc,
-                    )
-            self._config_external_sync_started = False
-        self._metadata_retry_tracker.cancel_all(clear_failures=True)
-        self._cancel_metadata_probe_queue(close=True)
-        with self._delta_lock:
-            self._pending_app_state_events.clear()
-            self._pending_app_state_events_overflowed = False
-        self._file_log_cache_store.shutdown()
-        self.failed_record_store.shutdown()
-        if self._owns_tool_runner_service:
-            try:
-                self.tool_runner_service.shutdown(wait=True, timeout=1.0)
-            except (OSError, RuntimeError, AttributeError) as exc:
-                debug_logger.log_exception(
-                    "FrontendStateService",
-                    "destroy.tool_runner",
-                    exc,
-                )
-        if self._owns_media_metadata_service:
-            shutdown_metadata_service = getattr(self.media_metadata_service, "shutdown", None)
-            if callable(shutdown_metadata_service):
-                shutdown_metadata_service()
-        if self._owns_app_state:
-            shutdown = getattr(self.app_state, "shutdown", None)
-            if callable(shutdown):
-                shutdown()
+    def destroy(self) -> bool:
+        """Release resources; ``False`` means a process-exit guardian is draining."""
+
+        with self._destroy_lock:
+            return destroy_frontend_state_service(self)
 
     @property
     def frontend_version(self) -> int:
@@ -744,7 +695,7 @@ class FrontendStateService(FrontendToolboxStateMixin):
         if self._destroyed:
             return FrontendActionResult("error", "frontend state service destroyed").to_dict()
         execution_profile: ExecutionProfile | None = None
-        if action in self._TOOL_ACTIONS:
+        if action in self._TOOL_ACTIONS or action == "tool_admit_candidates":
             execution_profile = self._capture_tool_execution_profile()
             if not execution_profile.allow_tool_execution:
                 return dict(self._TOOL_RUN_DISABLED_RESULT)
@@ -768,6 +719,7 @@ class FrontendStateService(FrontendToolboxStateMixin):
             "tool_start": self._action_tool_start,
             "tool_cancel": self._action_tool_cancel,
             "tool_open_result": self._action_tool_open_result,
+            "tool_admit_candidates": functools.partial(handle_frontend_link_candidate_admission, self),
             "tool_clear_history": self._action_tool_clear_history,
             "tool_reload": self._action_tool_reload,
             "run_tool": self._action_run_tool,

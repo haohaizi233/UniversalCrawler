@@ -6,10 +6,12 @@ import json
 import sqlite3
 import threading
 import time
+from collections.abc import Iterable
 from contextlib import closing, contextmanager
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from itertools import islice
 from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping
 
@@ -38,6 +40,240 @@ class FailedRecordQueryResult:
     offset: int
 
 
+_MAX_PAYLOAD_DEPTH = 6
+_MAX_PAYLOAD_ITEMS = 128
+_MAX_PAYLOAD_NODES = 512
+_MAX_PAYLOAD_TEXT_CHARS = 32_768
+_MAX_PAYLOAD_VALUE_CHARS = 4_096
+_MAX_UPSERT_BATCH_RECORDS = 1_024
+_MAX_JSON_SAFE_INTEGER = (1 << 53) - 1
+_INTEGER_OUT_OF_RANGE_VALUE = "[integer-out-of-range]"
+_UNSUPPORTED_PAYLOAD_VALUE = "[unsupported]"
+_TRUNCATED_PAYLOAD_VALUE = "[truncated]"
+_IDENTITY_FIELD_KEYS = ("id", "video_id")
+_PAYLOAD_MARKER_VALUES = frozenset(
+    {
+        _INTEGER_OUT_OF_RANGE_VALUE,
+        _UNSUPPORTED_PAYLOAD_VALUE,
+        _TRUNCATED_PAYLOAD_VALUE,
+    }
+)
+_RECORD_FIELD_KEYS = (
+    *_IDENTITY_FIELD_KEYS,
+    "title",
+    "reason",
+    "reason_label",
+    "failed_at",
+    "failed_at_table",
+    "status",
+    "status_label",
+    "platform",
+    "platform_label",
+    "trace_id",
+)
+_RECORD_FIELD_PRIORITY = {key: index for index, key in enumerate(_RECORD_FIELD_KEYS)}
+
+
+def _bounded_payload_text(value: str, budget: list[int]) -> str:
+    allowed = min(_MAX_PAYLOAD_VALUE_CHARS, max(0, budget[1]))
+    try:
+        text = str.__getitem__(value, slice(0, allowed))
+    except BaseException:
+        return _UNSUPPORTED_PAYLOAD_VALUE
+    text = "".join("\ufffd" if "\ud800" <= char <= "\udfff" else char for char in text)
+    budget[1] -= len(text)
+    return text
+
+
+def _payload_sort_key(value: Any) -> str:
+    try:
+        return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    except BaseException:
+        return _UNSUPPORTED_PAYLOAD_VALUE
+
+
+def _json_safe_identity_value(value: Any) -> Any:
+    if value is None or isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        try:
+            normalized_integer = int(value)
+        except BaseException:
+            return _UNSUPPORTED_PAYLOAD_VALUE
+        if -_MAX_JSON_SAFE_INTEGER <= normalized_integer <= _MAX_JSON_SAFE_INTEGER:
+            return normalized_integer
+        return _INTEGER_OUT_OF_RANGE_VALUE
+    if not isinstance(value, str):
+        return _UNSUPPORTED_PAYLOAD_VALUE
+    try:
+        if str.__len__(value) > _MAX_PAYLOAD_VALUE_CHARS:
+            return _TRUNCATED_PAYLOAD_VALUE
+        text = str.__getitem__(value, slice(0, _MAX_PAYLOAD_VALUE_CHARS + 1))
+    except BaseException:
+        return _UNSUPPORTED_PAYLOAD_VALUE
+    if any("\ud800" <= char <= "\udfff" for char in text):
+        return _UNSUPPORTED_PAYLOAD_VALUE
+    return text
+
+
+def _json_safe_payload_iterable(value: Iterable[Any], *, depth: int, budget: list[int]) -> Any:
+    try:
+        iterator = iter(value)
+    except BaseException:
+        return _UNSUPPORTED_PAYLOAD_VALUE
+    projected: list[Any] = []
+    for index in range(_MAX_PAYLOAD_ITEMS + 1):
+        if budget[0] <= 0 or budget[1] <= 0:
+            projected.append(_TRUNCATED_PAYLOAD_VALUE)
+            break
+        try:
+            item = next(iterator)
+        except StopIteration:
+            break
+        except BaseException:
+            return _UNSUPPORTED_PAYLOAD_VALUE
+        if index == _MAX_PAYLOAD_ITEMS:
+            projected.append(_TRUNCATED_PAYLOAD_VALUE)
+            break
+        projected.append(
+            _json_safe_payload_value(
+                item,
+                depth=depth + 1,
+                budget=budget,
+            )
+        )
+    return projected
+
+
+def _json_safe_payload_value(value: Any, *, depth: int, budget: list[int]) -> Any:
+    if budget[0] <= 0 or budget[1] <= 0:
+        return _TRUNCATED_PAYLOAD_VALUE
+    budget[0] -= 1
+    if value is None or isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        try:
+            normalized_integer = int(value)
+        except BaseException:
+            return _UNSUPPORTED_PAYLOAD_VALUE
+        if -_MAX_JSON_SAFE_INTEGER <= normalized_integer <= _MAX_JSON_SAFE_INTEGER:
+            return normalized_integer
+        return _INTEGER_OUT_OF_RANGE_VALUE
+    if isinstance(value, float):
+        return value if value == value and value not in {float("inf"), float("-inf")} else None
+    if isinstance(value, str):
+        return _bounded_payload_text(value, budget)
+    if isinstance(value, bytes):
+        try:
+            decoded = bytes.decode(value, "utf-8", errors="replace")
+        except BaseException:
+            return _UNSUPPORTED_PAYLOAD_VALUE
+        return _bounded_payload_text(decoded, budget)
+    if isinstance(value, Path):
+        try:
+            path_text = str(value)
+        except BaseException:
+            return _UNSUPPORTED_PAYLOAD_VALUE
+        return _bounded_payload_text(path_text, budget)
+    if depth >= _MAX_PAYLOAD_DEPTH:
+        return _TRUNCATED_PAYLOAD_VALUE
+    if isinstance(value, Mapping):
+        items: list[tuple[str, Any]] = []
+        seen_keys: set[str] = set()
+        for key in _RECORD_FIELD_KEYS:
+            try:
+                raw_value = value[key]
+            except BaseException:
+                continue
+            bounded_key = _bounded_payload_text(key, budget)
+            if not bounded_key:
+                break
+            items.append((bounded_key, raw_value))
+            seen_keys.add(bounded_key)
+        remaining_items = max(0, _MAX_PAYLOAD_ITEMS - len(items))
+        if remaining_items:
+            try:
+                raw_items = value.items()
+                for raw_key, raw_value in islice(raw_items, remaining_items):
+                    if isinstance(raw_key, str):
+                        key = _bounded_payload_text(raw_key, budget)
+                    elif isinstance(raw_key, (bool, int)):
+                        key = _bounded_payload_text(str(raw_key), budget)
+                    else:
+                        continue
+                    if key and key not in seen_keys:
+                        items.append((key, raw_value))
+                        seen_keys.add(key)
+            except BaseException:
+                pass
+        items.sort(
+            key=lambda item: (
+                _RECORD_FIELD_PRIORITY.get(item[0], len(_RECORD_FIELD_PRIORITY)),
+                item[0],
+            )
+        )
+        projected_mapping: dict[str, Any] = {}
+        for key, raw_value in items:
+            if depth == 0 and key in _IDENTITY_FIELD_KEYS:
+                projected_mapping[key] = _json_safe_identity_value(raw_value)
+                continue
+            if budget[0] <= 0 or budget[1] <= 0:
+                break
+            projected_mapping[key] = _json_safe_payload_value(
+                raw_value,
+                depth=depth + 1,
+                budget=budget,
+            )
+        return projected_mapping
+    if isinstance(value, (set, frozenset)):
+        try:
+            if len(value) > _MAX_PAYLOAD_ITEMS:
+                return _TRUNCATED_PAYLOAD_VALUE
+        except BaseException:
+            return _UNSUPPORTED_PAYLOAD_VALUE
+        projected = _json_safe_payload_iterable(value, depth=depth, budget=budget)
+        if not isinstance(projected, list):
+            return projected
+        return sorted(projected, key=_payload_sort_key)
+    if isinstance(value, Iterable):
+        return _json_safe_payload_iterable(value, depth=depth, budget=budget)
+    return _UNSUPPORTED_PAYLOAD_VALUE
+
+
+def _json_safe_payload(record: Mapping[str, Any]) -> dict[str, Any]:
+    budget = [_MAX_PAYLOAD_NODES, _MAX_PAYLOAD_TEXT_CHARS]
+    projected = _json_safe_payload_value(record, depth=0, budget=budget)
+    return projected if isinstance(projected, dict) else {}
+
+
+def _record_text(payload: Mapping[str, Any], *keys: str) -> str:
+    for key in keys:
+        value = payload.get(key)
+        if isinstance(value, str) and value:
+            return value[:_MAX_PAYLOAD_VALUE_CHARS]
+        if isinstance(value, (bool, int, float)):
+            return str(value)[:_MAX_PAYLOAD_VALUE_CHARS]
+    return ""
+
+
+def _record_identity_text(payload: Mapping[str, Any]) -> str:
+    for key in _IDENTITY_FIELD_KEYS:
+        value = payload.get(key)
+        if isinstance(value, str):
+            if (
+                value
+                and value not in _PAYLOAD_MARKER_VALUES
+                and len(value) <= _MAX_PAYLOAD_VALUE_CHARS
+                and not any("\ud800" <= char <= "\udfff" for char in value)
+            ):
+                return value
+            continue
+        if isinstance(value, int) and not isinstance(value, bool):
+            if -_MAX_JSON_SAFE_INTEGER <= value <= _MAX_JSON_SAFE_INTEGER:
+                return str(value)
+    return ""
+
+
 class FailedRecordStore:
     """后台按 video_id 合并写入，并只保留最新刷新请求，避免 UI 查询持续堆积。"""
 
@@ -62,7 +298,13 @@ class FailedRecordStore:
         self._pending: dict[str, dict[str, Any]] = {}
         self._inflight_ids: set[str] = set()
         self._write_generation = 0
+        self._next_record_generation = 0
         self._record_generations: dict[str, int] = {}
+        self._write_failure_count = 0
+        self._last_write_error_log_at = 0.0
+        self._write_retry_base_seconds = 0.05
+        self._write_retry_max_seconds = 1.0
+        self._write_error_log_interval_seconds = 30.0
         initial_query = FailedRecordQuery(limit=max(1, int(snapshot_limit)), offset=0)
         self._refresh_requested: FailedRecordQuery | None = None
         self._prune_retention_days: int | None = None
@@ -80,22 +322,45 @@ class FailedRecordStore:
     def db_path(self) -> Path:
         return self._db_path
 
-    def queue_upsert(self, records: list[Mapping[str, Any]]) -> None:
+    def queue_upsert(self, records: Iterable[Mapping[str, Any]]) -> None:
         """合并同 video_id 的待写入记录，避免失败列表刷新时重复写库。"""
-        normalized = [self._normalize_record(record) for record in records]
-        normalized = [record for record in normalized if record.get("video_id")]
+        try:
+            iterator = iter(records)
+        except BaseException:
+            return
+        normalized: list[dict[str, Any]] = []
+        # The limit+1 item is a truncation sentinel; it and the remaining tail are dropped.
+        for index in range(_MAX_UPSERT_BATCH_RECORDS + 1):
+            try:
+                record = next(iterator)
+            except StopIteration:
+                break
+            except BaseException:
+                break
+            if index == _MAX_UPSERT_BATCH_RECORDS:
+                break
+            try:
+                normalized_record = self._normalize_record(record)
+            except BaseException:
+                continue
+            if normalized_record.get("video_id"):
+                normalized.append(normalized_record)
         if not normalized:
             return
-        with self._lock:
-            if self._shutdown:
-                return
-            for record in normalized:
-                video_id = str(record["video_id"])
-                record["_store_generation"] = self._write_generation
-                record["_store_record_generation"] = self._record_generations.get(video_id, 0)
-                self._pending[video_id] = record
-            self._ensure_worker_locked()
-            self._event.set()
+        with self._db_mutation_lock:
+            with self._lock:
+                if self._shutdown:
+                    return
+                for record in normalized:
+                    video_id = str(record["video_id"])
+                    self._next_record_generation += 1
+                    record_generation = self._next_record_generation
+                    self._record_generations[video_id] = record_generation
+                    record["_store_generation"] = self._write_generation
+                    record["_store_record_generation"] = record_generation
+                    self._pending[video_id] = record
+                self._ensure_worker_locked()
+                self._event.set()
 
     def query(self, *, limit: int = 100, offset: int = 0) -> list[dict[str, Any]]:
         """仅供维护路径同步查询；UI 应读取 records_snapshot，避免阻塞渲染线程。"""
@@ -261,7 +526,8 @@ class FailedRecordStore:
                 pending = self._pending.pop(normalized_id, None) is not None
                 inflight = normalized_id in self._inflight_ids
                 if inflight:
-                    self._record_generations[normalized_id] = self._record_generations.get(normalized_id, 0) + 1
+                    self._next_record_generation += 1
+                    self._record_generations[normalized_id] = self._next_record_generation
         snapshot_changed, visible_count, total_count = self._remove_from_snapshot(normalized_id, deleted=deleted)
         if snapshot_changed:
             self._notify_refresh(visible_count, total_count)
@@ -328,7 +594,8 @@ class FailedRecordStore:
             return False
         if thread.is_alive():
             thread.join(timeout=wait_timeout)
-        return not thread.is_alive()
+        with self._lock:
+            return not thread.is_alive() and self._is_drained_locked()
 
     def _ensure_worker_locked(self) -> None:
         if self._thread is not None and self._thread.is_alive():
@@ -371,40 +638,52 @@ class FailedRecordStore:
                 if batch:
                     try:
                         self._write_batch(batch)
-                    except Exception as exc:
+                    except BaseException as exc:
                         write_failed = True
-                        debug_logger.log_exception(
-                            "FailedRecordStore",
-                            "write_batch",
-                            exc,
-                            details={"count": len(batch), "db_path": str(self._db_path)},
-                        )
+                        retry_delay, should_log = self._restore_failed_batch(batch)
+                        if should_log:
+                            self._log_write_failure_best_effort(exc, len(batch))
+                        self._wait_before_write_retry(retry_delay)
+                    else:
+                        self._reset_write_retry_state()
                 if prune_retention_days is not None:
                     try:
                         deleted_count = self.prune_expired(prune_retention_days)
                         if deleted_count:
-                            debug_logger.log(
-                                "FailedRecordStore",
+                            self._log_best_effort(
                                 "failed_record_prune",
-                                message=f"Pruned {deleted_count} expired failed records",
-                                details={"count": deleted_count, "retention_days": prune_retention_days},
+                                message_factory=lambda: f"Pruned {deleted_count} expired failed records",
+                                details_factory=lambda: {
+                                    "count": int(deleted_count),
+                                    "retention_days": int(prune_retention_days),
+                                },
                             )
                     except Exception as exc:
-                        debug_logger.log_exception(
-                            "FailedRecordStore",
+                        self._log_exception_best_effort(
                             "prune_expired",
                             exc,
-                            details={"retention_days": prune_retention_days, "db_path": str(self._db_path)},
+                            details_factory=lambda: {
+                                "retention_days": int(prune_retention_days),
+                                "db_path": str(self._db_path),
+                            },
+                        )
+                    except BaseException as exc:
+                        self._log_exception_best_effort(
+                            "prune_expired",
+                            exc,
+                            details_factory=lambda: {
+                                "retention_days": int(prune_retention_days),
+                                "db_path": str(self._db_path),
+                            },
                         )
                 if refresh_request is not None and not write_failed:
                     try:
                         self._refresh_snapshot(refresh_request)
-                    except Exception as exc:
-                        debug_logger.log_exception(
-                            "FailedRecordStore",
+                    except BaseException as exc:
+                        self._log_exception_best_effort(
                             "refresh_snapshot_unhandled",
                             exc,
-                            details={
+                            details_factory=lambda: {
                                 "query": refresh_request.__dict__,
                                 "db_path": str(self._db_path),
                             },
@@ -431,6 +710,102 @@ class FailedRecordStore:
             or self._refresh_requested is not None
             or self._prune_retention_days is not None
         )
+
+    def _is_drained_locked(self) -> bool:
+        return bool(
+            not self._pending
+            and not self._writing
+            and not self._refreshing
+            and not self._pruning
+            and self._refresh_requested is None
+            and self._prune_retention_days is None
+        )
+
+    def _restore_failed_batch(self, batch: list[dict[str, Any]]) -> tuple[float, bool]:
+        now = time.monotonic()
+        with self._lock:
+            for record in batch:
+                video_id = str(record.get("video_id") or "")
+                if not video_id:
+                    continue
+                if int(record.get("_store_generation", -1)) != self._write_generation:
+                    continue
+                if int(record.get("_store_record_generation", -1)) != self._record_generations.get(video_id, 0):
+                    continue
+                self._pending.setdefault(video_id, record)
+            self._write_failure_count += 1
+            retry_power = min(self._write_failure_count - 1, 8)
+            retry_delay = min(
+                max(0.0, float(self._write_retry_max_seconds)),
+                max(0.0, float(self._write_retry_base_seconds)) * (2**retry_power),
+            )
+            log_interval = max(0.0, float(self._write_error_log_interval_seconds))
+            should_log = (
+                self._write_failure_count == 1
+                or now - self._last_write_error_log_at >= log_interval
+            )
+            if should_log:
+                self._last_write_error_log_at = now
+            retry_needed = bool(self._pending)
+        return (retry_delay if retry_needed else 0.0), should_log
+
+    def _reset_write_retry_state(self) -> None:
+        with self._lock:
+            self._write_failure_count = 0
+            self._last_write_error_log_at = 0.0
+
+    def _log_write_failure_best_effort(self, exc: BaseException, count: int) -> None:
+        self._log_exception_best_effort(
+            "write_batch",
+            exc,
+            details_factory=lambda: {
+                "count": int(count),
+                "db_path": str(self._db_path),
+            },
+        )
+
+    @staticmethod
+    def _log_best_effort(
+        action: str,
+        *,
+        message_factory: Callable[[], str],
+        details_factory: Callable[[], Mapping[str, Any]],
+    ) -> None:
+        try:
+            debug_logger.log(
+                "FailedRecordStore",
+                action,
+                message=message_factory(),
+                details=details_factory(),
+            )
+        except BaseException:
+            return
+
+    @staticmethod
+    def _log_exception_best_effort(
+        action: str,
+        exc: BaseException,
+        *,
+        details_factory: Callable[[], Mapping[str, Any]],
+    ) -> None:
+        try:
+            debug_logger.log_exception(
+                "FailedRecordStore",
+                action,
+                exc,
+                details=details_factory(),
+            )
+        except BaseException:
+            return
+
+    @staticmethod
+    def _wait_before_write_retry(delay: float) -> None:
+        if delay <= 0:
+            return
+        try:
+            time.sleep(delay)
+        except BaseException:
+            return
 
     @contextmanager
     def _open_connection(self) -> Iterator[sqlite3.Connection]:
@@ -502,12 +877,14 @@ class FailedRecordStore:
         """根据最近一次查询刷新内存快照，并只在内容变化时通知前端。"""
         try:
             rows, total_count = self._query_rows(request)
-        except (OSError, sqlite3.Error, RuntimeError) as exc:
-            debug_logger.log_exception(
-                "FailedRecordStore",
+        except BaseException as exc:
+            self._log_exception_best_effort(
                 "refresh_snapshot",
                 exc,
-                details={"query": request.__dict__, "db_path": str(self._db_path)},
+                details_factory=lambda: {
+                    "query": request.__dict__,
+                    "db_path": str(self._db_path),
+                },
             )
             return
         with self._snapshot_lock:
@@ -547,7 +924,7 @@ class FailedRecordStore:
                     str(record.get("status") or ""),
                     str(record.get("platform") or ""),
                     str(record.get("trace_id") or ""),
-                    json.dumps(record.get("payload") or record, ensure_ascii=False),
+                    str(record.get("payload_json") or "{}"),
                     now,
                 )
                 for record in records
@@ -598,27 +975,40 @@ class FailedRecordStore:
             return
         try:
             callback(int(count))
-        except Exception as exc:
-            debug_logger.log_exception(
-                "FailedRecordStore",
+        except BaseException as exc:
+            self._log_exception_best_effort(
                 "refresh_callback",
                 exc,
-                details={"count": int(count), "total_count": int(total_count)},
+                details_factory=lambda: {
+                    "count": int(count),
+                    "total_count": int(total_count),
+                },
             )
 
     @staticmethod
     def _normalize_record(record: Mapping[str, Any]) -> dict[str, Any]:
         """把不同前端投影字段统一到失败记录表字段。"""
-        payload = deepcopy(dict(record or {}))
+        payload = _json_safe_payload(record)
+        try:
+            payload_json = json.dumps(
+                payload,
+                ensure_ascii=False,
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        except BaseException:
+            payload_json = "{}"
         return {
-            "video_id": str(payload.get("id") or payload.get("video_id") or ""),
-            "title": str(payload.get("title") or ""),
-            "reason": str(payload.get("reason") or payload.get("reason_label") or ""),
-            "failed_at": str(payload.get("failed_at") or payload.get("failed_at_table") or ""),
-            "status": str(payload.get("status") or payload.get("status_label") or ""),
-            "platform": str(payload.get("platform") or payload.get("platform_label") or ""),
-            "trace_id": str(payload.get("trace_id") or ""),
+            "video_id": _record_identity_text(payload),
+            "title": _record_text(payload, "title"),
+            "reason": _record_text(payload, "reason", "reason_label"),
+            "failed_at": _record_text(payload, "failed_at", "failed_at_table"),
+            "status": _record_text(payload, "status", "status_label"),
+            "platform": _record_text(payload, "platform", "platform_label"),
+            "trace_id": _record_text(payload, "trace_id"),
             "payload": payload,
+            "payload_json": payload_json,
         }
 
     @staticmethod

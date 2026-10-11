@@ -6,7 +6,6 @@ import sys
 import threading
 import time
 
-from dataclasses import dataclass, field
 from pathlib import Path
 from PyQt6.QtCore import QByteArray, QEvent, QPoint, QRect, QSignalBlocker, QSize, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QCursor, QFont, QPalette
@@ -27,7 +26,6 @@ from app.services.update_check_service import (
     UPDATE_STATUS_UNTRUSTED,
     UPDATE_PUBLIC_KEY_PEM,
     UPDATE_REQUIRE_OS_SIGNATURE,
-    PreparedUpdate,
     UpdateCheckResult,
     check_secure_update,
     launch_prepared_update,
@@ -49,6 +47,13 @@ from app.ui.dialogs.update_check import UpdateCheckDialog, UpdateDownloadDialog
 from app.ui.layout.app_shell import AppShell
 from app.ui.layout.window_chrome import WindowChromeFrame
 from app.ui.layout.window_chrome_controller import FramelessWindowChromeController, _NCCALCSIZE_PARAMS  # noqa: F401
+from app.ui.main_window_shutdown import shutdown_main_window
+from app.ui.main_window_update_install import install_prepared_update
+from app.ui.main_window_update_types import (
+    _PreparedUpdate,
+    _UpdateCheckOutcome,
+    _UpdateCheckRequest,
+)
 from shared.localization import normalize_language, tr
 from shared.release_identity import ReleaseIdentity, load_runtime_release_identity
 from shared.version import format_version_label
@@ -76,32 +81,6 @@ from app.ui.viewmodels.latest_worker import LatestRequestWorker
 from app.utils.qt_runtime import load_qt_icon
 from app.utils.runtime_paths import user_data_root
 from app.utils.safe_slot import safe_slot
-
-@dataclass(frozen=True)
-class _UpdateCheckRequest:
-    sequence: int
-    local_version: str
-    local_revision: int = 0
-
-
-@dataclass(frozen=True)
-class _UpdateCheckOutcome:
-    sequence: int
-    result: UpdateCheckResult | None = None
-    error: str = ""
-
-
-@dataclass(frozen=True)
-class _PreparedUpdate:
-    installer_path: str
-    manifest_path: str
-    signature_path: str
-    version: str
-    log_path: str
-    release_revision: int = 0
-    revision_authorization_path: str = ""
-    revision_authorization_token: str = field(default="", repr=False)
-
 
 class MainWindow(QMainWindow):
     """转发用户动作并渲染前端快照的轻量 GUI 宿主。"""
@@ -324,6 +303,8 @@ class MainWindow(QMainWindow):
         self._update_download_dialog: UpdateDownloadDialog | None = None
         self._last_update_result: UpdateCheckResult | None = None
         self._prepared_update: _PreparedUpdate | None = None
+        self._update_install_in_progress = False
+        self._update_install_claim_sequence: int | None = None
         window_state_persistence.initialize_window_state_persistence(self)
 
         self._build_ui()
@@ -756,6 +737,7 @@ class MainWindow(QMainWindow):
             local_version=local_version,
             latest_version=latest_version,
             release_url=result.html_url,
+            selected_candidate_id=result.selected_identity.candidate_id,
             candidates=result.candidates,
             language=self._current_ui_language(),
         )
@@ -845,6 +827,8 @@ class MainWindow(QMainWindow):
             self._last_update_result = result
             self._last_update_allow_downgrade = bool(allow_downgrade)
             self._prepared_update = None
+            self._update_install_in_progress = False
+            self._update_install_claim_sequence = None
             self._update_download_cancel_event = cancel_event
 
         previous_dialog = self.__dict__.get("_update_download_dialog")
@@ -994,30 +978,11 @@ class MainWindow(QMainWindow):
         )
 
     def _install_prepared_update(self) -> None:
-        prepared = self.__dict__.get("_prepared_update")
-        if not isinstance(prepared, _PreparedUpdate):
-            self._show_update_check_error("更新安装包尚未准备好。")
-            return
-        try:
-            launch_prepared_update(
-                PreparedUpdate(
-                    installer_path=prepared.installer_path,
-                    manifest_path=prepared.manifest_path,
-                    signature_path=prepared.signature_path,
-                    version=prepared.version,
-                    log_path=prepared.log_path,
-                    release_revision=prepared.release_revision,
-                    revision_authorization_path=prepared.revision_authorization_path,
-                    revision_authorization_token=prepared.revision_authorization_token,
-                ),
-                restart_argv=self._restart_argv_after_update(),
-            )
-        except Exception as exc:
-            self._show_update_check_error(str(exc))
-            self.append_log(f"更新安装程序启动失败: {exc}", level="ERROR")
-            return
-        self.append_log("更新安装程序已启动，应用即将退出。")
-        QTimer.singleShot(250, self.close)
+        install_prepared_update(
+            self,
+            launch=launch_prepared_update,
+            schedule_close=QTimer.singleShot,
+        )
 
     @staticmethod
     def _restart_argv_after_update() -> list[str]:
@@ -1217,22 +1182,85 @@ class MainWindow(QMainWindow):
         self._repair_black_shell_if_needed("_on_frontend_snapshot_finished")
 
     def _submit_frontend_action(self, action: str, payload: dict[str, object] | None = None) -> bool:
+        action = str(action or "")
+        request_payload = dict(payload or {})
         service = self.__dict__.get("_frontend_state_service")
         worker = self.__dict__.get("_frontend_action_worker")
         if service is None or worker is None:
+            if action == "tool_admit_candidates":
+                self._reject_tool_action_submission(
+                    action,
+                    request_payload,
+                    sequence=None,
+                    unavailable=True,
+                )
             return False
         # 设置保存、打开目录和失败重试交给 worker，UI 信号槽只分发请求与处理结果。
         self._frontend_action_sequence = int(self.__dict__.get("_frontend_action_sequence", 0) or 0) + 1
-        worker.submit(
-            FrontendActionRequest(
-                sequence=self._frontend_action_sequence,
-                service=service,
-                service_token=id(service),
-                action=str(action or ""),
-                payload=dict(payload or {}),
+        sequence = self._frontend_action_sequence
+        try:
+            if action == "tool_admit_candidates":
+                toolbox_page = getattr(getattr(self, "app_shell", None), "pages", {}).get("toolbox")
+                bind_action_request = getattr(toolbox_page, "bind_action_request", None)
+                if callable(bind_action_request):
+                    bind_action_request(action, request_payload, sequence=sequence)
+            accepted = worker.submit(
+                FrontendActionRequest(
+                    sequence=sequence,
+                    service=service,
+                    service_token=id(service),
+                    action=action,
+                    payload=request_payload,
+                )
             )
-        )
+            if accepted is not True:
+                self._reject_tool_action_submission(
+                    action,
+                    request_payload,
+                    sequence=sequence,
+                    unavailable=False,
+                )
+                return False
+        except BaseException as primary:
+            if action != "tool_admit_candidates":
+                raise
+            self._reject_tool_action_submission(
+                action,
+                request_payload,
+                sequence=sequence,
+                unavailable=False,
+            )
+            if not isinstance(primary, Exception):
+                raise primary
+            return False
         return True
+
+    def _reject_tool_action_submission(
+        self,
+        action: str,
+        payload: dict[str, object],
+        *,
+        sequence: int | None,
+        unavailable: bool,
+    ) -> None:
+        code = "tool_action_unavailable" if unavailable else "tool_action_submit_failed"
+        message = "tool action service is unavailable" if unavailable else "tool action submission failed"
+        result = {"status": "error", "message": message, "data": {"code": code}}
+        try:
+            toolbox_page = getattr(getattr(self, "app_shell", None), "pages", {}).get("toolbox")
+            apply_result = getattr(toolbox_page, "apply_action_result", None)
+            if callable(apply_result):
+                apply_result(action, payload, result, sequence=sequence)
+        except BaseException:
+            pass
+        try:
+            self.append_log(message, level="ERROR")
+        except BaseException:
+            pass
+        try:
+            self.refresh_frontend_state(topics={"tools.action"})
+        except BaseException:
+            pass
 
     def _on_frontend_action_finished(self, result: FrontendActionResult) -> None:
         service = self.__dict__.get("_frontend_state_service")
@@ -1256,7 +1284,12 @@ class MainWindow(QMainWindow):
         elif result.action == "pause_download":
             self._finish_pause_download(action_result)
         elif result.action == "run_tool" or result.action.startswith("tool_"):
-            self._finish_tool_action(result.action, result.payload, action_result)
+            self._finish_tool_action(
+                result.action,
+                result.payload,
+                action_result,
+                sequence=result.sequence,
+            )
         elif result.action == "register_file_associations":
             self._finish_register_file_associations(action_result)
         elif result.action == "update_completed_metadata":
@@ -1325,8 +1358,10 @@ class MainWindow(QMainWindow):
     def _finish_tool_action(
         self,
         action: str,
-        _payload: dict[str, object],
+        payload: dict[str, object],
         action_result: dict[str, object],
+        *,
+        sequence: int | None = None,
     ) -> None:
         ok = action_result.get("status") == "ok"
         message = str(action_result.get("message") or f"tool action completed: {action}")
@@ -1337,6 +1372,14 @@ class MainWindow(QMainWindow):
         data = action_result.get("data") if isinstance(action_result, dict) else {}
         projection = data.get("toolbox_display_projection") if isinstance(data, dict) else None
         toolbox_page = getattr(getattr(self, "app_shell", None), "pages", {}).get("toolbox")
+        apply_action_result = getattr(toolbox_page, "apply_action_result", None)
+        if callable(apply_action_result):
+            apply_action_result(
+                action,
+                payload,
+                action_result,
+                sequence=sequence,
+            )
         apply_projection = getattr(toolbox_page, "apply_display_projection", None)
         if isinstance(projection, dict) and callable(apply_projection):
             apply_projection(projection)
@@ -2278,62 +2321,21 @@ class MainWindow(QMainWindow):
 
     @safe_slot
     def closeEvent(self, event) -> None:
-        ui_state_snapshot = window_state_persistence.capture_window_state(self)
-        # 先停止调度器和 worker 再销毁服务，避免后台线程回调已释放的 QObject。
-        update_download_lock = self.__dict__.get("_update_download_lock")
-        if update_download_lock is None:
-            update_download_lock = threading.RLock()
-            self._update_download_lock = update_download_lock
-        with update_download_lock:
-            self._update_download_shutdown = True
-            self._update_download_sequence = int(self.__dict__.get("_update_download_sequence", 0) or 0) + 1
-            update_cancel_event = self.__dict__.get("_update_download_cancel_event")
-        if update_cancel_event is not None:
-            update_cancel_event.set()
-        update_download_thread = self.__dict__.get("_update_download_thread")
-        is_alive = getattr(update_download_thread, "is_alive", None)
-        join = getattr(update_download_thread, "join", None)
-        if (
-            update_download_thread is not threading.current_thread()
-            and callable(is_alive)
-            and is_alive()
-            and callable(join)
-        ):
-            join(timeout=self.UPDATE_DOWNLOAD_SHUTDOWN_JOIN_SECONDS)
-        self._ui_update_scheduler.stop()
-        snapshot_worker = self.__dict__.get("_frontend_snapshot_worker")
-        if snapshot_worker is not None:
-            snapshot_worker.shutdown()
-        action_worker = self.__dict__.get("_frontend_action_worker")
-        if action_worker is not None:
-            action_worker.shutdown()
-        update_check_worker = self.__dict__.get("_update_check_worker")
-        if update_check_worker is not None:
-            update_check_worker.shutdown()
-        frontend_state_service = self.__dict__.get("_frontend_state_service")
-        if self.__dict__.get("_owns_frontend_state_service", False) and frontend_state_service is not None:
-            destroy_frontend_state = getattr(frontend_state_service, "destroy", None)
-            if callable(destroy_frontend_state):
-                destroy_frontend_state()
-        app_state = self.__dict__.get("app_state")
-        if self.__dict__.get("_owns_app_state", False) and app_state is not None:
-            shutdown_app_state = getattr(app_state, "shutdown", None)
-            if callable(shutdown_app_state):
-                shutdown_app_state()
-        self._connections.disconnect_all()
+        failure = shutdown_main_window(self, event)
+        if failure is None:
+            return
+        action, exc = failure
+        try:
+            debug_logger.log_exception(
+                "MainWindow",
+                f"close_event.{action}",
+                exc,  # type: ignore[arg-type]
+            )
+        except BaseException:
+            pass
+
+    def _uninstall_window_chrome(self) -> None:
         self._chrome_controller().uninstall()
-        app_shell = self.__dict__.get("app_shell")
-        shutdown_shell = getattr(app_shell, "shutdown", None)
-        if callable(shutdown_shell):
-            shutdown_shell()
-        else:
-            self.cleanup_media()
-        self.event_bus.unsubscribe("app_state.changed", self._app_state_handler)
-        event_bus_shutdown = getattr(self.event_bus, "shutdown", None)
-        if self.__dict__.get("_owns_event_bus", False) and callable(event_bus_shutdown):
-            event_bus_shutdown()
-        window_state_persistence.start_window_state_persistence(self, ui_state_snapshot, cfg.save_ui_state)
-        event.accept()
 
     def on_btn_start_clicked(self) -> None:
         if not self.current_plugin:

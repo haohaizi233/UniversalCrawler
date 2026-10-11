@@ -3,6 +3,7 @@
 import threading
 import time
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -13,6 +14,7 @@ from app.models import VideoItem
 from app.services.app_state import AppState
 from app.services.frontend_state_service import FrontendStateService
 from app.ui.main_window import MainWindow
+from app.ui.main_window_update_types import _PreparedUpdate
 from app.ui.viewmodels.frontend_action_worker import FrontendActionRequest, FrontendActionResult
 from app.ui.viewmodels.frontend_snapshot_worker import FrontendSnapshotResult, build_frontend_snapshot
 from shared.execution_profile import DEFAULT_LOCAL_TOOL_PERMISSIONS
@@ -32,6 +34,7 @@ class MainWindowTests(unittest.TestCase):
 
         def submit(self, request):
             self.requests.append(request)
+            return True
 
     class CapturingUpdateCheckWorker:
         def __init__(self):
@@ -446,6 +449,144 @@ class MainWindowTests(unittest.TestCase):
         MainWindow._handle_tool_action(window, "tool_start", payload)
 
         window._submit_frontend_action.assert_called_once_with("tool_start", payload)
+
+    def test_missing_tool_action_runtime_returns_error_to_the_pending_request(self):
+        window = self._make_window()
+        toolbox_page = Mock()
+        window.app_shell = SimpleNamespace(pages={"toolbox": toolbox_page})
+        window.refresh_frontend_state = Mock()
+        window.__dict__["_frontend_state_service"] = None
+        window.__dict__["_frontend_action_worker"] = None
+        payload = {
+            "tool_id": "link_parser",
+            "run_id": "run-link-parser",
+            "candidate_ids": ["a" * 64],
+        }
+
+        MainWindow._handle_tool_action(window, "tool_admit_candidates", payload)
+
+        toolbox_page.apply_action_result.assert_called_once_with(
+            "tool_admit_candidates",
+            payload,
+            {
+                "status": "error",
+                "message": "tool action service is unavailable",
+                "data": {"code": "tool_action_unavailable"},
+            },
+            sequence=None,
+        )
+
+    def test_tool_action_submit_failure_clears_the_bound_request_without_leaking_details(self):
+        window = self._make_window()
+        toolbox_page = Mock()
+        worker = Mock()
+        worker.submit.side_effect = RuntimeError("https://private.example/token")
+        window.app_shell = SimpleNamespace(pages={"toolbox": toolbox_page})
+        window.refresh_frontend_state = Mock()
+        window.__dict__["_frontend_state_service"] = object()
+        window.__dict__["_frontend_action_worker"] = worker
+        window.__dict__["_frontend_action_sequence"] = 0
+        payload = {
+            "tool_id": "link_parser",
+            "run_id": "run-link-parser",
+            "candidate_ids": ["a" * 64],
+        }
+
+        MainWindow._handle_tool_action(window, "tool_admit_candidates", payload)
+
+        toolbox_page.bind_action_request.assert_called_once_with(
+            "tool_admit_candidates",
+            payload,
+            sequence=1,
+        )
+        action_result = toolbox_page.apply_action_result.call_args.args[2]
+        self.assertEqual(action_result["status"], "error")
+        self.assertEqual(action_result["data"]["code"], "tool_action_submit_failed")
+        self.assertNotIn("private", repr(action_result).lower())
+        self.assertEqual(toolbox_page.apply_action_result.call_args.kwargs["sequence"], 1)
+
+    def test_tool_action_submit_control_flow_clears_pending_then_rethrows_exact_primary(self):
+        window = self._make_window()
+        toolbox_page = Mock()
+        primary = KeyboardInterrupt("submit interrupted")
+        worker = Mock()
+        worker.submit.side_effect = primary
+        window.app_shell = SimpleNamespace(pages={"toolbox": toolbox_page})
+        window.refresh_frontend_state = Mock()
+        window.__dict__["_frontend_state_service"] = object()
+        window.__dict__["_frontend_action_worker"] = worker
+        window.__dict__["_frontend_action_sequence"] = 0
+        payload = {
+            "tool_id": "link_parser",
+            "run_id": "run-link-parser",
+            "candidate_ids": ["a" * 64],
+        }
+
+        with self.assertRaises(KeyboardInterrupt) as caught:
+            MainWindow._handle_tool_action(window, "tool_admit_candidates", payload)
+
+        self.assertIs(caught.exception, primary)
+        toolbox_page.apply_action_result.assert_called_once()
+        self.assertEqual(toolbox_page.apply_action_result.call_args.kwargs["sequence"], 1)
+
+    def test_shutdown_worker_rejection_clears_bound_tool_action_request(self):
+        window = self._make_window()
+        toolbox_page = Mock()
+        worker = Mock()
+        worker.submit.return_value = False
+        window.app_shell = SimpleNamespace(pages={"toolbox": toolbox_page})
+        window.refresh_frontend_state = Mock()
+        window.__dict__["_frontend_state_service"] = object()
+        window.__dict__["_frontend_action_worker"] = worker
+        window.__dict__["_frontend_action_sequence"] = 0
+        payload = {
+            "tool_id": "link_parser",
+            "run_id": "run-link-parser",
+            "candidate_ids": ["a" * 64],
+        }
+
+        accepted = MainWindow._submit_frontend_action(
+            window,
+            "tool_admit_candidates",
+            payload,
+        )
+
+        self.assertFalse(accepted)
+        toolbox_page.bind_action_request.assert_called_once_with(
+            "tool_admit_candidates",
+            payload,
+            sequence=1,
+        )
+        toolbox_page.apply_action_result.assert_called_once()
+        self.assertEqual(
+            toolbox_page.apply_action_result.call_args.kwargs["sequence"],
+            1,
+        )
+
+    def test_non_boolean_worker_acceptance_fails_closed(self):
+        window = self._make_window()
+        toolbox_page = Mock()
+        worker = Mock()
+        worker.submit.return_value = 1
+        window.app_shell = SimpleNamespace(pages={"toolbox": toolbox_page})
+        window.refresh_frontend_state = Mock()
+        window.__dict__["_frontend_state_service"] = object()
+        window.__dict__["_frontend_action_worker"] = worker
+        window.__dict__["_frontend_action_sequence"] = 0
+        payload = {
+            "tool_id": "link_parser",
+            "run_id": "run-link-parser",
+            "candidate_ids": ["a" * 64],
+        }
+
+        accepted = MainWindow._submit_frontend_action(
+            window,
+            "tool_admit_candidates",
+            payload,
+        )
+
+        self.assertFalse(accepted)
+        toolbox_page.apply_action_result.assert_called_once()
 
     def test_gui_tool_profile_uses_durable_owner_and_reads_current_save_root(self):
         window = self._make_window()
@@ -1326,6 +1467,7 @@ class MainWindowTests(unittest.TestCase):
         window._pending_refresh_topics = set()
         window._frontend_state_service = Mock()
         window._frontend_action_worker = Mock()
+        window._frontend_action_worker.submit.return_value = True
         window._frontend_action_sequence = 0
         window._ui_update_scheduler = Mock()
 
@@ -1457,11 +1599,167 @@ class MainWindowTests(unittest.TestCase):
         _Dialog.instance.view_log_requested.emit()
         window._handle_log_action.assert_called_once_with("open_latest")
 
+    def test_install_prepared_update_claims_once_before_launch(self):
+        prepared = self._prepared_update()
+        window = self._make_install_window(prepared)
+
+        with (
+            patch("app.ui.main_window.launch_prepared_update") as launch,
+            patch("app.ui.main_window.QTimer.singleShot") as single_shot,
+        ):
+            MainWindow._install_prepared_update(window)
+            MainWindow._install_prepared_update(window)
+
+        launch.assert_called_once()
+        self.assertIsNone(window._prepared_update)
+        self.assertIs(window._update_install_in_progress, True)
+        window._update_download_dialog.set_installing.assert_called_once_with()
+        window._show_update_check_error.assert_not_called()
+        single_shot.assert_called_once_with(250, window.close)
+
+    def test_install_prepared_update_restores_claim_after_launch_error(self):
+        prepared = self._prepared_update()
+        window = self._make_install_window(prepared)
+
+        with (
+            patch(
+                "app.ui.main_window.launch_prepared_update",
+                side_effect=RuntimeError("private installer path"),
+            ),
+            patch("app.ui.main_window.QTimer.singleShot") as single_shot,
+        ):
+            MainWindow._install_prepared_update(window)
+
+        self.assertIs(window._prepared_update, prepared)
+        self.assertIs(window._update_install_in_progress, False)
+        window._update_download_dialog.set_installing.assert_called_once_with()
+        window._update_download_dialog.set_ready.assert_called_once_with(
+            prepared.installer_path
+        )
+        window._show_update_check_error.assert_called_once()
+        single_shot.assert_not_called()
+
+    def test_install_prepared_update_restores_claim_before_rethrowing_control_flow(self):
+        class InstallInterrupted(BaseException):
+            pass
+
+        prepared = self._prepared_update()
+        window = self._make_install_window(prepared)
+        primary = InstallInterrupted("stop")
+
+        with (
+            patch(
+                "app.ui.main_window.launch_prepared_update",
+                side_effect=primary,
+            ),
+            patch("app.ui.main_window.QTimer.singleShot") as single_shot,
+            self.assertRaises(InstallInterrupted) as caught,
+        ):
+            MainWindow._install_prepared_update(window)
+
+        self.assertIs(caught.exception, primary)
+        self.assertIs(window._prepared_update, prepared)
+        self.assertIs(window._update_install_in_progress, False)
+        window._update_download_dialog.set_installing.assert_called_once_with()
+        window._update_download_dialog.set_ready.assert_called_once_with(
+            prepared.installer_path
+        )
+        single_shot.assert_not_called()
+
+    def test_old_install_failure_cannot_clear_new_sequence_claim(self):
+        old_prepared = self._prepared_update()
+        new_prepared = replace(old_prepared, version="3.6.22")
+        window = self._make_install_window(old_prepared)
+        old_started = threading.Event()
+        new_started = threading.Event()
+        release_old = threading.Event()
+        release_new = threading.Event()
+
+        def launch(prepared, **_kwargs):
+            if prepared.version == old_prepared.version:
+                old_started.set()
+                self.assertTrue(release_old.wait(2.0))
+                raise RuntimeError("old launch failed")
+            new_started.set()
+            self.assertTrue(release_new.wait(2.0))
+            raise RuntimeError("new launch failed")
+
+        with (
+            patch("app.ui.main_window.launch_prepared_update", side_effect=launch),
+            patch("app.ui.main_window.QTimer.singleShot"),
+        ):
+            old_thread = threading.Thread(
+                target=MainWindow._install_prepared_update,
+                args=(window,),
+            )
+            old_thread.start()
+            self.assertTrue(old_started.wait(2.0))
+
+            with window._update_download_lock:
+                window._update_download_sequence = 8
+                window._prepared_update = new_prepared
+                window._update_install_in_progress = False
+                window._update_install_claim_sequence = None
+
+            new_thread = threading.Thread(
+                target=MainWindow._install_prepared_update,
+                args=(window,),
+            )
+            new_thread.start()
+            self.assertTrue(new_started.wait(2.0))
+
+            release_old.set()
+            old_thread.join(timeout=2.0)
+            self.assertFalse(old_thread.is_alive())
+            self.assertIs(window._prepared_update, None)
+            self.assertIs(window._update_install_in_progress, True)
+            self.assertEqual(window._update_install_claim_sequence, 8)
+
+            release_new.set()
+            new_thread.join(timeout=2.0)
+            self.assertFalse(new_thread.is_alive())
+
+        self.assertIs(window._prepared_update, new_prepared)
+        self.assertIs(window._update_install_in_progress, False)
+        self.assertIsNone(window._update_install_claim_sequence)
+
+    def test_install_success_schedules_close_when_log_sink_fails(self):
+        prepared = self._prepared_update()
+        window = self._make_install_window(prepared)
+        window.append_log = Mock(side_effect=RuntimeError("log sink unavailable"))
+
+        with (
+            patch("app.ui.main_window.launch_prepared_update") as launch,
+            patch("app.ui.main_window.QTimer.singleShot") as single_shot,
+        ):
+            MainWindow._install_prepared_update(window)
+
+        launch.assert_called_once()
+        single_shot.assert_called_once_with(250, window.close)
+        self.assertIsNone(window._prepared_update)
+
+    def test_install_success_closes_directly_when_close_scheduler_fails(self):
+        prepared = self._prepared_update()
+        window = self._make_install_window(prepared)
+
+        with (
+            patch("app.ui.main_window.launch_prepared_update") as launch,
+            patch(
+                "app.ui.main_window.QTimer.singleShot",
+                side_effect=RuntimeError("scheduler unavailable"),
+            ),
+        ):
+            MainWindow._install_prepared_update(window)
+
+        launch.assert_called_once()
+        window.close.assert_called_once_with()
+
     def test_log_refresh_action_throttles_rapid_repeated_clicks(self):
         window = self._make_window()
         window._pending_refresh_topics = set()
         window._frontend_state_service = Mock()
         window._frontend_action_worker = Mock()
+        window._frontend_action_worker.submit.return_value = True
         window._frontend_action_sequence = 0
         window._ui_update_scheduler = Mock()
 
@@ -1477,6 +1775,29 @@ class MainWindowTests(unittest.TestCase):
         window.append_log.assert_not_called()
         self.assertEqual(window._pending_refresh_topics, {"logs.append"})
         window._ui_update_scheduler.schedule.assert_called_once_with("logs.append", force=False)
+
+    @staticmethod
+    def _prepared_update() -> _PreparedUpdate:
+        return _PreparedUpdate(
+            installer_path="D:/updates/setup.exe",
+            manifest_path="D:/updates/latest.json",
+            signature_path="D:/updates/latest.json.sig",
+            version="3.6.21",
+            log_path="D:/updates/update.log",
+        )
+
+    def _make_install_window(self, prepared: _PreparedUpdate) -> MainWindow:
+        window = self._make_window()
+        window._update_download_lock = threading.RLock()
+        window._update_download_sequence = 7
+        window._prepared_update = prepared
+        window._update_install_in_progress = False
+        window._update_install_claim_sequence = None
+        window._update_download_dialog = Mock()
+        window._show_update_check_error = Mock()
+        window._restart_argv_after_update = Mock(return_value=["app.exe"])
+        window.close = Mock()
+        return window
 
     def test_log_action_result_appends_non_refresh_feedback_and_refreshes_logs(self):
         window = self._make_window()
@@ -2270,6 +2591,87 @@ class MainWindowTests(unittest.TestCase):
         self.assertIs(window.__dict__.get("_ui_state_save_error"), failure)
         mock_log_exception.assert_called_once_with("MainWindow", "persist_ui_state", failure)
         event.accept.assert_called_once()
+
+    def test_close_event_worker_failure_does_not_short_circuit_remaining_cleanup(self):
+        class FatalWorkerShutdown(BaseException):
+            pass
+
+        for failure in (
+            RuntimeError("snapshot shutdown failed"),
+            FatalWorkerShutdown("snapshot shutdown aborted"),
+        ):
+            with self.subTest(failure_type=type(failure).__name__):
+                window, event = self._make_close_event_window()
+                snapshot_worker = Mock()
+                snapshot_worker.shutdown.side_effect = failure
+                action_worker = Mock()
+                window._frontend_snapshot_worker = snapshot_worker
+                window._frontend_action_worker = action_worker
+                window._owns_event_bus = True
+
+                with (
+                    patch(
+                        "app.ui.main_window.window_state_persistence.capture_window_state",
+                        return_value={},
+                    ),
+                    patch(
+                        "app.ui.main_window.window_state_persistence.start_window_state_persistence"
+                    ) as start_persistence,
+                    patch("app.ui.main_window.debug_logger.log_exception") as log_exception,
+                ):
+                    MainWindow.closeEvent(window, event)
+
+                snapshot_worker.shutdown.assert_called_once_with()
+                action_worker.shutdown.assert_called_once_with()
+                self.assertTrue(window._update_check_worker.shutdown_called)
+                window._connections.disconnect_all.assert_called_once_with()
+                window._chrome_controller.return_value.uninstall.assert_called_once_with()
+                window.event_bus.unsubscribe.assert_called_once_with(
+                    "app_state.changed",
+                    window._app_state_handler,
+                )
+                window.event_bus.shutdown.assert_called_once_with()
+                start_persistence.assert_called_once()
+                event.accept.assert_called_once_with()
+                log_exception.assert_called_once_with(
+                    "MainWindow",
+                    "close_event.frontend_snapshot_worker.shutdown",
+                    failure,
+                )
+
+    def test_close_event_hostile_exception_formatting_cannot_break_completion(self):
+        class HostileShutdownError(RuntimeError):
+            def __str__(self):
+                raise KeyboardInterrupt("exception formatting interrupted")
+
+        primary = HostileShutdownError()
+        window, event = self._make_close_event_window()
+        snapshot_worker = Mock()
+        snapshot_worker.shutdown.side_effect = primary
+        action_worker = Mock()
+        window._frontend_snapshot_worker = snapshot_worker
+        window._frontend_action_worker = action_worker
+
+        with (
+            patch(
+                "app.ui.main_window.window_state_persistence.capture_window_state",
+                return_value={},
+            ),
+            patch(
+                "app.ui.main_window.window_state_persistence.start_window_state_persistence"
+            ),
+            patch(
+                "app.ui.main_window.debug_logger.log_exception",
+                side_effect=lambda _component, _action, exc: str(exc),
+            ),
+        ):
+            MainWindow.closeEvent(window, event)
+
+        snapshot_worker.shutdown.assert_called_once_with()
+        action_worker.shutdown.assert_called_once_with()
+        self.assertTrue(window._update_check_worker.shutdown_called)
+        window._connections.disconnect_all.assert_called_once_with()
+        event.accept.assert_called_once_with()
 
     def test_native_event_unhandled_returns_false_without_super_call(self):
         window = self._make_window()

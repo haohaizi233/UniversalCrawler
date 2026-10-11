@@ -1384,9 +1384,13 @@ def _build_pipeline_hooks(
             paths.append(UPDATE_TRUST_CONFIG)
         if paths:
             relative_paths = _relative_release_paths(tuple(paths))
-            if _git_path_set(["diff", "--cached", "--name-only"]) or _git_path_set(
-                ["diff", "--name-only"]
-            ) != set(relative_paths):
+            cached = _git_path_set(["diff", "--cached", "--name-only"])
+            unstaged = _git_path_set(["diff", "--name-only"])
+            if not cached and not unstaged:
+                # 重试发布时版本投影已经是目标版本，原子重写不会产生 Git diff。
+                _validate_release_baseline_clean()
+                return _run_git(["rev-parse", "HEAD"])
+            if cached or unstaged != set(relative_paths):
                 raise SystemExit("version update has unexpected Git changes")
             _run_git(["add", "--", *relative_paths])
             if _git_path_set(["diff", "--cached", "--name-only"]) != set(relative_paths):

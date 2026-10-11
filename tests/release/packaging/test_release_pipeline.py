@@ -1728,6 +1728,40 @@ def test_rotated_trust_anchor_is_included_in_exact_release_commit(tmp_path):
     assert commit_call[-2:] == list(expected_paths)
 
 
+def test_already_synced_version_projection_reuses_head_without_a_new_commit():
+    tool = _load_tool()
+    request = BuildRequest(
+        target_version="3.6.22",
+        remote=RemoteReleaseInfo.available("3.6.21"),
+        commit_version_changes=True,
+    )
+    version_plan = VersionUpdatePlan(tool.PROJECT_ROOT, "3.6.22", "3.6.22", ())
+    version_result = VersionUpdateResult(
+        "3.6.22",
+        "3.6.22",
+        (tool.PROJECT_ROOT / "shared/version.py",),
+    )
+    git_calls: list[list[str]] = []
+
+    def fake_git(argv):
+        git_calls.append(list(argv))
+        if argv[:2] == ["rev-parse", "HEAD"]:
+            return "b" * 40
+        return ""
+
+    with (
+        patch.object(tool, "plan_version_update", return_value=version_plan),
+        patch.object(tool, "apply_version_update", return_value=version_result),
+        patch.object(tool, "_run_git", side_effect=fake_git),
+    ):
+        hooks = tool._build_pipeline_hooks(request, {}, emitter=None)
+        hooks.apply_version(request.target_version)
+        commit = hooks.commit_version_changes(request)
+
+    assert commit == "b" * 40
+    assert not any(call[0] in {"add", "commit"} for call in git_calls)
+
+
 def test_normal_signing_reuses_external_key_without_rotating_trust_anchor(tmp_path):
     tool = _load_tool()
     key = ECC.generate(curve="Ed25519")

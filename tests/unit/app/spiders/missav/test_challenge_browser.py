@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 from unittest.mock import Mock, call, patch
 
 from playwright.sync_api import Error as PlaywrightError
@@ -115,6 +116,7 @@ def test_headed_runtime_waits_for_challenge_before_starting_playwright() -> None
     events: list[str] = []
 
     session = Mock()
+    session.browser_executable = Path("chrome.exe")
     session.start.side_effect = lambda _url: events.append("start")
     session.wait_for_ready_page.side_effect = lambda *_args, **_kwargs: (
         events.append("ready")
@@ -133,6 +135,10 @@ def test_headed_runtime_waits_for_challenge_before_starting_playwright() -> None
     )
 
     with (
+        patch(
+            "app.spiders.missav.spider.resolve_challenge_browser",
+            return_value=Path("chrome.exe"),
+        ),
         patch(
             "app.spiders.missav.spider.ExternalChromeChallengeSession",
             return_value=session,

@@ -163,6 +163,7 @@ function translateRuntimeLogText(value) {
 }
 
 const RUNTIME_LOG_PHRASE_TRANSLATIONS = [
+  { zh: "失败记录持久化在关闭等待超时后仍在排空", en: "Failed-record persistence is still draining after the shutdown wait expired", tw: "失敗記錄持久化在關閉等待逾時後仍在排空" },
   { zh: "Bilibili 流请求建立成功", en: "Bilibili stream request established", tw: "Bilibili 串流請求建立成功" },
   { zh: "Bilibili 下载任务已提交到下载队列", en: "Bilibili download task submitted to the queue", tw: "Bilibili 下載任務已提交到下載佇列" },
   { zh: "Bilibili 下载任务已装配完成", en: "Bilibili download task assembled", tw: "Bilibili 下載任務已組裝完成" },
@@ -261,6 +262,10 @@ const RUNTIME_LOG_PHRASE_TRANSLATIONS = [
   { zh: "Cloudflare 验证等待超时", en: "Cloudflare verification timed out", tw: "Cloudflare 驗證等待逾時" },
   { zh: "MissAV 人工验证使用系统", en: "MissAV manual verification is using system", tw: "MissAV 人工驗證使用系統" },
   { zh: "MissAV 已接管系统浏览器", en: "MissAV attached to the system browser", tw: "MissAV 已接管系統瀏覽器" },
+  { zh: "启动独立浏览器", en: "Starting an independent browser", tw: "啟動獨立瀏覽器" },
+  { zh: "指定的浏览器不存在", en: "The specified browser does not exist", tw: "指定的瀏覽器不存在" },
+  { zh: "配置的本机代理不可用，改用已识别的代理", en: "The configured local proxy is unavailable; using the recognized proxy", tw: "設定的本機代理無法使用，改用已識別的代理" },
+  { zh: "已识别本机代理", en: "Recognized the local proxy", tw: "已識別本機代理" },
   { zh: "未找到系统 Chrome/Edge，改用 Playwright 浏览器", en: "No system Chrome/Edge was found; using the Playwright browser", tw: "未找到系統 Chrome/Edge，改用 Playwright 瀏覽器" },
   { zh: "准备下载 MissAV HLS 流", en: "Preparing MissAV HLS stream download", tw: "準備下載 MissAV HLS 串流" },
   { zh: "正在尝试以 curl_cffi 浏览器模拟方式下载 MissAV HLS", en: "Trying curl_cffi browser-impersonated HLS download for MissAV", tw: "正在嘗試以 curl_cffi 瀏覽器模擬方式下載 MissAV HLS" },

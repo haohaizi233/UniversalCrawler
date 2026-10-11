@@ -33,7 +33,8 @@ def test_external_chrome_launch_keeps_native_browser_fingerprint(
         session.start("https://missav.ai/cn/search/CAWD-377")
 
     command = popen.call_args.args[0]
-    assert "--proxy-server=http://127.0.0.1:7890" in command
+    assert "--proxy-server=http=127.0.0.1:7890;https=127.0.0.1:7890" in command
+    assert "--proxy-bypass-list=localhost;127.0.0.1;::1;<local>" in command
     assert any(item.startswith("--remote-debugging-port=") for item in command)
     assert any(item.startswith("--user-data-dir=") for item in command)
     assert not any("AutomationControlled" in item for item in command)

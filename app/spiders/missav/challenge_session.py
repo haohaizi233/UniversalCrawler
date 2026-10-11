@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
 import socket
 import subprocess
 import tempfile
@@ -16,6 +15,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from app.spiders.missav.local_proxy import chromium_proxy_bypass_switch, chromium_proxy_switch
 from app.utils.runtime_paths import user_cache_root
 
 
@@ -108,34 +108,10 @@ class ExternalChromeChallengeSession:
 
     @classmethod
     def find_system_browser_executable(cls) -> Path:
-        """按稳定版 Chrome、Edge 的顺序定位系统浏览器。"""
-        candidates: list[Path] = []
-        for executable_name in (
-            "chrome.exe",
-            "msedge.exe",
-            "google-chrome",
-            "chromium",
-        ):
-            located = shutil.which(executable_name)
-            if located:
-                candidates.append(Path(located))
-        local_app_data = Path(os.environ.get("LOCALAPPDATA", ""))
-        program_files = Path(os.environ.get("PROGRAMFILES", ""))
-        program_files_x86 = Path(os.environ.get("PROGRAMFILES(X86)", ""))
-        candidates.extend(
-            (
-                program_files / "Google/Chrome/Application/chrome.exe",
-                program_files_x86 / "Google/Chrome/Application/chrome.exe",
-                local_app_data / "Google/Chrome/Application/chrome.exe",
-                program_files / "Microsoft/Edge/Application/msedge.exe",
-                program_files_x86 / "Microsoft/Edge/Application/msedge.exe",
-                local_app_data / "Microsoft/Edge/Application/msedge.exe",
-            )
-        )
-        for candidate in candidates:
-            if candidate.is_file():
-                return candidate
-        raise SystemBrowserUnavailable("未找到系统 Chrome 或 Edge")
+        """按手动路径、Playwright 目录、稳定版 Chrome、Edge 的顺序定位浏览器。"""
+        from app.spiders.missav.browser_executable import resolve_challenge_browser
+
+        return resolve_challenge_browser()
 
     def _common_command(self) -> list[str]:
         command = [
@@ -148,7 +124,8 @@ class ExternalChromeChallengeSession:
             "--no-default-browser-check",
         ]
         if self.proxy_server:
-            command.append(f"--proxy-server={self.proxy_server}")
+            command.append(chromium_proxy_switch(self.proxy_server))
+            command.append(chromium_proxy_bypass_switch())
         return command
 
     @staticmethod

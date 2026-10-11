@@ -93,6 +93,11 @@ def _repair_mojibake_text(text: str) -> str:
     return repaired
 
 _RUNTIME_LOG_PHRASE_TRANSLATIONS = (
+    (
+        "失败记录持久化在关闭等待超时后仍在排空",
+        "Failed-record persistence is still draining after the shutdown wait expired",
+        "失敗記錄持久化在關閉等待逾時後仍在排空",
+    ),
     ("Bilibili 流请求建立成功", "Bilibili stream request established", "Bilibili 串流請求建立成功"),
     ("Bilibili 下载任务已提交到下载队列", "Bilibili download task submitted to the queue", "Bilibili 下載任務已提交到下載佇列"),
     ("Bilibili 下载任务已装配完成", "Bilibili download task assembled", "Bilibili 下載任務已組裝完成"),
@@ -299,6 +304,14 @@ _RUNTIME_LOG_PHRASE_TRANSLATIONS = (
         "MissAV attached to the system browser",
         "MissAV 已接管系統瀏覽器",
     ),
+    ("启动独立浏览器", "Starting an independent browser", "啟動獨立瀏覽器"),
+    ("指定的浏览器不存在", "The specified browser does not exist", "指定的瀏覽器不存在"),
+    (
+        "配置的本机代理不可用，改用已识别的代理",
+        "The configured local proxy is unavailable; using the recognized proxy",
+        "設定的本機代理無法使用，改用已識別的代理",
+    ),
+    ("已识别本机代理", "Recognized the local proxy", "已識別本機代理"),
     (
         "未找到系统 Chrome/Edge，改用 Playwright 浏览器",
         "No system Chrome/Edge was found; using the Playwright browser",

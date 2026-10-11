@@ -2105,7 +2105,8 @@ class SpiderHelperTests(unittest.TestCase):
     def test_missav_effective_proxy_prefers_config_then_environment(self):
         spider = MissAVSpider.__new__(MissAVSpider)
         spider.config = {"proxy": "127.0.0.1:9001"}
-        self.assertEqual(spider._effective_proxy_server(), "http://127.0.0.1:9001")
+        with patch("app.spiders.missav.spider.discover_client_proxy", return_value=None):
+            self.assertEqual(spider._effective_proxy_server(), "http://127.0.0.1:9001")
 
         spider.config = {}
         with patch.dict(os.environ, {"HTTPS_PROXY": "127.0.0.1:7890"}, clear=True):

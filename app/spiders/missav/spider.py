@@ -10,12 +10,18 @@ from playwright.sync_api import Error as PlaywrightError, sync_playwright
 
 from app.config import DEFAULT_USER_AGENT
 from app.spiders.base import BaseSpider
+from app.spiders.missav.browser_executable import (
+    browser_launch_label,
+    missing_browser_request,
+    resolve_challenge_browser,
+)
 from app.spiders.missav.challenge_session import (
     ChallengeWaitCancelled,
     ChallengeWaitTimeout,
     ExternalChromeChallengeSession,
     SystemBrowserUnavailable,
 )
+from app.spiders.missav.local_proxy import discover_client_proxy, is_unreachable_loopback_proxy
 from app.spiders.missav.parser import MissAVParser
 from app.spiders.missav.task_builder import MissAVTaskBuilder
 from shared.runtime_options import DomainPolicyViolation
@@ -240,13 +246,23 @@ class MissAVSpider(BaseSpider):
         browser_timeout_ms = self._configured_timeout_ms(default=60)
         try:
             if not self._browser_headless():
+                configured_browser = str((getattr(self, "config", {}) or {}).get("browser_executable") or "")
                 try:
+                    browser_executable = resolve_challenge_browser(configured_browser)
                     runtime.external_session = ExternalChromeChallengeSession(
                         proxy_server=proxy_server,
+                        browser_executable=browser_executable,
                     )
                 except SystemBrowserUnavailable:
                     self.log("⚠️ 未找到系统 Chrome/Edge，改用 Playwright 浏览器")
                 else:
+                    missing_browser = missing_browser_request(configured_browser)
+                    if missing_browser:
+                        self.log(f"⚠️ 指定的浏览器不存在: {missing_browser}")
+                    self.log(
+                        "🌐 启动独立浏览器: "
+                        f"{browser_launch_label(runtime.external_session.browser_executable)}"
+                    )
                     runtime.external_session.start(target_url)
                     if self._wait_for_external_challenge(
                         runtime.external_session,
@@ -933,7 +949,32 @@ class MissAVSpider(BaseSpider):
             configured = (getattr(self, "config", {}) or {}).get("proxy")
         # MissAV 默认继承系统代理，但仍需遵守基类调用方的显式关闭请求。
         fallback = True if allow_system_fallback is None else bool(allow_system_fallback)
-        return super()._effective_proxy_server(configured, allow_system_fallback=fallback)
+        configured_text = str(configured or "").strip()
+        cache = getattr(self, "_proxy_resolution_cache", None)
+        if cache is None:
+            cache = {}
+            self._proxy_resolution_cache = cache
+        cache_key = (configured_text, fallback)
+        if cache_key in cache:
+            return cache[cache_key]
+        if configured_text.lower() in {"none", "direct"} or configured_text == "直连":
+            cache[cache_key] = None
+            return None
+        resolved = super()._effective_proxy_server(configured, allow_system_fallback=fallback)
+        if not fallback or (resolved is not None and not is_unreachable_loopback_proxy(resolved)):
+            cache[cache_key] = resolved
+            return resolved
+        discovered = discover_client_proxy()
+        if not discovered or discovered == resolved:
+            cache[cache_key] = resolved
+            return resolved
+        if getattr(self, "sig_log", None) is not None:
+            if resolved:
+                self.log(f"🌍 配置的本机代理不可用，改用已识别的代理: {discovered}")
+            else:
+                self.log(f"🌍 已识别本机代理: {discovered}")
+        cache[cache_key] = discovered
+        return discovered
 
     @classmethod
     def _proxy_from_environment(cls) -> str | None:

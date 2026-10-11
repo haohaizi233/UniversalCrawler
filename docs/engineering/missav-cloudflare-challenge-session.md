@@ -3,7 +3,7 @@
 > 本文描述当前生产实现的长期契约。历史排查过程和失败实验见
 > [MissAV Cloudflare 挑战拒绝活动 CDP 会话复盘](../postmortems/missav-cloudflare-active-cdp-browser-rejection.md)。
 
-更新日期：2026-07-18
+更新日期：2026-10-11
 
 ## 结论
 
@@ -62,13 +62,21 @@ flowchart LR
 
 ## 系统浏览器启动
 
-`ExternalChromeChallengeSession` 按稳定版 Chrome、Edge 的顺序定位系统浏览器，并使用：
+`ExternalChromeChallengeSession` 按下面的顺序定位浏览器：
+
+1. 任务配置 `browser_executable` 或环境变量 `UCP_BROWSER_EXECUTABLE`。
+2. 用户设置的 `PLAYWRIGHT_BROWSERS_PATH`（安装包自带的 `ms-playwright` 不抢在系统浏览器之前）。
+3. 稳定版系统 Chrome、Edge。跳过 `WindowsApps` 应用执行别名和空文件。
+4. Playwright 目录中的完整 Chromium。它仍以独立进程启动，挑战期间不连接 CDP。
+
+启动参数：
 
 - 随机 loopback 调试端口。
 - `--remote-debugging-address=127.0.0.1`。
 - 独立临时 `user-data-dir`。
 - 固定 `Default` profile。
-- 与任务一致的代理参数。
+- 与任务一致的代理参数。HTTP 代理写成 `http=host:port;https=host:port`，并绕过 loopback，避免 Edge 只把 HTTP 送进 Clash、HTTPS 仍然直连。
+- 配置的本机代理端口连不上时，改用当前系统代理、PAC 或 Clash / Clash Verge 配置里正在监听的端口。
 - `--no-first-run` 和 `--no-default-browser-check`。
 
 不得添加会修改浏览器公开指纹的参数、扩展或脚本。尤其不得在 MissAV challenge path

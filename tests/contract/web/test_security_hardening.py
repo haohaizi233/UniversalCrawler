@@ -491,6 +491,52 @@ class WebSecurityHardeningTests(unittest.TestCase):
         self.assertEqual(prepare.call_args.args[0].latest_revision, 1)
         self.assertTrue(check.called)
 
+    def test_update_prepare_default_follows_service_selected_identity(self):
+        result = UpdateCheckResult(
+            status=UPDATE_STATUS_AVAILABLE,
+            local_version="3.6.20",
+            latest_version="3.6.21",
+            latest_revision=1,
+            tag_name="v3.6.21-r1",
+            release_name="v3.6.21-r1",
+            html_url="https://example.test/v3.6.21-r1",
+            candidates=(
+                UpdateCandidate(
+                    version="3.6.21",
+                    release_revision=2,
+                    tag_name="v3.6.21-r2",
+                    release_name="v3.6.21-r2",
+                    html_url="https://example.test/v3.6.21-r2",
+                ),
+                UpdateCandidate(
+                    version="3.6.21",
+                    release_revision=1,
+                    tag_name="v3.6.21-r1",
+                    release_name="v3.6.21-r1",
+                    html_url="https://example.test/v3.6.21-r1",
+                ),
+            ),
+        )
+        prepared = PreparedUpdate(
+            installer_path=os.fspath(Path(tempfile.gettempdir(), "ucrawl-update.exe")),
+            manifest_path=os.fspath(Path(tempfile.gettempdir(), "latest.json")),
+            signature_path=os.fspath(Path(tempfile.gettempdir(), "latest.json.sig")),
+            version="3.6.21",
+            release_revision=1,
+            log_path=os.fspath(Path(tempfile.gettempdir(), "updater-install.log")),
+        )
+        with (
+            patch("app.services.update_check_service.check_secure_update", return_value=result),
+            patch(
+                "app.services.update_check_service.prepare_verified_update",
+                return_value=prepared,
+            ) as prepare,
+        ):
+            response = self.client.post("/api/update/prepare", json={})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(prepare.call_args.args[0].selected_identity, result.selected_identity)
+
     def test_update_prepare_requires_explicit_confirmation_for_revision_downgrade(self):
         from shared.release_identity import ReleaseIdentity
 

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from concurrent.futures import Future, ThreadPoolExecutor
 from collections import deque
+from contextlib import contextmanager
+from dataclasses import dataclass
 import os
 import ipaddress
 import secrets
@@ -11,17 +13,53 @@ import threading
 import time
 import asyncio
 import logging
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urlsplit
 
+from app.services.path_policy import ApprovedRootGrant
 from shared.execution_profile import ExecutionProfile, public_web_profile
+from shared.filesystem_directory_capability import (
+    FilesystemDirectoryCapability,
+    ensure_regular_directory,
+    open_filesystem_directory_capability,
+)
 
 SendFactory = Callable[[str], Callable[[str, Any], Any]]
 TEST_TRANSPORT_HOSTS = {"testserver", "testclient"}
 DEFAULT_DISPOSAL_WORKERS = 2
 DEFAULT_DISPOSAL_QUEUE_CAPACITY = 8
+
+
+@dataclass
+class _SessionRootAuthority:
+    grant: ApprovedRootGrant
+    capability: FilesystemDirectoryCapability
+    references: int = 0
+    retired: bool = False
+
+
+def _attach_cleanup_note(error: BaseException, note: str) -> None:
+    try:
+        add_note = getattr(error, "add_note", None)
+        if callable(add_note):
+            add_note(note)
+    except BaseException:
+        pass
+
+
+def _preferred_failure(
+    current: BaseException | None,
+    candidate: BaseException,
+) -> BaseException:
+    if current is None:
+        return candidate
+    if isinstance(current, Exception) and not isinstance(candidate, Exception):
+        _attach_cleanup_note(candidate, "an earlier session cleanup step also failed")
+        return candidate
+    _attach_cleanup_note(current, "an additional session cleanup step failed")
+    return current
 
 
 class WebSessionCapacityError(RuntimeError):
@@ -131,6 +169,8 @@ class WebSessionContext:
         self.session_token = secrets.token_urlsafe(24)
         self.csrf_token = secrets.token_urlsafe(24)
         self.approved_roots: set[str] = set()
+        self._approved_root_authorities: dict[str, _SessionRootAuthority] = {}
+        self._approved_roots_closed = False
         self._approved_roots_lock = threading.RLock()
         self._prepared_update_lock = threading.RLock()
         self._prepared_update: Any = None
@@ -138,10 +178,17 @@ class WebSessionContext:
         self._background_tasks_lock = threading.RLock()
         self._access_lock = threading.RLock()
         self._monotonic: Callable[[], float] = time.monotonic
+        self._active_http_requests = 0
         self._active_websockets = 0
         self.last_access_at = self._monotonic()
-        self.approve_directory(self.controller.current_save_dir)
-        self._bind_tool_execution_profile_provider()
+        try:
+            self._approve_directory(self.controller.current_save_dir, create=True)
+            self._bind_tool_execution_profile_provider()
+        except BaseException as primary_error:
+            selected_error = self._retire_approved_root_authorities(primary_error)
+            if selected_error is not primary_error:
+                raise selected_error
+            raise
 
     def touch(self) -> None:
         with self._access_lock:
@@ -151,6 +198,27 @@ class WebSessionContext:
         with self._access_lock:
             self._active_websockets += 1
             self.last_access_at = self._monotonic()
+
+    def mark_http_request_started(self) -> None:
+        now = self._monotonic()
+        with self._access_lock:
+            self._active_http_requests += 1
+            self.last_access_at = now
+
+    def mark_http_request_finished(self) -> None:
+        with self._access_lock:
+            if self._active_http_requests <= 0:
+                raise RuntimeError("HTTP request reference underflow")
+            self._active_http_requests -= 1
+            self.last_access_at = self._monotonic()
+
+    def has_active_http_request(self) -> bool:
+        with self._access_lock:
+            return self._active_http_requests > 0
+
+    def has_active_request(self) -> bool:
+        with self._access_lock:
+            return self._active_http_requests > 0 or self._active_websockets > 0
 
     def mark_websocket_disconnected(self) -> None:
         with self._access_lock:
@@ -179,10 +247,146 @@ class WebSessionContext:
         return task
 
     def approve_directory(self, directory: str) -> str:
-        normalized = normalize_directory(directory)
+        """Approve an existing regular directory selected for this session."""
+        return self._approve_directory(directory, create=False)
+
+    def _approve_directory(self, directory: str, *, create: bool) -> str:
+        lexical_directory = os.path.abspath(
+            os.path.normpath(os.path.expanduser(directory))
+        )
         with self._approved_roots_lock:
-            self.approved_roots.add(normalized)
+            if self._approved_roots_closed:
+                raise PermissionError("Web session directory authority is closed")
+        ensure_regular_directory(lexical_directory, create=create)
+        capability = open_filesystem_directory_capability(lexical_directory)
+        try:
+            bound_root, identity = capability.snapshot_bound_identity()
+        except BaseException as primary_error:
+            selected_error = self._close_root_authorities(
+                (_SessionRootAuthority(("", (0, 0)), capability),),
+                primary_error,
+            )
+            if selected_error is not primary_error:
+                raise selected_error
+            raise
+        grant_path = os.path.normcase(os.path.abspath(os.fspath(bound_root)))
+        grant: ApprovedRootGrant = (
+            grant_path,
+            (int(identity[0]), int(identity[1])),
+        )
+        normalized = normalize_directory(grant_path)
+        authority = _SessionRootAuthority(grant, capability)
+        retired: tuple[_SessionRootAuthority, ...] = ()
+        with self._approved_roots_lock:
+            if self._approved_roots_closed:
+                installation_error = PermissionError(
+                    "Web session directory authority is closed"
+                )
+            else:
+                installation_error = None
+                previous = self._approved_root_authorities.get(normalized)
+                self.approved_roots.add(normalized)
+                self._approved_root_authorities[normalized] = authority
+                if previous is not None:
+                    previous.retired = True
+                    if previous.references == 0:
+                        retired = (previous,)
+        if installation_error is not None:
+            selected_error = self._close_root_authorities(
+                (authority,), installation_error
+            )
+            raise selected_error
+        selected_error = self._close_root_authorities(retired)
+        if selected_error is not None:
+            raise selected_error
         return normalized
+
+    @staticmethod
+    def _close_root_authorities(
+        authorities: Iterable[_SessionRootAuthority],
+        primary_error: BaseException | None = None,
+    ) -> BaseException | None:
+        selected_error = primary_error
+        for authority in authorities:
+            try:
+                authority.capability.close()
+            except BaseException as cleanup_error:
+                selected_error = _preferred_failure(selected_error, cleanup_error)
+        return selected_error
+
+    def _retire_approved_root_authorities(
+        self,
+        primary_error: BaseException | None = None,
+    ) -> BaseException | None:
+        with self._approved_roots_lock:
+            self._approved_roots_closed = True
+            authorities = tuple(self._approved_root_authorities.values())
+            self._approved_root_authorities.clear()
+            self.approved_roots.clear()
+            for authority in authorities:
+                authority.retired = True
+            closable = tuple(
+                authority for authority in authorities if authority.references == 0
+            )
+        return self._close_root_authorities(closable, primary_error)
+
+    def close_approved_root_authorities(self) -> None:
+        selected_error = self._retire_approved_root_authorities()
+        if selected_error is not None:
+            raise selected_error
+
+    def _release_root_authorities(
+        self,
+        authorities: tuple[_SessionRootAuthority, ...],
+        primary_error: BaseException | None,
+    ) -> BaseException | None:
+        selected_error = primary_error
+        closable: list[_SessionRootAuthority] = []
+        with self._approved_roots_lock:
+            for authority in authorities:
+                if authority.references <= 0:
+                    selected_error = _preferred_failure(
+                        selected_error,
+                        RuntimeError("session directory lease reference underflow"),
+                    )
+                    continue
+                authority.references -= 1
+                if authority.retired and authority.references == 0:
+                    closable.append(authority)
+        return self._close_root_authorities(closable, selected_error)
+
+    @contextmanager
+    def lease_approved_root_grants_snapshot(
+        self,
+    ) -> Iterator[tuple[ApprovedRootGrant, ...]]:
+        with self._approved_roots_lock:
+            if self._approved_roots_closed:
+                raise PermissionError("目录未被当前会话授权访问")
+            authorities = tuple(self._approved_root_authorities.values())
+            if not authorities:
+                raise PermissionError("目录未被当前会话授权访问")
+            for authority in authorities:
+                authority.references += 1
+            grants = tuple(authority.grant for authority in authorities)
+
+        primary_error: BaseException | None = None
+        try:
+            try:
+                for authority in authorities:
+                    authority.capability.assert_bound()
+            except (OSError, TypeError, ValueError):
+                raise PermissionError("目录未被当前会话授权访问") from None
+            yield grants
+        except BaseException as error:
+            primary_error = error
+            raise
+        finally:
+            selected_error = self._release_root_authorities(
+                authorities,
+                primary_error,
+            )
+            if selected_error is not None and selected_error is not primary_error:
+                raise selected_error
 
     def _bind_tool_execution_profile_provider(self) -> None:
         frontend_state_service = getattr(
@@ -205,14 +409,34 @@ class WebSessionContext:
 
     def is_directory_allowed(self, directory: str) -> bool:
         normalized = normalize_directory(directory)
-        with self._approved_roots_lock:
-            roots = tuple(self.approved_roots)
+        roots = self.approved_roots_snapshot()
         return any(is_within_root(normalized, root) for root in roots)
 
     def approved_roots_snapshot(self) -> tuple[str, ...]:
-        """返回稳定快照，供工作线程校验路径。"""
+        """Return currently bound roots for non-authorizing diagnostics."""
         with self._approved_roots_lock:
-            return tuple(self.approved_roots)
+            pairs = tuple(
+                (root, self._approved_root_authorities.get(root))
+                for root in self.approved_roots
+            )
+        valid_roots: list[str] = []
+        for root, authority in pairs:
+            if authority is None:
+                continue
+            try:
+                authority.capability.assert_bound()
+            except (OSError, TypeError, ValueError):
+                continue
+            valid_roots.append(root)
+        return tuple(valid_roots)
+
+    def approved_root_grants_snapshot(self) -> tuple[ApprovedRootGrant, ...]:
+        """Return diagnostic grants; authorizing operations must use the lease API."""
+        with self._approved_roots_lock:
+            return tuple(
+                authority.grant
+                for authority in self._approved_root_authorities.values()
+            )
 
     def store_prepared_update(self, prepared: Any) -> None:
         with self._prepared_update_lock:
@@ -284,56 +508,80 @@ class WebSessionRegistry:
         self._disposal_executor_closed = False
 
     def get_or_create(self, session_id: str) -> WebSessionContext:
-        self.prune()
+        return self._get_or_create_context(session_id, acquire_http=False)
+
+    def acquire_http_context(self, session_id: str) -> WebSessionContext:
+        """Find or create and reserve an HTTP context in one critical section."""
+        return self._get_or_create_context(session_id, acquire_http=True)
+
+    def _get_or_create_context(
+        self,
+        session_id: str,
+        *,
+        acquire_http: bool,
+    ) -> WebSessionContext:
+        if not acquire_http:
+            self.prune()
         detached: tuple[str, WebSessionContext] | None = None
         with self._disposal_submit_lock:
             with self._lock:
                 if self._closed:
                     raise RuntimeError("Web session registry is shutting down")
                 context = self._contexts.get(session_id)
-                if context is not None:
-                    context.touch()
-                    return context
+                if context is None:
+                    if len(self._contexts) >= self._max_contexts:
+                        candidate = self._oldest_evictable_context_locked()
+                        if candidate is None or not self._disposal_slots.acquire(
+                            blocking=False
+                        ):
+                            raise WebSessionCapacityError(
+                                "Web session capacity is exhausted; retry later"
+                            )
+                        detached = candidate
 
-                if len(self._contexts) >= self._max_contexts:
-                    candidate = self._oldest_evictable_context_locked()
-                    if candidate is None or not self._disposal_slots.acquire(blocking=False):
-                        raise WebSessionCapacityError(
-                            "Web session capacity is exhausted; retry later"
+                    try:
+                        context = WebSessionContext(
+                            session_id,
+                            send_factory=self._send_factory,
+                            controller_factory=self._controller_factory,
+                            workflow_factory=self._workflow_factory,
                         )
-                    detached = candidate
-
-                try:
-                    context = WebSessionContext(
-                        session_id,
-                        send_factory=self._send_factory,
-                        controller_factory=self._controller_factory,
-                        workflow_factory=self._workflow_factory,
-                    )
-                except BaseException:
+                    except BaseException:
+                        if detached is not None:
+                            self._disposal_slots.release()
+                        raise
+                    context._monotonic = self._monotonic
                     if detached is not None:
-                        self._disposal_slots.release()
-                    raise
-                context._monotonic = self._monotonic
-                if detached is not None:
-                    self._contexts.pop(detached[0], None)
-                self._contexts[session_id] = context
-                context.touch()
+                        self._contexts.pop(detached[0], None)
+                    self._contexts[session_id] = context
 
             if detached is not None:
                 try:
                     self._submit_reserved_disposal(detached[1])
-                except RuntimeError:
+                except RuntimeError as submit_error:
                     with self._lock:
                         if self._contexts.get(session_id) is context:
                             self._contexts.pop(session_id, None)
                         self._contexts.setdefault(detached[0], detached[1])
                     self._disposal_slots.release()
                     shutdown = getattr(context.controller, "shutdown", None)
-                    if callable(shutdown):
-                        self._safe_shutdown_controller(shutdown)
+                    selected_error = self._dispose_context_resources(
+                        context,
+                        shutdown if callable(shutdown) else None,
+                        submit_error,
+                    )
+                    if selected_error is not submit_error:
+                        raise selected_error
                     raise
+            if acquire_http:
+                context.mark_http_request_started()
+            else:
+                context.touch()
             return context
+
+    @staticmethod
+    def release_http_context(context: WebSessionContext) -> None:
+        context.mark_http_request_finished()
 
     def acquire_websocket_context(
         self,
@@ -360,7 +608,7 @@ class WebSessionRegistry:
             (getattr(context, "last_access_at", 0.0), session_id, context)
             for session_id, context in self._contexts.items()
             if session_id not in self._pinned_session_ids
-            and not context.has_active_websocket()
+            and not context.has_active_request()
         )
         try:
             _, session_id, context = min(candidates, key=lambda item: item[0])
@@ -377,7 +625,7 @@ class WebSessionRegistry:
                 session_id
                 for session_id, context in self._contexts.items()
                 if session_id not in self._pinned_session_ids
-                and not context.has_active_websocket()
+                and not context.has_active_request()
                 and now - getattr(context, "last_access_at", now) > self._idle_ttl_seconds
             ]
         idle_cutoff = now - self._idle_ttl_seconds
@@ -396,10 +644,12 @@ class WebSessionRegistry:
                 if context is None:
                     return None
                 with context._access_lock:
-                    if idle_cutoff is not None and (
-                        context._active_websockets > 0
-                        or context.last_access_at > idle_cutoff
+                    if (
+                        context._active_http_requests > 0
+                        or context._active_websockets > 0
                     ):
+                        return None
+                    if idle_cutoff is not None and context.last_access_at > idle_cutoff:
                         return None
                     if not self._disposal_slots.acquire(blocking=False):
                         return None
@@ -419,14 +669,13 @@ class WebSessionRegistry:
         controller = getattr(context, "controller", None)
         shutdown = getattr(controller, "shutdown", None)
         if not callable(shutdown):
-            self._cancel_context_activity(context)
-            self._disposal_slots.release()
-            return None
+            shutdown = None
 
         start_gate = threading.Event()
         future = self._disposal_executor.submit(
-            self._shutdown_controller_after_gate,
+            self._shutdown_context_after_gate,
             start_gate,
+            context,
             shutdown,
         )
         try:
@@ -464,13 +713,33 @@ class WebSessionRegistry:
                 )
 
     @classmethod
-    def _shutdown_controller_after_gate(
+    def _shutdown_context_after_gate(
         cls,
         start_gate: threading.Event,
-        shutdown: Callable[[], Any],
+        context: WebSessionContext,
+        shutdown: Callable[[], Any] | None,
     ) -> None:
         start_gate.wait()
-        cls._safe_shutdown_controller(shutdown)
+        selected_error = cls._dispose_context_resources(context, shutdown)
+        if selected_error is not None:
+            raise selected_error
+
+    @staticmethod
+    def _dispose_context_resources(
+        context: WebSessionContext,
+        shutdown: Callable[[], Any] | None,
+        primary_error: BaseException | None = None,
+    ) -> BaseException | None:
+        selected_error = primary_error
+        if shutdown is not None:
+            try:
+                shutdown()
+            except BaseException as shutdown_error:
+                selected_error = _preferred_failure(
+                    selected_error,
+                    shutdown_error,
+                )
+        return context._retire_approved_root_authorities(selected_error)
 
     def _disposal_finished(self, future: Future[Any]) -> None:
         with self._disposal_submit_lock:
@@ -490,12 +759,23 @@ class WebSessionRegistry:
                 context = self._terminal_disposal_backlog.popleft()
             try:
                 self._submit_reserved_disposal(context)
-            except RuntimeError:
+            except RuntimeError as submit_error:
                 self._disposal_slots.release()
                 self._cancel_context_activity(context)
                 shutdown = getattr(context.controller, "shutdown", None)
-                if callable(shutdown):
-                    self._safe_shutdown_controller(shutdown)
+                selected_error = self._dispose_context_resources(
+                    context,
+                    shutdown if callable(shutdown) else None,
+                    submit_error,
+                )
+                if selected_error is not None and not isinstance(
+                    selected_error, Exception
+                ):
+                    raise selected_error
+                logging.getLogger(__name__).warning(
+                    "Web session terminal disposal fallback failed",
+                    exc_info=selected_error,
+                )
 
     def _close_disposal_executor_if_idle_locked(self) -> None:
         with self._lock:

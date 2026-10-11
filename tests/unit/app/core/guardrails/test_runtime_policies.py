@@ -1161,7 +1161,9 @@ class UIAsyncGuardrailTests(unittest.TestCase):
         self.assertNotIn("async def stream_range", service_text)
         self.assertNotIn("async def stream_range", server_text)
         self.assertIn("run_in_executor", service_text)
-        self.assertIn("def _iter_file_range", service_text)
+        self.assertIn("open_approved_file", service_text)
+        self.assertIn("lease.iter_bytes", service_text)
+        self.assertNotIn("def _iter_file_range", service_text)
         self.assertNotIn("def _iter_file_range", server_text)
         self.assertNotIn("def _media_file_info", server_text)
         media_route_block = router_text.split('@router.get("/api/media/{video_id}")', 1)[1].split(

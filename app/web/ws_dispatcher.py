@@ -11,13 +11,28 @@ from fastapi import HTTPException
 
 from app.config import cfg
 from app.exceptions import ConfigValidationError
-from app.web.controller_config_service import WebControllerConfigService
+from app.web.controller_config_service import (
+    DIRECTORY_NOT_AUTHORIZED_MESSAGE,
+    WebControllerConfigService,
+)
 from app.web.logging_utils import log_web_exception
 from app.web.session_runtime import WebSessionContext
 from app.web.controller_route_service import require_valid_video_id
 
 Handler = Callable[[dict[str, Any], WebSessionContext], Awaitable[None]]
 MAX_SCAN_LIMIT = 5000
+
+
+def _handler_accepts_keyword(handler: Callable[..., Any], keyword: str) -> bool:
+    try:
+        parameters = inspect.signature(handler).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(
+        parameter.name == keyword
+        or parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters
+    )
 
 
 async def _run_controller_worker_call(func: Callable[..., Any], *args: Any) -> Any:
@@ -124,10 +139,14 @@ class WebSocketMessageDispatcher:
         return payload
 
     async def _handle_start_crawl(self, data: dict[str, Any], context: WebSessionContext) -> None:
-        payload = await self._normalize_authorized_save_dir(data, context)
-        if payload is None:
-            return
-        await context.workflow.start_crawl(payload, log_error=True)
+        try:
+            with context.lease_approved_root_grants_snapshot():
+                payload = await self._normalize_authorized_save_dir(data, context)
+                if payload is None:
+                    return
+                await context.workflow.start_crawl(payload, log_error=True)
+        except PermissionError:
+            await self._emit_log(context, f"❌ {DIRECTORY_NOT_AUTHORIZED_MESSAGE}")
 
     async def _handle_stop_crawl(self, data: dict[str, Any], context: WebSessionContext) -> None:
         del data
@@ -155,14 +174,16 @@ class WebSocketMessageDispatcher:
                 await self._emit_log(context, f"❌ scan_limit 不能大于 {MAX_SCAN_LIMIT}")
                 return
 
-        target_directory = directory or context.controller.current_save_dir
         try:
-            normalized_directory = context.require_directory(target_directory)
-        except PermissionError as exc:
-            await self._emit_log(context, f"❌ {exc}")
-            return
-
-        await context.controller.async_scan_local_dir(normalized_directory, scan_limit=scan_limit)
+            with context.lease_approved_root_grants_snapshot():
+                target_directory = directory or context.controller.current_save_dir
+                normalized_directory = context.require_directory(target_directory)
+                await context.controller.async_scan_local_dir(
+                    normalized_directory,
+                    scan_limit=scan_limit,
+                )
+        except PermissionError:
+            await self._emit_log(context, f"❌ {DIRECTORY_NOT_AUTHORIZED_MESSAGE}")
 
     async def _handle_change_dir(self, data: dict[str, Any], context: WebSessionContext) -> None:
         directory = data.get("directory", "")
@@ -174,12 +195,11 @@ class WebSocketMessageDispatcher:
             return
 
         try:
-            directory = context.require_directory(directory)
-        except PermissionError as exc:
-            await self._emit_log(context, f"❌ {exc}")
-            return
-
-        await context.controller.async_change_dir(directory)
+            with context.lease_approved_root_grants_snapshot():
+                directory = context.require_directory(directory)
+                await context.controller.async_change_dir(directory)
+        except PermissionError:
+            await self._emit_log(context, f"❌ {DIRECTORY_NOT_AUTHORIZED_MESSAGE}")
 
     async def _handle_change_theme(self, data: dict[str, Any], context: WebSessionContext) -> None:
         is_dark = data.get("dark_theme", True)
@@ -278,7 +298,11 @@ class WebSocketMessageDispatcher:
             await self._emit_log(context, "❌ invalid video_id")
             return
 
-        await context.controller.async_delete_video(video_id, context.approved_roots_snapshot())
+        try:
+            with context.lease_approved_root_grants_snapshot() as grants:
+                await context.controller.async_delete_video(video_id, grants)
+        except PermissionError:
+            await self._emit_log(context, f"❌ {DIRECTORY_NOT_AUTHORIZED_MESSAGE}")
 
     async def _handle_rename_video(self, data: dict[str, Any], context: WebSessionContext) -> None:
         video_id = data.get("video_id", "")
@@ -292,13 +316,25 @@ class WebSocketMessageDispatcher:
             await self._emit_log(context, "❌ invalid video_id")
             return
 
-        await context.controller.async_rename_video(video_id, new_title, context.approved_roots_snapshot())
+        try:
+            with context.lease_approved_root_grants_snapshot() as grants:
+                await context.controller.async_rename_video(
+                    video_id,
+                    new_title,
+                    grants,
+                )
+        except PermissionError:
+            await self._emit_log(context, f"❌ {DIRECTORY_NOT_AUTHORIZED_MESSAGE}")
 
     async def _handle_download(self, data: dict[str, Any], context: WebSessionContext) -> None:
-        payload = await self._normalize_authorized_save_dir(data, context)
-        if payload is None:
-            return
-        await context.workflow.direct_download(payload, log_error=True)
+        try:
+            with context.lease_approved_root_grants_snapshot():
+                payload = await self._normalize_authorized_save_dir(data, context)
+                if payload is None:
+                    return
+                await context.workflow.direct_download(payload, log_error=True)
+        except PermissionError:
+            await self._emit_log(context, f"❌ {DIRECTORY_NOT_AUTHORIZED_MESSAGE}")
 
     async def _handle_frontend_action(self, data: dict[str, Any], context: WebSessionContext) -> None:
         """执行前端动作后尽量返回 delta，旧客户端仍可回退到完整 frontend_state。"""
@@ -375,25 +411,48 @@ class WebSocketMessageDispatcher:
             await context.send("frontend_action_result", result)
             await self._emit_log(context, f"❌ {exc}")
             return
-        if inspect.iscoroutinefunction(handler):
-            result = (
-                await handler(action, payload, approved_roots=approved_roots)
-                if handler_accepts_roots
-                else await handler(action, payload)
-            )
-        else:
+        handler_accepts_grants = _handler_accepts_keyword(
+            handler,
+            "approved_root_grants",
+        )
+
+        async def invoke_handler(
+            approved_root_grants=None,
+        ):
+            handler_kwargs = {}
             if handler_accepts_roots:
-                call = partial(
-                    handler,
-                    action,
-                    payload,
-                    approved_roots=approved_roots,
-                )
+                handler_kwargs["approved_roots"] = approved_roots
+            if handler_accepts_grants:
+                handler_kwargs["approved_root_grants"] = approved_root_grants
+            if inspect.iscoroutinefunction(handler):
+                result = await handler(action, payload, **handler_kwargs)
             else:
-                call = partial(handler, action, payload)
-            result = await _run_controller_worker_call(call)
-        if inspect.isawaitable(result):
-            result = await result
+                if handler_kwargs:
+                    call = partial(
+                        handler,
+                        action,
+                        payload,
+                        **handler_kwargs,
+                    )
+                else:
+                    call = partial(handler, action, payload)
+                result = await _run_controller_worker_call(call)
+            if inspect.isawaitable(result):
+                result = await result
+            return result
+
+        try:
+            if handler_accepts_grants:
+                with context.lease_approved_root_grants_snapshot() as grants:
+                    result = await invoke_handler(grants)
+            else:
+                result = await invoke_handler()
+        except PermissionError:
+            result = {
+                "status": "error",
+                "message": DIRECTORY_NOT_AUTHORIZED_MESSAGE,
+                "data": {"code": "directory_not_authorized"},
+            }
         if request_id and isinstance(result, dict):
             result = dict(result)
             result["request_id"] = request_id

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import threading
 import unittest
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
@@ -12,6 +13,10 @@ from fastapi import WebSocketDisconnect
 from app.web.session_runtime import WebSessionContext, normalize_directory
 from app.web.ws_dispatcher import WebSocketMessageDispatcher
 from app.web.ws_runtime import WebSocketRuntime
+
+
+def _fixed_grant_lease():
+    return nullcontext((("C:/allowed", (11, 22)),))
 
 class _FakeConnectionManager:
     def __init__(self):
@@ -48,33 +53,39 @@ class _RecordingMutationController:
     def __init__(self, current_save_dir: str) -> None:
         self.current_save_dir = current_save_dir
         self.changed_directories: list[str] = []
-        self.deleted_videos: list[tuple[str, tuple[str, ...]]] = []
-        self.renamed_videos: list[tuple[str, str, tuple[str, ...]]] = []
+        self.deleted_videos: list[tuple[str, tuple[object, ...]]] = []
+        self.renamed_videos: list[tuple[str, str, tuple[object, ...]]] = []
+        self.assert_grant_lease = lambda: None
 
     async def async_change_dir(self, directory: str) -> dict:
+        self.assert_grant_lease()
         self.current_save_dir = directory
         self.changed_directories.append(directory)
         return {"status": "ok"}
 
-    async def async_delete_video(self, video_id: str, approved_roots: tuple[str, ...]) -> dict:
-        self.deleted_videos.append((video_id, approved_roots))
+    async def async_delete_video(self, video_id: str, approved_root_grants: tuple[object, ...]) -> dict:
+        self.assert_grant_lease()
+        self.deleted_videos.append((video_id, approved_root_grants))
         return {"status": "ok"}
 
     async def async_rename_video(
         self,
         video_id: str,
         new_title: str,
-        approved_roots: tuple[str, ...],
+        approved_root_grants: tuple[object, ...],
     ) -> dict:
-        self.renamed_videos.append((video_id, new_title, approved_roots))
+        self.assert_grant_lease()
+        self.renamed_videos.append((video_id, new_title, approved_root_grants))
         return {"status": "ok"}
 
 
 class _RecordingMutationWorkflow:
     def __init__(self) -> None:
         self.downloads: list[tuple[dict, bool]] = []
+        self.assert_grant_lease = lambda: None
 
     async def direct_download(self, payload: dict, *, log_error: bool) -> dict:
+        self.assert_grant_lease()
         self.downloads.append((dict(payload), log_error))
         return {"status": "ok"}
 
@@ -124,6 +135,14 @@ class WebSocketMessageDispatcherTests(unittest.IsolatedAsyncioTestCase):
             controller_factory=lambda _loop, _send: controller,
             workflow_factory=lambda _controller, _send: workflow,
         )
+
+        def assert_grant_lease() -> None:
+            authorities = tuple(context._approved_root_authorities.values())
+            self.assertTrue(authorities)
+            self.assertTrue(all(authority.references > 0 for authority in authorities))
+
+        controller.assert_grant_lease = assert_grant_lease
+        workflow.assert_grant_lease = assert_grant_lease
         return context, controller, workflow, sent
 
     async def test_unknown_message_types_return_protocol_errors(self):
@@ -234,11 +253,11 @@ class WebSocketMessageDispatcherTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(download_data["save_dir"], unnormalized)
             self.assertEqual(sent, [])
 
-    async def test_valid_video_mutations_forward_session_roots(self):
+    async def test_valid_video_mutations_forward_session_generation_grants(self):
         dispatcher = WebSocketMessageDispatcher()
         with TemporaryDirectory(ignore_cleanup_errors=True) as approved_root:
             context, controller, _workflow, sent = self._mutation_context(approved_root)
-            approved_roots = context.approved_roots_snapshot()
+            approved_root_grants = context.approved_root_grants_snapshot()
 
             await dispatcher.handle(
                 {"type": "delete_video", "data": {"video_id": "video_01"}},
@@ -252,12 +271,48 @@ class WebSocketMessageDispatcherTests(unittest.IsolatedAsyncioTestCase):
                 context,
             )
 
-            self.assertEqual(controller.deleted_videos, [("video_01", approved_roots)])
+            self.assertEqual(
+                controller.deleted_videos,
+                [("video_01", approved_root_grants)],
+            )
             self.assertEqual(
                 controller.renamed_videos,
-                [("video-02", "Renamed title", approved_roots)],
+                [("video-02", "Renamed title", approved_root_grants)],
             )
             self.assertEqual(sent, [])
+
+    async def test_mutation_lease_failure_is_redacted_before_controller_dispatch(self):
+        dispatcher = WebSocketMessageDispatcher()
+        sent = []
+
+        @contextmanager
+        def denied_lease():
+            raise PermissionError("private root C:/secret/downloads changed")
+            yield ()
+
+        async def send(event_type, data):
+            sent.append((event_type, data))
+
+        controller = SimpleNamespace(
+            async_delete_video=AsyncMock(),
+            async_rename_video=AsyncMock(),
+        )
+        context = SimpleNamespace(
+            controller=controller,
+            lease_approved_root_grants_snapshot=denied_lease,
+            send=send,
+        )
+
+        await dispatcher._handle_delete_video({"video_id": "video-1"}, context)
+        await dispatcher._handle_rename_video(
+            {"video_id": "video-2", "new_title": "renamed"},
+            context,
+        )
+
+        self.assertEqual([event_type for event_type, _data in sent], ["log", "log"])
+        self.assertNotIn("C:/secret", repr(sent))
+        controller.async_delete_video.assert_not_awaited()
+        controller.async_rename_video.assert_not_awaited()
 
     async def test_scan_without_directory_authorizes_current_save_directory(self):
         dispatcher = WebSocketMessageDispatcher()
@@ -273,6 +328,7 @@ class WebSocketMessageDispatcherTests(unittest.IsolatedAsyncioTestCase):
         context = SimpleNamespace(
             controller=controller,
             require_directory=Mock(side_effect=PermissionError("目录未被当前会话授权访问")),
+            lease_approved_root_grants_snapshot=_fixed_grant_lease,
             send=send,
         )
 
@@ -287,12 +343,32 @@ class WebSocketMessageDispatcherTests(unittest.IsolatedAsyncioTestCase):
         dispatcher = WebSocketMessageDispatcher()
         observed = {}
         sent = []
+        lease_active = False
+        grants = (("C:/allowed", (11, 22)),)
+        case = self
+
+        @contextmanager
+        def lease_grants():
+            nonlocal lease_active
+            lease_active = True
+            try:
+                yield grants
+            finally:
+                lease_active = False
 
         class Controller:
-            async def async_handle_frontend_action(self, action, payload, approved_roots=None):
+            async def async_handle_frontend_action(
+                self,
+                action,
+                payload,
+                approved_roots=None,
+                approved_root_grants=None,
+            ):
+                case.assertTrue(lease_active)
                 observed["action"] = action
                 observed["payload"] = payload
                 observed["approved_roots"] = approved_roots
+                observed["approved_root_grants"] = approved_root_grants
                 return {"status": "error", "message": "目录未被当前会话授权访问"}
 
             def get_frontend_delta(self, frontend_version):
@@ -304,6 +380,7 @@ class WebSocketMessageDispatcherTests(unittest.IsolatedAsyncioTestCase):
         context = SimpleNamespace(
             controller=Controller(),
             approved_roots_snapshot=Mock(return_value=("C:/allowed",)),
+            lease_approved_root_grants_snapshot=lease_grants,
             send=send,
         )
 
@@ -317,6 +394,11 @@ class WebSocketMessageDispatcherTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(observed["approved_roots"], ("C:/allowed",))
+        self.assertEqual(
+            observed["approved_root_grants"],
+            grants,
+        )
+        self.assertFalse(lease_active)
         self.assertEqual(sent[0][0], "frontend_action_result")
         self.assertEqual(sent[0][1]["status"], "error")
 
@@ -409,7 +491,11 @@ class WebSocketMessageDispatcherTests(unittest.IsolatedAsyncioTestCase):
             async_handle_frontend_action=AsyncMock(return_value={"status": "ok"}),
             get_frontend_delta=Mock(return_value=delta),
         )
-        context = SimpleNamespace(controller=controller, send=send)
+        context = SimpleNamespace(
+            controller=controller,
+            lease_approved_root_grants_snapshot=_fixed_grant_lease,
+            send=send,
+        )
 
         await dispatcher._handle_frontend_action(
             {
@@ -435,7 +521,11 @@ class WebSocketMessageDispatcherTests(unittest.IsolatedAsyncioTestCase):
             async_handle_frontend_action=AsyncMock(return_value={"status": "ok", "message": "saved"}),
             get_frontend_delta=Mock(side_effect=RuntimeError("delta unavailable")),
         )
-        context = SimpleNamespace(controller=controller, send=send)
+        context = SimpleNamespace(
+            controller=controller,
+            lease_approved_root_grants_snapshot=_fixed_grant_lease,
+            send=send,
+        )
 
         await dispatcher._handle_frontend_action(
             {
@@ -460,7 +550,11 @@ class WebSocketMessageDispatcherTests(unittest.IsolatedAsyncioTestCase):
             sent.append((event_type, data))
 
         controller = SimpleNamespace(async_handle_frontend_action=AsyncMock())
-        context = SimpleNamespace(controller=controller, send=send)
+        context = SimpleNamespace(
+            controller=controller,
+            lease_approved_root_grants_snapshot=_fixed_grant_lease,
+            send=send,
+        )
 
         await dispatcher._handle_save_config(
             {"section": "common", "key": "user_agent", "value": "unsafe"},
@@ -535,7 +629,11 @@ class WebSocketMessageDispatcherTests(unittest.IsolatedAsyncioTestCase):
             sent.append((event_type, data))
 
         controller = SimpleNamespace(async_handle_frontend_action=AsyncMock())
-        context = SimpleNamespace(controller=controller, send=send)
+        context = SimpleNamespace(
+            controller=controller,
+            lease_approved_root_grants_snapshot=_fixed_grant_lease,
+            send=send,
+        )
 
         await dispatcher._handle_frontend_action(
             {
@@ -592,7 +690,11 @@ class WebSocketMessageDispatcherTests(unittest.IsolatedAsyncioTestCase):
                 return_value={"version": 2, "base_version": 1, "changed_sections": [], "sections": {}}
             ),
         )
-        context = SimpleNamespace(controller=controller, send=send)
+        context = SimpleNamespace(
+            controller=controller,
+            lease_approved_root_grants_snapshot=_fixed_grant_lease,
+            send=send,
+        )
 
         await dispatcher._handle_frontend_action(
             {

@@ -23,6 +23,39 @@ _ACTIVE_CAPABILITIES: ContextVar[
 _AT_FDCWD = -100
 _AT_SYMLINK_FOLLOW = 0x400
 _AT_EMPTY_PATH = 0x1000
+_MAX_DIRECTORY_SNAPSHOT_ENTRIES = 4096
+
+
+class _FilesystemChildLinkError(OSError):
+    """A child rejected specifically because it is a link/reparse point."""
+
+
+@dataclass(frozen=True, slots=True)
+class DirectoryChildSnapshot:
+    """Primitive metadata for one validated immediate directory child."""
+
+    name: str
+    mode: int
+    size: int
+    modified_ns: int
+    identity: tuple[int, int]
+
+    @property
+    def is_file(self) -> bool:
+        return stat.S_ISREG(self.mode)
+
+    @property
+    def is_directory(self) -> bool:
+        return stat.S_ISDIR(self.mode)
+
+
+@dataclass(frozen=True, slots=True)
+class DirectorySnapshot:
+    """One bounded view of validated immediate children."""
+
+    children: tuple[DirectoryChildSnapshot, ...]
+    examined: int
+    truncated: bool
 
 
 class DescriptorPublishStatus(str, Enum):
@@ -246,8 +279,83 @@ class FilesystemDirectoryCapability:
             value = os.lstat(self.root / child)
         self.assert_bound()
         if is_link_or_reparse(value):
-            raise OSError("filesystem capability child is a link or reparse point")
+            raise _FilesystemChildLinkError(
+                "filesystem capability child is a link or reparse point"
+            )
         return value
+
+    def snapshot_children(
+        self,
+        *,
+        max_entries: int = _MAX_DIRECTORY_SNAPSHOT_ENTRIES,
+    ) -> DirectorySnapshot:
+        """Enumerate a bounded, no-follow snapshot under this live authority."""
+
+        budget = _validated_directory_snapshot_budget(max_entries)
+        self.assert_bound()
+        if self._descriptor is not None:
+            source: int | Path = self._descriptor
+        elif self._windows_handles:
+            source = self.root
+        else:
+            raise OSError("approved directory capability has no live handle")
+
+        iterator = None
+        primary_error: BaseException | None = None
+        snapshot: DirectorySnapshot | None = None
+        try:
+            iterator = os.scandir(source)
+            children: list[DirectoryChildSnapshot] = []
+            examined = 0
+            truncated = False
+            for entry in iterator:
+                examined += 1
+                if examined > budget:
+                    truncated = True
+                    break
+                child = _validated_child_name(entry.name)
+                try:
+                    value = self.stat_child(child)
+                except (FileNotFoundError, _FilesystemChildLinkError):
+                    continue
+                children.append(_directory_child_snapshot(child, value))
+            snapshot = DirectorySnapshot(
+                children=tuple(children),
+                examined=examined,
+                truncated=truncated,
+            )
+        except BaseException as exc:
+            primary_error = exc
+
+        close_error: BaseException | None = None
+        if iterator is not None:
+            try:
+                iterator.close()
+            except BaseException as exc:
+                close_error = exc
+
+        identity_error: BaseException | None = None
+        try:
+            self.assert_bound()
+        except BaseException as exc:
+            identity_error = exc
+
+        selected_error = _preferred_cleanup_error(primary_error, close_error)
+        selected_error = _preferred_cleanup_error(selected_error, identity_error)
+        if selected_error is not None:
+            if close_error is not None and selected_error is not close_error:
+                _attach_note_best_effort(
+                    selected_error,
+                    "directory snapshot iterator cleanup failed",
+                )
+            if identity_error is not None and selected_error is not identity_error:
+                _attach_note_best_effort(
+                    selected_error,
+                    "approved directory identity changed during directory snapshot",
+                )
+            raise selected_error
+        assert snapshot is not None
+        return snapshot
 
     def open_child(self, name: str, flags: int, mode: int = 0o600) -> int:
         child = _validated_child_name(name)
@@ -1172,6 +1280,35 @@ def _safe_directory(value: os.stat_result) -> bool:
 
 def _stat_identity(value: os.stat_result) -> tuple[int, int]:
     return int(value.st_dev), int(value.st_ino)
+
+
+def _validated_directory_snapshot_budget(value: int) -> int:
+    if (
+        type(value) is not int
+        or value < 1
+        or value > _MAX_DIRECTORY_SNAPSHOT_ENTRIES
+    ):
+        raise ValueError(
+            "max_entries must be an integer between 1 and "
+            f"{_MAX_DIRECTORY_SNAPSHOT_ENTRIES}"
+        )
+    return value
+
+
+def _directory_child_snapshot(
+    name: str,
+    value: os.stat_result,
+) -> DirectoryChildSnapshot:
+    modified_ns = getattr(value, "st_mtime_ns", None)
+    if type(modified_ns) is not int:
+        modified_ns = int(float(value.st_mtime) * 1_000_000_000)
+    return DirectoryChildSnapshot(
+        name=name,
+        mode=int(value.st_mode),
+        size=int(value.st_size),
+        modified_ns=modified_ns,
+        identity=_stat_identity(value),
+    )
 
 
 def _validated_child_name(value: str) -> str:

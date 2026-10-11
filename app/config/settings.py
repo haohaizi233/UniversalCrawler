@@ -24,9 +24,17 @@ from app.config.constants import (
     DEFAULT_USER_AGENT,
     SUPPORTED_THEMES,
 )
+from app.config.settings_file_lock import (
+    acquire_file_lock_descriptor,
+    release_file_lock_descriptor,
+)
 from app.core.event_bus import EventBus
 from app.exceptions import ConfigReadError, ConfigValidationError, ConfigWriteError
 from app.utils.runtime_paths import is_temporary_path, resolve_user_file
+from shared.filesystem_directory_capability import (
+    FilesystemDirectoryCapability,
+    filesystem_directory_capability,
+)
 
 CURRENT_FILENAME_TEMPLATE = "current"
 DEFAULT_OPEN_MODE = "builtin_player"
@@ -707,6 +715,7 @@ class _InstrumentedRLock:
     def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
         self.release()
 
+
 class ConfigManager:
     """协调内存配置、磁盘持久化和不同前端进程之间的变更通知。"""
     SECTION_MODELS = {
@@ -764,66 +773,51 @@ class ConfigManager:
     def _transaction_depth(self) -> int:
         return int(getattr(self._transaction_local, "depth", 0) or 0)
 
+    def _config_parent_capability(self) -> FilesystemDirectoryCapability | None:
+        return getattr(self._transaction_local, "config_parent_capability", None)
+
     @contextmanager
     def _exclusive_file_lock(self):
-        """用 30 秒租约式协作锁尽量串行化 GUI、WebUI 等进程的配置写入。
-
-        超过租期的锁文件会被其他进程删除，即使原持有者仍在运行，因此不提供绝对
-        的跨进程互斥保证。
-        """
+        """Serialize configuration writes with a persistent OS advisory lock."""
         if self._transaction_depth() > 0:
             yield
             return
 
-        deadline = time_module.monotonic() + CONFIG_FILE_LOCK_TIMEOUT_SECONDS
-        descriptor: int | None = None
-        while descriptor is None:
-            try:
-                descriptor = os.open(
-                    self._file_lock_path,
-                    os.O_CREAT | os.O_EXCL | os.O_WRONLY,
-                )
-                os.write(descriptor, f"{os.getpid()} {time_module.time()}".encode("ascii"))
-            except FileExistsError as exc:
-                try:
-                    age = time_module.time() - self._file_lock_path.stat().st_mtime
-                    if age >= CONFIG_FILE_LOCK_STALE_SECONDS:
-                        self._file_lock_path.unlink(missing_ok=True)
-                        continue
-                except OSError:
-                    pass
-                if time_module.monotonic() >= deadline:
-                    raise ConfigWriteError(f"timed out waiting for config lock: {self._file_lock_path}") from exc
-                time_module.sleep(0.02)
-            except OSError as exc:
-                if descriptor is not None:
-                    try:
-                        os.close(descriptor)
-                    finally:
-                        descriptor = None
-                        try:
-                            self._file_lock_path.unlink(missing_ok=True)
-                        except OSError:
-                            pass
-                raise ConfigWriteError(str(exc)) from exc
-
-        self._transaction_local.depth = 1
         try:
-            yield
-        finally:
-            self._transaction_local.depth = 0
-            try:
-                os.close(descriptor)
-            finally:
+            with filesystem_directory_capability(Path(self.filename).parent) as capability:
+                descriptor = acquire_file_lock_descriptor(
+                    self._file_lock_path,
+                    timeout_seconds=CONFIG_FILE_LOCK_TIMEOUT_SECONDS,
+                )
+                capability.assert_bound()
+                self._transaction_local.depth = 1
+                self._transaction_local.config_parent_capability = capability
+                primary_error: BaseException | None = None
                 try:
-                    self._file_lock_path.unlink(missing_ok=True)
-                except OSError:
-                    pass
+                    yield
+                except BaseException as exc:
+                    primary_error = exc
+                    raise
+                finally:
+                    self._transaction_local.depth = 0
+                    self._transaction_local.config_parent_capability = None
+                    release_file_lock_descriptor(
+                        descriptor,
+                        acquired=True,
+                        primary_error=primary_error,
+                    )
+        except OSError as exc:
+            raise ConfigWriteError(str(exc)) from exc
 
     def _read_disk_data_unlocked(self) -> dict[str, Any]:
         try:
+            capability = self._config_parent_capability()
+            if capability is not None:
+                capability.assert_bound()
             with open(self.filename, "r", encoding="utf-8") as fp:
                 saved_data = json.load(fp)
+            if capability is not None:
+                capability.assert_bound()
         except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
             raise ConfigReadError(str(exc)) from exc
         if not isinstance(saved_data, dict):
@@ -1150,6 +1144,12 @@ class ConfigManager:
         logger = logging.getLogger(__name__)
         target_file = Path(self.filename)
         parent = target_file.parent
+        capability = self._config_parent_capability()
+        try:
+            if capability is not None:
+                capability.assert_bound()
+        except OSError as exc:
+            raise ConfigWriteError(str(exc)) from exc
         parent.mkdir(parents=True, exist_ok=True)
         last_permission_error: PermissionError | None = None
 
@@ -1170,7 +1170,11 @@ class ConfigManager:
                     fp.flush()
                     os.fsync(fp.fileno())
                     temp_file = Path(fp.name)
+                if capability is not None:
+                    capability.assert_bound()
                 temp_file.replace(target_file)
+                if capability is not None:
+                    capability.assert_bound()
                 self._disk_signature = self._current_disk_signature()
                 return
             except PermissionError as exc:

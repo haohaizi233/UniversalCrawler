@@ -2,6 +2,8 @@
 
 import json
 import os
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -31,10 +33,162 @@ from app.config.settings import (
     speed_limit_options,
     ui_log_max_display_options,
 )
-from app.exceptions import ConfigWriteError
+from app.exceptions import ConfigReadError, ConfigWriteError
 from app.utils.runtime_paths import resolve_user_file
 
 class ConfigManagerTests(unittest.TestCase):
+
+    def test_exclusive_file_lock_reuses_persistent_lock_file(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            manager = ConfigManager(f"{temp_dir}/config.json")
+            manager._file_lock_path.write_text("previous owner", encoding="utf-8")
+
+            with mock.patch(
+                "app.config.settings.CONFIG_FILE_LOCK_TIMEOUT_SECONDS",
+                0.1,
+            ):
+                with manager._exclusive_file_lock():
+                    pass
+
+            self.assertTrue(manager._file_lock_path.exists())
+
+    def test_cross_process_lock_remains_exclusive_past_legacy_stale_age(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "config.json"
+            ready_path = Path(temp_dir) / "owner-ready"
+            release_path = Path(temp_dir) / "release-owner"
+            manager = ConfigManager(str(config_path))
+            script = """
+import sys
+import time
+from pathlib import Path
+from app.config.settings import ConfigManager
+
+manager = ConfigManager(sys.argv[1])
+ready_path = Path(sys.argv[2])
+release_path = Path(sys.argv[3])
+with manager._exclusive_file_lock():
+    ready_path.write_text("ready", encoding="utf-8")
+    deadline = time.monotonic() + 5.0
+    while not release_path.exists():
+        if time.monotonic() >= deadline:
+            raise TimeoutError("parent did not release lock owner")
+        time.sleep(0.01)
+"""
+            process = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-c",
+                    script,
+                    str(config_path),
+                    str(ready_path),
+                    str(release_path),
+                ],
+                cwd=Path(__file__).resolve().parents[4],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            try:
+                deadline = time.monotonic() + 3.0
+                while not ready_path.exists() and process.poll() is None:
+                    if time.monotonic() >= deadline:
+                        self.fail("child lock owner did not become ready")
+                    time.sleep(0.01)
+                self.assertIsNone(process.poll())
+
+                with mock.patch(
+                    "app.config.settings.CONFIG_FILE_LOCK_TIMEOUT_SECONDS",
+                    0.2,
+                ):
+                    with mock.patch(
+                        "app.config.settings.CONFIG_FILE_LOCK_STALE_SECONDS",
+                        0.05,
+                    ):
+                        time.sleep(0.08)
+                        with self.assertRaises(ConfigWriteError):
+                            with manager._exclusive_file_lock():
+                                pass
+            finally:
+                release_path.write_text("release", encoding="utf-8")
+                try:
+                    stdout, stderr = process.communicate(timeout=3.0)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    stdout, stderr = process.communicate(timeout=3.0)
+
+            self.assertEqual(0, process.returncode, f"{stdout}\n{stderr}")
+            self.assertTrue(manager._file_lock_path.exists())
+
+    @unittest.skipIf(os.name == "nt", "Windows denies replacing an open lock file")
+    def test_lock_owner_exit_does_not_delete_replacement_generation(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            manager = ConfigManager(f"{temp_dir}/config.json")
+            replaced_owner = manager._file_lock_path.with_suffix(".lock.owner-a")
+
+            with manager._exclusive_file_lock():
+                manager._file_lock_path.replace(replaced_owner)
+                manager._file_lock_path.write_text("owner-b", encoding="utf-8")
+
+            self.assertEqual(
+                "owner-b",
+                manager._file_lock_path.read_text(encoding="utf-8"),
+            )
+
+    def test_locked_read_fails_closed_when_config_parent_generation_changes(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config_parent = root / "config-root"
+            config_path = config_parent / "config.json"
+            manager = ConfigManager(str(config_path))
+            stable_lock_parent = root / "stable-locks"
+            stable_lock_parent.mkdir()
+            manager._file_lock_path = stable_lock_parent / "config.lock"
+            retired_parent = root / "retired-config-root"
+
+            with manager._exclusive_file_lock():
+                try:
+                    config_parent.replace(retired_parent)
+                except OSError:
+                    return
+                config_parent.mkdir()
+                attacker_data = manager.settings.to_dict()
+                attacker_data["common"]["theme"] = "dark"
+                config_path.write_text(
+                    json.dumps(attacker_data),
+                    encoding="utf-8",
+                )
+
+                with self.assertRaises(ConfigReadError):
+                    manager._read_disk_data_unlocked()
+
+    def test_locked_write_fails_closed_when_config_parent_generation_changes(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config_parent = root / "config-root"
+            config_path = config_parent / "config.json"
+            manager = ConfigManager(str(config_path))
+            stable_lock_parent = root / "stable-locks"
+            stable_lock_parent.mkdir()
+            manager._file_lock_path = stable_lock_parent / "config.lock"
+            retired_parent = root / "retired-config-root"
+
+            with manager._exclusive_file_lock():
+                try:
+                    config_parent.replace(retired_parent)
+                except OSError:
+                    return
+                config_parent.mkdir()
+                manager.settings.common.theme = "dark"
+
+                with self.assertRaises(ConfigWriteError):
+                    manager._save_unlocked()
+
+            self.assertFalse(config_path.exists())
+            retired_data = json.loads(
+                (retired_parent / "config.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual("light", retired_data["common"]["theme"])
 
     def test_failed_set_keeps_state_imported_by_forced_refresh(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -96,7 +250,7 @@ class ConfigManagerTests(unittest.TestCase):
             self.assertEqual(stale_manager._current_disk_signature(), stale_manager._disk_signature)
             self.assertFalse(stale_manager.reload_if_changed())
 
-    def test_exclusive_file_lock_cleans_up_when_metadata_write_fails(self):
+    def test_exclusive_file_lock_releases_descriptor_when_metadata_write_fails(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             manager = ConfigManager(f"{temp_dir}/config.json")
 
@@ -110,7 +264,26 @@ class ConfigManagerTests(unittest.TestCase):
                             self.fail("lock body should not run")
 
             close_mock.assert_called_once()
-            self.assertFalse(manager._file_lock_path.exists())
+            self.assertTrue(manager._file_lock_path.exists())
+            with manager._exclusive_file_lock():
+                pass
+
+    def test_exclusive_file_lock_preserves_body_base_exception_when_close_fails(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            manager = ConfigManager(f"{temp_dir}/config.json")
+            real_close = os.close
+
+            def close_then_fail(descriptor: int) -> None:
+                real_close(descriptor)
+                raise SystemExit("close failed")
+
+            with mock.patch(
+                "app.config.settings.os.close",
+                side_effect=close_then_fail,
+            ):
+                with self.assertRaisesRegex(KeyboardInterrupt, "body failed"):
+                    with manager._exclusive_file_lock():
+                        raise KeyboardInterrupt("body failed")
 
     def test_restarted_external_sync_does_not_revive_timed_out_watcher(self):
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -12,6 +12,199 @@ import pytest
 import shared.filesystem_directory_capability as capability_module
 
 
+def test_snapshot_children_returns_bounded_primitive_metadata_and_skips_links(
+    tmp_path,
+):
+    approved = tmp_path / "approved"
+    approved.mkdir()
+    payload = approved / "payload.bin"
+    payload.write_bytes(b"payload")
+    child_directory = approved / "nested"
+    child_directory.mkdir()
+    outside = tmp_path / "outside.bin"
+    outside.write_bytes(b"outside")
+    link = approved / "outside-link"
+    try:
+        link.symlink_to(outside)
+    except OSError as exc:
+        pytest.skip(f"file symlink creation unavailable: {exc}")
+
+    with capability_module.filesystem_directory_capability(approved) as capability:
+        snapshot = capability.snapshot_children(max_entries=8)
+
+    children = {child.name: child for child in snapshot.children}
+    payload_stat = os.lstat(payload)
+    directory_stat = os.lstat(child_directory)
+
+    assert snapshot.examined == 3
+    assert snapshot.truncated is False
+    assert set(children) == {"nested", "payload.bin"}
+    assert children["payload.bin"] == capability_module.DirectoryChildSnapshot(
+        name="payload.bin",
+        mode=int(payload_stat.st_mode),
+        size=7,
+        modified_ns=int(payload_stat.st_mtime_ns),
+        identity=(int(payload_stat.st_dev), int(payload_stat.st_ino)),
+    )
+    assert children["payload.bin"].is_file is True
+    assert children["payload.bin"].is_directory is False
+    assert children["nested"].mode == int(directory_stat.st_mode)
+    assert children["nested"].is_file is False
+    assert children["nested"].is_directory is True
+
+
+def test_snapshot_children_consumes_only_one_entry_past_the_requested_budget(
+    tmp_path,
+):
+    approved = tmp_path / "approved"
+    approved.mkdir()
+    for index in range(5):
+        (approved / f"payload-{index}.bin").write_bytes(bytes((index,)))
+
+    with capability_module.filesystem_directory_capability(approved) as capability:
+        truncated = capability.snapshot_children(max_entries=2)
+        complete = capability.snapshot_children(max_entries=8)
+
+    assert len(truncated.children) == 2
+    assert truncated.examined == 3
+    assert truncated.truncated is True
+    assert len(complete.children) == 5
+    assert complete.examined == 5
+    assert complete.truncated is False
+
+
+@pytest.mark.parametrize("max_entries", (True, 0, -1, 4097, 10**100))
+def test_snapshot_children_rejects_unbounded_or_non_integer_budgets(
+    tmp_path,
+    max_entries,
+):
+    with capability_module.filesystem_directory_capability(tmp_path) as capability:
+        with pytest.raises(ValueError, match="max_entries"):
+            capability.snapshot_children(max_entries=max_entries)
+
+
+def test_snapshot_children_bounds_hostile_iterators_by_examined_entries(
+    tmp_path,
+    monkeypatch,
+):
+    payload = tmp_path / "payload.bin"
+    payload.write_bytes(b"payload")
+    next_calls = 0
+    closed = False
+
+    class EndlessDirectoryIterator:
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            nonlocal next_calls
+            next_calls += 1
+            return type("Entry", (), {"name": payload.name})()
+
+        def close(self) -> None:
+            nonlocal closed
+            closed = True
+
+    monkeypatch.setattr(
+        capability_module.os,
+        "scandir",
+        lambda _source: EndlessDirectoryIterator(),
+    )
+
+    with capability_module.filesystem_directory_capability(tmp_path) as capability:
+        snapshot = capability.snapshot_children(max_entries=2)
+
+    assert snapshot.examined == 3
+    assert snapshot.truncated is True
+    assert len(snapshot.children) == 2
+    assert next_calls == 3
+    assert closed is True
+
+
+@pytest.mark.parametrize("through_ancestor", (False, True))
+def test_snapshot_children_rejects_root_or_ancestor_generation_replacement(
+    tmp_path,
+    through_ancestor,
+):
+    ancestor = tmp_path / "ancestor"
+    approved = ancestor / "approved"
+    approved.mkdir(parents=True)
+    (approved / "payload.bin").write_bytes(b"approved")
+    target = ancestor if through_ancestor else approved
+    moved = tmp_path / "before-swap"
+
+    capability = capability_module.open_filesystem_directory_capability(approved)
+    try:
+        try:
+            target.rename(moved)
+        except PermissionError:
+            snapshot = capability.snapshot_children(max_entries=4)
+            assert [child.name for child in snapshot.children] == ["payload.bin"]
+            return
+
+        if through_ancestor:
+            replacement = target / approved.name
+            replacement.mkdir(parents=True)
+        else:
+            target.mkdir()
+        with pytest.raises(OSError, match="identity changed"):
+            capability.snapshot_children(max_entries=4)
+    finally:
+        capability.close()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX descriptor enumeration contract")
+def test_snapshot_children_posix_enumerates_the_held_descriptor_without_path_reopen(
+    tmp_path,
+    monkeypatch,
+):
+    (tmp_path / "payload.bin").write_bytes(b"payload")
+    real_scandir = os.scandir
+
+    def descriptor_only_scandir(source):
+        if type(source) is not int:
+            raise AssertionError("POSIX directory snapshot reopened a path")
+        return real_scandir(source)
+
+    monkeypatch.setattr(capability_module.os, "scandir", descriptor_only_scandir)
+
+    with capability_module.filesystem_directory_capability(tmp_path) as capability:
+        snapshot = capability.snapshot_children(max_entries=4)
+        capability.assert_bound()
+
+    assert [child.name for child in snapshot.children] == ["payload.bin"]
+
+
+def test_snapshot_children_preserves_first_control_flow_over_hostile_close(
+    tmp_path,
+    monkeypatch,
+):
+    primary = KeyboardInterrupt("directory enumeration interrupted")
+    cleanup = SystemExit("directory iterator close interrupted")
+
+    class HostileDirectoryIterator:
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            raise primary
+
+        def close(self) -> None:
+            raise cleanup
+
+    monkeypatch.setattr(
+        capability_module.os,
+        "scandir",
+        lambda _source: HostileDirectoryIterator(),
+    )
+
+    with capability_module.filesystem_directory_capability(tmp_path) as capability:
+        with pytest.raises(KeyboardInterrupt) as exc_info:
+            capability.snapshot_children(max_entries=4)
+
+    assert exc_info.value is primary
+
+
 def test_open_capability_can_be_asserted_and_closed_from_another_thread(
     tmp_path,
 ):

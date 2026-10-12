@@ -153,12 +153,18 @@ jobs:
         run: .\.audit-venv\Scripts\python -m pip_audit --local --skip-editable --strict --progress-spinner off
 
   core-tests:
-    name: Full test suite / Core + performance (Windows, Python 3.13)
+    name: Core shard / ${{ matrix.shard }}
     needs: quality
     runs-on: windows-latest
-    timeout-minutes: 75
+    timeout-minutes: 35
     env:
       QT_QPA_PLATFORM: offscreen
+    strategy:
+      fail-fast: false
+      matrix:
+        # 单进程大杂烩曾把 5000+ 用例串在一台 runner 上跑约 26 分钟；
+        # 按目录切成并行分片后每片独立进程，Qt/原生资源互不累积。
+        shard: [unit, integration, release, misc, contract-1, contract-2, contract-3, contract-4]
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -178,54 +184,93 @@ jobs:
           python -m pip install -r requirements.txt
           python -m pip install -r requirements-dev.txt
 
-      - name: Run all non-browser tests with coverage
+      - name: Run shard
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force artifacts | Out-Null
-          python -m coverage erase
-          python -m coverage run --branch --source=app,cli,entry,shared --omit="app/core/lib/douyin/encrypt/aBogus.py,app/core/lib/douyin/encrypt/verifyFp.py,app/core/lib/douyin/encrypt/xBogus.py,app/core/lib/douyin/encrypt/xGnarly.py" -m pytest tests/unit tests/integration tests/architecture tests/release tests/testkit -q --junitxml=artifacts/core-tests.xml
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $shard = "${{ matrix.shard }}"
+          $omit = "app/core/lib/douyin/encrypt/aBogus.py,app/core/lib/douyin/encrypt/verifyFp.py,app/core/lib/douyin/encrypt/xBogus.py,app/core/lib/douyin/encrypt/xGnarly.py"
+          $coverageArgs = @("run", "--data-file=artifacts/.coverage-$shard", "--branch", "--source=app,cli,entry,shared", "--omit=$omit")
 
-          $contractFiles = @(
-            python -c "from tests.support.catalog import get_resolved_files; print(*get_resolved_files('contract'), sep='\n')"
-          )
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          if ($contractFiles.Count -eq 0) { throw "No contract tests were found through the suite catalog" }
-          $contractNodes = @(
-            python -m pytest $contractFiles --collect-only -q |
-              Where-Object { $_ -match "::" }
-          )
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          if ($contractNodes.Count -eq 0) { throw "No contract test nodes were collected" }
-
-          # 所有契约测试统一按目录发现结果分片；每片重建 Qt/原生资源，避免长驻 runner 累积对象。
-          $contractChunkSize = 12
-          for ($offset = 0; $offset -lt $contractNodes.Count; $offset += $contractChunkSize) {
-            $last = [Math]::Min($offset + $contractChunkSize - 1, $contractNodes.Count - 1)
-            [string[]] $chunk = $contractNodes[$offset..$last]
-            $chunkNumber = [int]($offset / $contractChunkSize) + 1
-            python -m coverage run --append --branch --source=app,cli,entry,shared --omit="app/core/lib/douyin/encrypt/aBogus.py,app/core/lib/douyin/encrypt/verifyFp.py,app/core/lib/douyin/encrypt/xBogus.py,app/core/lib/douyin/encrypt/xGnarly.py" -m pytest $chunk -q --junitxml="artifacts/contract-$chunkNumber.xml"
-            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          switch ($shard) {
+            "unit" {
+              python -m coverage @coverageArgs -m pytest tests/unit -q --junitxml=artifacts/core-unit.xml
+              if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            }
+            "integration" {
+              python -m coverage @coverageArgs -m pytest tests/integration -q --junitxml=artifacts/core-integration.xml
+              if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            }
+            "release" {
+              python -m coverage @coverageArgs -m pytest tests/release -q --junitxml=artifacts/core-release.xml
+              if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            }
+            "misc" {
+              python -m coverage @coverageArgs -m pytest tests/architecture tests/testkit -q --junitxml=artifacts/core-misc.xml
+              if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+              # 性能预算不插桩，避免计时代码被 coverage 拖慢。
+              python -X faulthandler -m pytest tests/performance -q
+              if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            }
+            default {
+              # contract-N：按目录发现顺序把契约节点均分为 4 组，本片跑第 N 组。
+              $shardIndex = [int]($shard.Split("-")[1])
+              $groupCount = 4
+              $contractFiles = @(
+                python -c "from tests.support.catalog import get_resolved_files; print(*get_resolved_files('contract'), sep='\n')"
+              )
+              if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+              if ($contractFiles.Count -eq 0) { throw "No contract tests were found through the suite catalog" }
+              $contractNodes = @(
+                python -m pytest $contractFiles --collect-only -q |
+                  Where-Object { $_ -match "::" }
+              )
+              if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+              if ($contractNodes.Count -eq 0) { throw "No contract test nodes were collected" }
+              $groupSize = [Math]::Ceiling($contractNodes.Count / $groupCount)
+              $start = ($shardIndex - 1) * $groupSize
+              $end = [Math]::Min($start + $groupSize - 1, $contractNodes.Count - 1)
+              if ($start -gt $end) {
+                Write-Host "contract shard $shardIndex is empty; nothing to run"
+                exit 0
+              }
+              [string[]] $chunk = $contractNodes[$start..$end]
+              python -m coverage @coverageArgs -m pytest $chunk -q --junitxml="artifacts/core-contract-$shardIndex.xml"
+              if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            }
           }
 
-          python -m coverage xml -o artifacts/coverage.xml
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          python -m coverage report
-
-      - name: Run performance budgets without instrumentation
-        run: python -X faulthandler -m pytest tests/performance -q
-
-      - name: Upload core report
+      - name: Upload shard report
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: core-tests-report
+          name: core-report-${{ matrix.shard }}
           path: |
-            artifacts/core-tests.xml
-            artifacts/contract-*.xml
-            artifacts/coverage.xml
+            artifacts/core-*.xml
+            artifacts/.coverage-*
           if-no-files-found: ignore
           retention-days: 14
+
+  core-coverage:
+    name: Core coverage report
+    needs: [core-tests]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Download shard coverage data
+        uses: actions/download-artifact@v7
+        with:
+          pattern: core-report-*
+          merge-multiple: true
+          path: covdata
+
+      - name: Combine and report coverage
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "coverage>=7,<8"
+          python -m coverage combine covdata/.coverage-*
+          python -m coverage report
 
   browser-tests:
     name: Full test suite / Browser (Chromium)
@@ -293,6 +338,7 @@ jobs:
       - compatibility
       - security
       - core-tests
+      - core-coverage
       - browser-tests
     runs-on: ubuntu-latest
     timeout-minutes: 2
@@ -303,6 +349,7 @@ jobs:
           COMPATIBILITY_RESULT: ${{ needs.compatibility.result }}
           SECURITY_RESULT: ${{ needs.security.result }}
           CORE_RESULT: ${{ needs.core-tests.result }}
+          CORE_COVERAGE_RESULT: ${{ needs.core-coverage.result }}
           BROWSER_RESULT: ${{ needs.browser-tests.result }}
         shell: bash
         run: |
@@ -310,4 +357,5 @@ jobs:
           test "$COMPATIBILITY_RESULT" = "success"
           test "$SECURITY_RESULT" = "success"
           test "$CORE_RESULT" = "success"
+          test "$CORE_COVERAGE_RESULT" = "success"
           test "$BROWSER_RESULT" = "success"

@@ -21,8 +21,12 @@ class WebControllerSelectionBridgeTests(unittest.TestCase):
             _pending_selection_strategy=None,
             bridge=SimpleNamespace(emit=Mock()),
             _on_spider_item_found=Mock(),
+            _on_spider_items_found=Mock(),
             _on_spider_select_tasks=on_select,
             _on_spider_finished=Mock(),
+            # _bind_spider_signals 绑定时会先打开 spider intake session，
+            # 其返回值作为 session_id 传给 item 回调。
+            _open_spider_intake_session=Mock(return_value="session-test"),
         )
 
         WebController._bind_spider_signals(controller, spider)

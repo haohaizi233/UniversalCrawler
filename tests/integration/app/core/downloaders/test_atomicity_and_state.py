@@ -61,12 +61,15 @@ class DownloadAtomicityAndStateTests(unittest.TestCase):
 
     def test_download_worker_publishes_local_path_only_after_file_exists(self):
         observed_paths: list[str] = []
+        # 发布门要求产物带可识别的媒体签名：偏移 4 处必须是 ftyp 盒头（合法 MP4）。
+        # 无签名内容会被 `_detect_actual_file_type` 判为失败并发 sig_error，不会发布。
+        mp4_payload = b"\x00\x00\x00\x18ftypisom\x00\x00\x00\x00"
 
         class WritingDownloader:
             @staticmethod
             def download(*, video_item, save_path, **_kwargs):
                 observed_paths.append(video_item.local_path)
-                Path(save_path).write_bytes(b"video")
+                Path(save_path).write_bytes(mp4_payload)
                 return None
 
         with tempfile.TemporaryDirectory() as temp_dir:

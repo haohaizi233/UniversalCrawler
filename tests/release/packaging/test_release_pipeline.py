@@ -64,6 +64,18 @@ def _load_manifest_tool():
     return module
 
 
+def _working_tree_root(tmp_path: Path) -> Path:
+    """返回 fixture 工作树根，让 tmp_path 下的密钥保持"工作树外"语义。
+
+    发布安全契约（_validate_private_key_path / release_secrets_dir）禁止
+    manifest 私钥位于 Git 工作树内；本地 basetemp 可能在仓库 tmp/ 目录下，
+    因此签名类测试把 tool.PROJECT_ROOT patch 到该 fixture 根。
+    """
+    root = tmp_path / "repository"
+    root.mkdir(exist_ok=True)
+    return root
+
+
 def _release_payload(installer: Path, *, source_commit: str = "a" * 40) -> dict:
     return {
         "schema": 1,
@@ -837,9 +849,16 @@ def test_script_invalid_dry_run_version_returns_one_terminal_failure(capsys):
 def test_release_mode_fails_before_build_when_manifest_key_is_missing(tmp_path):
     tool = _load_tool()
     run_build = Mock()
+    working_root = _working_tree_root(tmp_path)
 
     with (
         patch.object(tool, "_run_build", run_build),
+        patch.object(tool, "PROJECT_ROOT", working_root),
+        patch.object(
+            tool,
+            "_project_release_metadata",
+            return_value=("3.6.21", tmp_path / "setup.exe"),
+        ),
         patch.object(tool, "_default_private_key_path", return_value=tmp_path / "missing.pem"),
         pytest.raises(SystemExit, match="manifest.*私钥|私钥.*manifest"),
     ):
@@ -1122,14 +1141,16 @@ def test_new_release_persists_identity_before_snapshot_and_publishes_after_smoke
         calls.append("smoke")
         return subprocess.CompletedProcess(args[0], 0, stdout="usage", stderr="")
 
-    version_plan = VersionUpdatePlan(tool.PROJECT_ROOT, "3.6.21", "3.6.22", ())
-    version_result = VersionUpdateResult("3.6.21", "3.6.22", (tool.PROJECT_ROOT / "shared/version.py",))
     (tmp_path / "notes.md").write_text("notes", encoding="utf-8")
     (tmp_path / "private.pem").write_text(
         ECC.generate(curve="Ed25519").export_key(format="PEM"),
         encoding="utf-8",
     )
+    working_root = _working_tree_root(tmp_path)
+    version_plan = VersionUpdatePlan(working_root, "3.6.21", "3.6.22", ())
+    version_result = VersionUpdateResult("3.6.21", "3.6.22", (working_root / "shared/version.py",))
     with (
+        patch.object(tool, "PROJECT_ROOT", working_root),
         patch.object(tool, "GitHubReleasePublisher", FakePublisher),
         patch.object(tool, "plan_version_update", return_value=version_plan),
         patch.object(tool, "apply_version_update", return_value=version_result),
@@ -1195,6 +1216,7 @@ def test_portable_only_signed_build_does_not_validate_an_unbuilt_installer(tmp_p
 
 def test_publisher_logs_follow_upload_and_verify_stage_progress(tmp_path):
     tool = _load_tool()
+    working_root = _working_tree_root(tmp_path)
     private_key = tmp_path / "manifest-private.pem"
     private_key.write_text(
         ECC.generate(curve="Ed25519").export_key(format="PEM"),
@@ -1255,6 +1277,7 @@ def test_publisher_logs_follow_upload_and_verify_stage_progress(tmp_path):
         return publisher
 
     with (
+        patch.object(tool, "PROJECT_ROOT", working_root),
         patch.object(tool, "GitHubReleasePublisher", side_effect=make_publisher),
         patch.object(
             tool,
@@ -1292,6 +1315,7 @@ def test_publisher_logs_follow_upload_and_verify_stage_progress(tmp_path):
 
 def test_same_release_tag_mismatch_fails_before_resolving_signing_material(tmp_path):
     tool = _load_tool()
+    working_root = _working_tree_root(tmp_path)
     private_key = tmp_path / "manifest-private.pem"
     private_key.write_text(
         ECC.generate(curve="Ed25519").export_key(format="PEM"),
@@ -1314,6 +1338,7 @@ def test_same_release_tag_mismatch_fails_before_resolving_signing_material(tmp_p
         yield "release-token"
 
     with (
+        patch.object(tool, "PROJECT_ROOT", working_root),
         patch.object(tool, "_release_build_lock", side_effect=fake_lock),
         patch.object(tool, "_validate_release_baseline_clean"),
         patch.object(tool, "_git_tag_exists", return_value=True),
@@ -1338,6 +1363,7 @@ def test_same_release_tag_mismatch_fails_before_resolving_signing_material(tmp_p
 
 def test_same_release_new_revision_does_not_require_target_tag_before_signing(tmp_path):
     tool = _load_tool()
+    working_root = _working_tree_root(tmp_path)
     private_key = tmp_path / "manifest-private.pem"
     private_key.write_text(
         ECC.generate(curve="Ed25519").export_key(format="PEM"),
@@ -1360,6 +1386,7 @@ def test_same_release_new_revision_does_not_require_target_tag_before_signing(tm
         yield "release-token"
 
     with (
+        patch.object(tool, "PROJECT_ROOT", working_root),
         patch.object(tool, "_release_build_lock", side_effect=fake_lock),
         patch.object(tool, "_validate_release_baseline_clean"),
         patch.object(tool, "_git_tag_exists", return_value=False) as tag_exists,
@@ -1580,6 +1607,7 @@ def test_source_identity_skips_main_push_when_remote_already_matches():
 
 def test_same_release_tag_is_created_only_after_signing_succeeds(tmp_path):
     tool = _load_tool()
+    working_root = _working_tree_root(tmp_path)
     expected_commit = "a" * 40
     git_calls: list[list[str]] = []
     ensured: list[tuple[str, str]] = []
@@ -1654,6 +1682,7 @@ def test_same_release_tag_is_created_only_after_signing_succeeds(tmp_path):
         yield snapshot_root
 
     with (
+        patch.object(tool, "PROJECT_ROOT", working_root),
         patch.object(tool, "GitHubReleasePublisher", FakePublisher),
         patch.object(tool, "_release_build_lock", side_effect=fake_lock),
         patch.object(tool, "_git_tag_exists", return_value=False),
@@ -1678,6 +1707,7 @@ def test_same_release_tag_is_created_only_after_signing_succeeds(tmp_path):
 
 def test_signing_failure_does_not_publish_the_release_tag(tmp_path):
     tool = _load_tool()
+    working_root = _working_tree_root(tmp_path)
     expected_commit = "a" * 40
     git_calls: list[list[str]] = []
     snapshot_root = tmp_path / "snapshot"
@@ -1733,6 +1763,7 @@ def test_signing_failure_does_not_publish_the_release_tag(tmp_path):
         raise RuntimeError("manifest signature failed")
 
     with (
+        patch.object(tool, "PROJECT_ROOT", working_root),
         patch.object(tool, "GitHubReleasePublisher", FakePublisher),
         patch.object(tool, "_release_build_lock", side_effect=fake_lock),
         patch.object(tool, "_git_tag_exists", return_value=False),
@@ -1907,6 +1938,7 @@ def test_clean_head_is_reused_only_when_it_is_the_version_commit():
 
 def test_normal_signing_reuses_external_key_without_rotating_trust_anchor(tmp_path):
     tool = _load_tool()
+    working_root = _working_tree_root(tmp_path)
     key = ECC.generate(curve="Ed25519")
     private_key = tmp_path / "external" / "manifest-private.pem"
     private_key.parent.mkdir()
@@ -1923,11 +1955,14 @@ def test_normal_signing_reuses_external_key_without_rotating_trust_anchor(tmp_pa
     stream = io.StringIO()
     emitter = ReleaseEventEmitter(stream=stream)
 
-    with patch.object(
-        tool,
-        "begin_manifest_key_transaction",
-        side_effect=AssertionError("normal signing must not generate a key"),
-    ) as begin_transaction:
+    with (
+        patch.object(tool, "PROJECT_ROOT", working_root),
+        patch.object(
+            tool,
+            "begin_manifest_key_transaction",
+            side_effect=AssertionError("normal signing must not generate a key"),
+        ) as begin_transaction,
+    ):
         hooks = tool._build_pipeline_hooks(request, {}, emitter=emitter)
         material = hooks.resolve_signing_material(request)
 
@@ -1955,6 +1990,7 @@ def test_private_key_validation_error_does_not_expose_workspace_path():
 
 def test_public_key_upload_uses_external_standalone_asset(tmp_path):
     tool = _load_tool()
+    working_root = _working_tree_root(tmp_path)
     key = ECC.generate(curve="Ed25519")
     public_key = tmp_path / "external" / "manifest-public.pem"
     public_key.parent.mkdir()
@@ -1978,6 +2014,7 @@ def test_public_key_upload_uses_external_standalone_asset(tmp_path):
     manifest = tmp_path / "release-assets" / "latest.json"
 
     with (
+        patch.object(tool, "PROJECT_ROOT", working_root),
         patch.object(tool, "GitHubReleasePublisher", return_value=publisher),
         patch.object(tool, "_read_only_public_key_path", return_value=public_key),
     ):
@@ -1989,7 +2026,7 @@ def test_public_key_upload_uses_external_standalone_asset(tmp_path):
     uploaded = publisher.upload_assets.call_args.args[1]
     assert uploaded == (manifest, public_key.resolve())
     with pytest.raises(ValueError):
-        public_key.resolve().relative_to(tool.PROJECT_ROOT.resolve())
+        public_key.resolve().relative_to(working_root.resolve())
 
 
 @pytest.mark.parametrize("public_state", ["missing", "mismatched"])
@@ -1998,6 +2035,7 @@ def test_public_key_upload_repairs_external_public_pem_from_private_key(
     public_state,
 ):
     tool = _load_tool()
+    working_root = _working_tree_root(tmp_path)
     key = ECC.generate(curve="Ed25519")
     private_key = tmp_path / "external" / "manifest-private.pem"
     public_key = tmp_path / "external" / "manifest-public.pem"
@@ -2022,7 +2060,10 @@ def test_public_key_upload_repairs_external_public_pem_from_private_key(
         private_key_path=str(private_key),
     )
 
-    with patch.object(tool, "_read_only_public_key_path", return_value=public_key):
+    with (
+        patch.object(tool, "PROJECT_ROOT", working_root),
+        patch.object(tool, "_read_only_public_key_path", return_value=public_key),
+    ):
         hooks = tool._build_pipeline_hooks(request, {}, emitter=None)
         hooks.validate_dependencies(request)
         material = hooks.resolve_signing_material(request)

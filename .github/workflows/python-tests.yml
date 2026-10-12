@@ -273,10 +273,16 @@ jobs:
           python -m coverage report
 
   browser-tests:
-    name: Full test suite / Browser (Chromium)
+    name: Browser shard / ${{ matrix.shard }}
     needs: quality
     runs-on: windows-latest
-    timeout-minutes: 25
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        # 192 个 Playwright 用例挤一个进程会在长跑中累积原生资源直至挂死；
+        # 按节点均分 4 片独立进程，各自重建浏览器会话。
+        shard: [browser-1, browser-2, browser-3, browser-4]
     env:
       QT_QPA_PLATFORM: offscreen
       PLAYWRIGHT_BROWSERS_PATH: ${{ github.workspace }}/.cache/ms-playwright
@@ -309,21 +315,38 @@ jobs:
         run: |
           python -m playwright install chromium
 
-      - name: Run browser suite
+      - name: Run browser shard
         id: browser_suite
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force artifacts | Out-Null
-          python -X faulthandler -m pytest tests/e2e -q --junitxml=artifacts/browser-tests.xml
+          $shard = "${{ matrix.shard }}"
+          $shardIndex = [int]($shard.Split("-")[1])
+          $groupCount = 4
+          $browserNodes = @(
+            python -m pytest tests/e2e --collect-only -q |
+              Where-Object { $_ -match "::" }
+          )
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if ($browserNodes.Count -eq 0) { throw "No browser test nodes were collected" }
+          $groupSize = [Math]::Ceiling($browserNodes.Count / $groupCount)
+          $start = ($shardIndex - 1) * $groupSize
+          $end = [Math]::Min($start + $groupSize - 1, $browserNodes.Count - 1)
+          if ($start -gt $end) {
+            Write-Host "browser shard $shardIndex is empty; nothing to run"
+            exit 0
+          }
+          [string[]] $chunk = $browserNodes[$start..$end]
+          python -X faulthandler -m pytest $chunk -q --junitxml="artifacts/browser-tests-$shardIndex.xml"
 
       - name: Upload browser report
         if: failure() && steps.browser_suite.outcome == 'failure'
         continue-on-error: true
         uses: actions/upload-artifact@v7
         with:
-          name: browser-tests-report
+          name: browser-tests-report-${{ matrix.shard }}
           path: |
-            artifacts/browser-tests.xml
+            artifacts/browser-tests-*.xml
             test-results/
             playwright-report/
           if-no-files-found: ignore

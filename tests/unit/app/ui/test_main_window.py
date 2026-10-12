@@ -2522,9 +2522,10 @@ class MainWindowTests(unittest.TestCase):
         self.assertTrue(window._update_download_shutdown)
         self.assertEqual(window._update_download_sequence, 8)
         window._update_download_cancel_event.set.assert_called_once_with()
-        window._update_download_thread.join.assert_called_once_with(
-            timeout=MainWindow.UPDATE_DOWNLOAD_SHUTDOWN_JOIN_SECONDS,
-        )
+        # 非阻塞关闭契约（e243e510）：closeEvent 不再 join 更新下载线程，
+        # 线程为 daemon，靠 shutdown 标记 + cancel event + sequence 递增
+        # 丢弃迟到事件，关闭路径不得阻塞等待它。
+        window._update_download_thread.join.assert_not_called()
         self.assertFalse(mock_save_ui_state.call_args.kwargs["is_fs"])
         event.accept.assert_called_once()
 

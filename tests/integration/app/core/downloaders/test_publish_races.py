@@ -155,6 +155,9 @@ class DownloadPublishRaceTests(unittest.TestCase):
     def test_bilibili_cancel_after_merge_cleans_sidecar_without_publishing(self) -> None:
         item = VideoItem(url="https://cdn.example.com/video.m4s", title="video", source="bilibili")
         item.meta["audio_url"] = None
+        # 单段 durl 自带音轨，才能在无独立音频流时走到合并阶段；
+        # 否则 _single_segment_has_audio_and_video 门会在合并前以可见失败终止。
+        item.meta["bilibili_stream"] = "durl"
         cancelled = threading.Event()
 
         with tempfile.TemporaryDirectory() as temp_dir:

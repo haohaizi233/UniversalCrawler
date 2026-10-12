@@ -11,6 +11,7 @@ import tempfile
 import types
 import unittest
 import urllib.parse
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from app.core.downloaders.hls_proxy import _LocalHlsProxy
@@ -18,6 +19,19 @@ from app.core.downloaders.m3u8 import N_m3u8DL_RE_Downloader
 from app.exceptions import ExternalToolError
 from app.models import VideoItem
 from shared.network.pinned_transport import canonicalize_request_target
+
+# 合法 MP4 签名负载：发布前签名校验要求媒体盒文件偏移 4 处为 ftyp。
+_FTYP = b"\x00\x00\x00\x18ftypisom\x00\x00\x00\x00"
+
+
+def _stage_publishable_media(build_command_result):
+    """包装 build_download_command 替身：把合法 MP4 写进暂存输出后返回命令。"""
+
+    def build_command(executable, source_url, staged_output, *_args, **_kwargs):
+        Path(staged_output).write_bytes(_FTYP)
+        return build_command_result(executable, source_url, staged_output, *_args, **_kwargs)
+
+    return build_command
 
 
 class M3u8DownloaderLifecycleTests(unittest.TestCase):
@@ -144,6 +158,10 @@ class M3u8DownloaderLifecycleTests(unittest.TestCase):
 
         class FakeCurlOpt:
             PROXY = object()
+            RESOLVE = object()
+            NOSIGNAL = object()
+            FRESH_CONNECT = object()
+            FORBID_REUSE = object()
 
         class FakeResponse:
             status_code = 200
@@ -224,7 +242,10 @@ class M3u8DownloaderLifecycleTests(unittest.TestCase):
             return_value="tool",
         ), patch(
             "app.core.downloaders.m3u8.NM3U8DLREExternalTool.build_download_command",
-            return_value=["tool"],
+            side_effect=_stage_publishable_media(lambda *_args, **_kwargs: ["tool"]),
+        ), patch(
+            "app.core.downloaders.m3u8.FFmpegExternalTool.probe_duration_seconds",
+            return_value=(False, None),
         ), patch("app.core.downloaders.m3u8.subprocess.Popen", return_value=process), patch(
             "app.core.downloaders.m3u8.ExternalToolRunner.wait_process",
         ):
@@ -257,7 +278,10 @@ class M3u8DownloaderLifecycleTests(unittest.TestCase):
             return_value="tool",
         ), patch(
             "app.core.downloaders.m3u8.NM3U8DLREExternalTool.build_download_command",
-            return_value=["tool"],
+            side_effect=_stage_publishable_media(lambda *_args, **_kwargs: ["tool"]),
+        ), patch(
+            "app.core.downloaders.m3u8.FFmpegExternalTool.probe_duration_seconds",
+            return_value=(False, None),
         ), patch("app.core.downloaders.m3u8.subprocess.Popen", return_value=process):
             downloader = N_m3u8DL_RE_Downloader()
             downloader.download(video, save_path, progress_callback, lambda: False)
@@ -512,8 +536,10 @@ class M3u8DownloaderLifecycleTests(unittest.TestCase):
         process = MagicMock(returncode=0)
         process.poll.return_value = 0
 
-        def build_command(executable, source_url, *_args, **_kwargs):
+        def build_command(executable, source_url, staged_output, *_args, **_kwargs):
             captured["url"] = source_url
+            # 生产会在外部命令成功后校验并发布暂存输出，这里预置合法 MP4 字节。
+            Path(staged_output).write_bytes(_FTYP)
             return [executable, source_url]
 
         with tempfile.TemporaryDirectory() as save_dir, patch.object(
@@ -534,6 +560,9 @@ class M3u8DownloaderLifecycleTests(unittest.TestCase):
         ), patch.object(
             N_m3u8DL_RE_Downloader,
             "_wait_external_process_with_file_progress",
+        ), patch(
+            "app.core.downloaders.m3u8.FFmpegExternalTool.probe_duration_seconds",
+            return_value=(False, None),
         ), patch(
             "app.core.downloaders.m3u8.debug_logger.log",
         ) as log, patch(
@@ -662,7 +691,11 @@ class M3u8DownloaderLifecycleTests(unittest.TestCase):
         )
         final = self._ProxyResponse(redirected_url, "video/mp2t", b"segment")
 
-        with patch.object(
+        # 这两个测试聚焦重定向链行为，绕过公网地址钉死层（域名 + 代理会被策略拒绝）。
+        with patch(
+            "app.core.downloaders.hls_proxy.prepare_hls_curl_request",
+            side_effect=lambda url, _policy, _proxy: (url, None),
+        ), patch.object(
             downloader,
             "_curl_cffi_get_response",
             side_effect=[first, final],
@@ -694,7 +727,10 @@ class M3u8DownloaderLifecycleTests(unittest.TestCase):
             headers={"Location": "http://[::1"},
         )
 
-        with patch.object(
+        with patch(
+            "app.core.downloaders.hls_proxy.prepare_hls_curl_request",
+            side_effect=lambda url, _policy, _proxy: (url, None),
+        ), patch.object(
             downloader,
             "_curl_cffi_get_response",
             return_value=response,
@@ -795,20 +831,27 @@ class M3u8DownloaderLifecycleTests(unittest.TestCase):
         self.assertEqual(downloader.calls, [])
 
     def test_sweep_orphaned_workspaces_removes_stale_dirs(self):
-        """启动清扫同时覆盖新版统一工作目录和旧版 fallback 目录。"""
+        """清扫只删除受控根里带所有权标记的工作目录，外来目录和旧版 fallback 目录必须保留。"""
         with tempfile.TemporaryDirectory() as save_dir:
-            nm3u8_workspace = os.path.join(save_dir, N_m3u8DL_RE_Downloader.NM3U8_TEMP_ROOT_NAME, "ucp-foo")
+            temp_root = os.path.join(save_dir, N_m3u8DL_RE_Downloader.NM3U8_TEMP_ROOT_NAME)
+            owned_workspace = os.path.join(temp_root, "ucp-foo")
+            unmarked_workspace = os.path.join(temp_root, "ucp-bar")
+            foreign_workspace = os.path.join(temp_root, "other-dir")
             curl_workspace = os.path.join(save_dir, "xxx_curl_cffi_hls")
             playwright_workspace = os.path.join(save_dir, "yyy_playwright_hls")
-            for path in (nm3u8_workspace, curl_workspace, playwright_workspace):
+            for path in (owned_workspace, unmarked_workspace, foreign_workspace, curl_workspace, playwright_workspace):
                 os.makedirs(path, exist_ok=True)
+            N_m3u8DL_RE_Downloader._mark_owned_workspace(Path(owned_workspace))
 
             cleaned = N_m3u8DL_RE_Downloader.sweep_orphaned_workspaces([save_dir])
 
-            self.assertEqual(cleaned, 3)
-            self.assertFalse(os.path.exists(os.path.join(save_dir, N_m3u8DL_RE_Downloader.NM3U8_TEMP_ROOT_NAME)))
-            self.assertFalse(os.path.exists(curl_workspace))
-            self.assertFalse(os.path.exists(playwright_workspace))
+            self.assertEqual(cleaned, 1)
+            self.assertFalse(os.path.exists(owned_workspace))
+            self.assertTrue(os.path.exists(unmarked_workspace))
+            self.assertTrue(os.path.exists(foreign_workspace))
+            self.assertTrue(os.path.exists(temp_root))
+            self.assertTrue(os.path.exists(curl_workspace))
+            self.assertTrue(os.path.exists(playwright_workspace))
 
 
 if __name__ == "__main__":

@@ -831,9 +831,13 @@ with manager._exclusive_file_lock():
 
     def test_temp_save_directory_is_normalized_back_to_default_download_dir(self):
         """被临时目录污染的保存路径在加载配置时应自动回落到规范目录。"""
+        # 生产归一逻辑参考的是运行时 tempfile.gettempdir()（TEMP/TMP），
+        # 而 conftest 把 tempfile.TemporaryDirectory 固定重定向到仓库内
+        # tmp/ucrawl-pytest。CI 上两者不同盘，污染路径必须显式建在
+        # gettempdir() 之下，测试才不依赖 basetemp 的位置。
+        polluted_save_dir = Path(tempfile.gettempdir()) / "tmp-persisted-downloads"
         with tempfile.TemporaryDirectory() as temp_dir:
             config_path = Path(temp_dir) / "config.json"
-            polluted_save_dir = Path(temp_dir) / "tmp-persisted-downloads"
             config_path.write_text(
                 json.dumps({"common": {"save_directory": str(polluted_save_dir)}}),
                 encoding="utf-8",

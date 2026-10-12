@@ -9,6 +9,7 @@ import re
 import secrets
 import threading
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
 from fastapi import HTTPException, Request
@@ -84,36 +85,65 @@ class WebFileResponseService:
         self._debug_artifacts_service = (
             debug_artifacts_service or DebugArtifactsService()
         )
-        debug_root_authority = open_filesystem_directory_capability(
+        self._debug_root_close_lock = threading.Lock()
+        self._debug_root_closed = False
+        self._debug_root_authorities: dict[str, Any] = {}
+        self._debug_root_grants: dict[str, tuple[str, Any]] = {}
+        # 构造时立即绑定当前日志根，钉住其目录代际；之后同路径被替换会被拒绝。
+        self._debug_root_authority = self._bind_debug_root(
             self._debug_artifacts_service.logs_dir
         )
+
+    @staticmethod
+    def _debug_root_key(logs_dir: Any) -> str:
+        return os.path.normcase(os.path.normpath(os.fspath(logs_dir)))
+
+    def _bind_debug_root(self, logs_dir: Any):
+        authority = open_filesystem_directory_capability(logs_dir)
         try:
-            debug_root, debug_identity = (
-                debug_root_authority.snapshot_bound_identity()
-            )
-            self._debug_root_grant = (
-                os.path.normcase(os.fspath(debug_root)),
-                debug_identity,
-            )
+            debug_root, debug_identity = authority.snapshot_bound_identity()
+            grant = (os.path.normcase(os.fspath(debug_root)), debug_identity)
         except BaseException as primary:
             try:
-                debug_root_authority.close()
+                authority.close()
             except BaseException:
                 try:
                     primary.add_note("debug root authority cleanup failed")
                 except BaseException:
                     pass
             raise
-        self._debug_root_authority = debug_root_authority
-        self._debug_root_close_lock = threading.Lock()
-        self._debug_root_closed = False
+        key = self._debug_root_key(logs_dir)
+        self._debug_root_authorities[key] = authority
+        self._debug_root_grants[key] = grant
+        return authority
+
+    def _debug_grant_for(self, path: str) -> tuple[str, Any]:
+        """取被服务文件所属日志根的能力授予。
+
+        日志根可能在运行期切换（例如用户数据根环境值变化后 debug logger
+        重新锚定），此时为新根惰性绑定能力；已绑定根保持钉住的目录代际，
+        同路径目录被替换仍会被 PathPolicy 拒绝。
+        """
+        key = self._debug_root_key(Path(path).parent)
+        with self._debug_root_close_lock:
+            if self._debug_root_closed:
+                raise PermissionError("debug root authority is closed")
+            grant = self._debug_root_grants.get(key)
+            if grant is None:
+                self._bind_debug_root(Path(path).parent)
+                grant = self._debug_root_grants[key]
+            return grant
 
     def close(self) -> None:
         with self._debug_root_close_lock:
             if self._debug_root_closed:
                 return
             self._debug_root_closed = True
-        self._debug_root_authority.close()
+            authorities = list(self._debug_root_authorities.values())
+            self._debug_root_authorities.clear()
+            self._debug_root_grants.clear()
+        for authority in authorities:
+            authority.close()
 
     def __del__(self) -> None:
         try:
@@ -393,7 +423,7 @@ class WebFileResponseService:
         try:
             lease = await self._open_approved_file_async(
                 path,
-                (self._debug_root_grant,),
+                (self._debug_grant_for(path),),
             )
         except FileNotFoundError:
             raise HTTPException(status_code=404, detail="debug artifact not found") from None
@@ -418,7 +448,7 @@ class WebFileResponseService:
         try:
             lease = self._path_policy.open_approved_file(
                 path,
-                (self._debug_root_grant,),
+                (self._debug_grant_for(path),),
             )
         except FileNotFoundError:
             raise HTTPException(status_code=404, detail="debug artifact not found") from None

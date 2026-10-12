@@ -83,14 +83,16 @@ def isolate_runtime_user_data(tmp_path, monkeypatch):
     else:
         base = None
         user_data = tmp_path / "user_data"
-    # 测试可能把 shutil.rmtree 打桩成失败探针；这里持有原实现，拆除时不被打桩劫持。
-    real_rmtree = shutil.rmtree
     monkeypatch.setenv("UCRAWL_USER_DATA_ROOT", str(user_data))
     try:
         yield
     finally:
         if base is not None:
-            real_rmtree(base, ignore_errors=True)
+            # 测试可能把 os.scandir/shutil.rmtree 桩成失败探针（例如 hostile
+            # 迭代器用例）；先整体撤销打桩再拆目录，否则拆除本身会被劫持。
+            # monkeypatch.undo 幂等，pytest 之后的自动撤销不受影响。
+            monkeypatch.undo()
+            shutil.rmtree(base, ignore_errors=True)
 
 
 @pytest.fixture(autouse=True)

@@ -105,3 +105,4 @@ docx/
 人工测试.txt
 简历*.*
 artifacts/
+.tmp-*/

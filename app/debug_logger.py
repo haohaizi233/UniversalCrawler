@@ -2,6 +2,7 @@
 
 import json
 import multiprocessing
+import os
 import re
 import threading
 import time
@@ -10,7 +11,7 @@ from datetime import datetime
 from functools import wraps
 from typing import Any
 
-from app.utils.runtime_paths import user_logs_root
+from app.utils.runtime_paths import USER_DATA_ROOT_ENV, user_logs_root
 
 _TRACE_PREFIX_ALIASES = {
     "douyin": "dy",
@@ -320,6 +321,15 @@ class DebugLogger:
     LEVEL_ORDER = {"DEBUG": 10, "INFO": 20, "WARN": 30, "WARNING": 30, "ERROR": 40}
 
     def __init__(self):
+        self._lock = threading.Lock()
+        self._min_level = self.LEVEL_ORDER["INFO"]
+        self._retention_days = _DEFAULT_RETENTION_DAYS
+        self._last_cleanup_policy: tuple[int, str] | None = None
+        self._anchored_user_data_root = os.environ.get(USER_DATA_ROOT_ENV, "").strip()
+        self._anchor_log_paths()
+
+    def _anchor_log_paths(self) -> None:
+        """按当前用户数据根锚定日志路径；环境根变化时可重新锚定。"""
         self.logs_dir = user_logs_root()
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -329,10 +339,6 @@ class DebugLogger:
         self.session_file = self.logs_dir / f"debug_{timestamp}_{process_name}.log"
         self.latest_file = self.logs_dir / "latest_debug.log"
         self.latest_error_summary_file = self.logs_dir / "latest_error_summary.md"
-        self._lock = threading.Lock()
-        self._min_level = self.LEVEL_ORDER["INFO"]
-        self._retention_days = _DEFAULT_RETENTION_DAYS
-        self._last_cleanup_policy: tuple[int, str] | None = None
 
         # Windows 可能短暂持有日志文件锁，因此初始化也走有限重试的安全写入路径。
         if self._is_main_process:
@@ -342,6 +348,18 @@ class DebugLogger:
                 "# 最近错误摘要\n\n当前会话暂无错误。\n",
             )
         self._write_header()
+
+    def reanchor_if_root_changed(self) -> None:
+        """用户数据根环境值变化时重新锚定，避免继续使用已失效的日志目录。
+
+        注意：不能持有 self._lock 调用 _anchor_log_paths（写入路径会再次取锁，
+        threading.Lock 不可重入会死锁）；重复锚定结果幂等，最坏只是多写一次文件头。
+        """
+        current = os.environ.get(USER_DATA_ROOT_ENV, "").strip()
+        if current == self._anchored_user_data_root:
+            return
+        self._anchored_user_data_root = current
+        self._anchor_log_paths()
 
     def configure(
         self,
@@ -993,12 +1011,16 @@ class DebugLogger:
         )
 
 _debug_logger_singleton: DebugLogger | None = None
+_debug_logger_singleton_lock = threading.Lock()
 
 def get_debug_logger() -> DebugLogger:
-    
+
     global _debug_logger_singleton
-    if _debug_logger_singleton is None:
-        _debug_logger_singleton = DebugLogger()
+    with _debug_logger_singleton_lock:
+        if _debug_logger_singleton is None:
+            _debug_logger_singleton = DebugLogger()
+        else:
+            _debug_logger_singleton.reanchor_if_root_changed()
     return _debug_logger_singleton
 
 class DebugLoggerProxy:

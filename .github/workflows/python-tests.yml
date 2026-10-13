@@ -255,9 +255,20 @@ jobs:
   core-coverage:
     name: Core coverage report
     needs: [core-tests]
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
+    # 分片数据在 Windows runner 录制，内嵌 D:\a\... 绝对路径；合并报告必须
+    # 回到同布局的 Windows 工作区并 checkout 源码与 pyproject，report 才能
+    # 定位源码并执行 fail_under 门槛。
+    runs-on: windows-latest
+    timeout-minutes: 10
     steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
       - name: Download shard coverage data
         uses: actions/download-artifact@v7
         with:

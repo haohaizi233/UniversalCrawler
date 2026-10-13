@@ -2500,12 +2500,16 @@ def test_run_build_passes_the_parent_release_lock_token_to_snapshot_script(tmp_p
 @pytest.mark.parametrize("script_name", ["build_portable.py", "build_installer.py"])
 def test_build_scripts_accept_and_validate_the_snapshot_project_root(tmp_path, script_name):
     script = PROJECT_ROOT / "packaging" / script_name
+    # --help 输出含中文且子进程在 PYTHONUTF8 下输出 UTF-8；不显式指定解码
+    # 时 Windows 用 GBK 读管道，遇到多字节序列会让 stdout 变 None。
     help_result = subprocess.run(
         [sys.executable, str(script), "--help"],
         cwd=PROJECT_ROOT,
         check=False,
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
     )
     assert help_result.returncode == 0, help_result.stderr
     assert "--project-root" in help_result.stdout
@@ -2516,6 +2520,8 @@ def test_build_scripts_accept_and_validate_the_snapshot_project_root(tmp_path, s
         check=False,
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
     )
     assert mismatched.returncode != 0
     assert "project root" in (mismatched.stderr + mismatched.stdout)

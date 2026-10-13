@@ -92,6 +92,10 @@ class FrontendRuntimeStateCases:
                 runtime.configure(dependencies);
                 const firstStart = runtime.start();
                 const duplicateStart = runtime.start();
+                // start() 先预热 /api/session/bootstrap（requests[0]），connectWS
+                // 在 bootstrap 放行后才执行；必须等到 socket 建立再捕获陈旧引用。
+                requests[0].resolve(response({}));
+                while (sockets.length < 1) await Promise.resolve();
                 const firstSocket = sockets[0];
                 const staleMessage = firstSocket.onmessage;
                 runtime.scheduleSections(["queue_items"]);
@@ -101,11 +105,13 @@ class FrontendRuntimeStateCases:
                 runtime.dispose();
                 runtime.configure(dependencies);
                 const secondStart = runtime.start();
+                requests[2].resolve(response({}));
+                while (sockets.length < 2) await Promise.resolve();
                 const secondSocket = sockets[1];
 
-                requests[1].resolve(response({ version: 2, queue_items: [{ id: "current" }], log_items: [] }));
+                requests[3].resolve(response({ version: 2, queue_items: [{ id: "current" }], log_items: [] }));
                 await secondStart;
-                requests[0].resolve(response({ version: 1, queue_items: [{ id: "stale" }], log_items: [] }));
+                requests[1].resolve(response({ version: 1, queue_items: [{ id: "stale" }], log_items: [] }));
                 await firstStart;
                 staleMessage({ data: JSON.stringify({
                   type: "frontend_state",
@@ -115,14 +121,14 @@ class FrontendRuntimeStateCases:
 
                 const staleDelta = runtime.fetchDelta();
                 const currentDelta = runtime.fetchDelta();
-                requests[3].resolve(response({
+                requests[5].resolve(response({
                   version: 4,
                   base_version: 2,
                   sections: { queue_items: [{ id: "delta-current" }] },
                   changed_sections: ["queue_items"],
                 }));
                 await currentDelta;
-                requests[2].resolve(response({
+                requests[4].resolve(response({
                   version: 3,
                   base_version: 2,
                   sections: { queue_items: [{ id: "delta-stale" }] },
@@ -160,7 +166,7 @@ class FrontendRuntimeStateCases:
         )
 
         self.assertTrue(result["duplicateStartShared"])
-        self.assertEqual(result["fetchCount"], 4)
+        self.assertEqual(result["fetchCount"], 6)
         self.assertEqual(result["socketCount"], 2)
         self.assertTrue(result["firstSocketClosedOnce"])
         self.assertTrue(result["secondSocketClosedOnce"])
@@ -214,7 +220,11 @@ class FrontendRuntimeStateCases:
                   type: "frontend_state",
                   data: { version: 2, queue_items: [{ id: "socket-v2" }], log_items: [] },
                 });
-                requests[0].resolve(response({
+                // start() 先预热 /api/session/bootstrap（requests[0]），状态请求
+                // 在 bootstrap 放行后才发出（requests[1]）。
+                requests[0].resolve(response({}));
+                while (requests.length < 2) await Promise.resolve();
+                requests[1].resolve(response({
                   version: 1,
                   queue_items: [{ id: "fetch-v1" }],
                   log_items: [],
@@ -227,7 +237,7 @@ class FrontendRuntimeStateCases:
                   type: "frontend_state",
                   data: { version: 3, queue_items: [{ id: "socket-v3" }], log_items: [] },
                 });
-                requests[1].resolve(response({
+                requests[2].resolve(response({
                   queue_items: [{ id: "fetch-without-version" }],
                   log_items: [],
                 }));

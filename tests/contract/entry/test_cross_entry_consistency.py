@@ -5,6 +5,8 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 def _create_test_client():
+    from pathlib import Path
+
     from fastapi.testclient import TestClient
     from app.web.server import create_app, SESSION_TOKEN_HEADER
 
@@ -17,6 +19,9 @@ def _create_test_client():
     client._ucrawl_session_token = context.csrf_token
     client._ucrawl_token_header = SESSION_TOKEN_HEADER
     client._ucrawl_session_context = context
+    # approve_directory 要求目录真实存在（47a5d0ab 安全租约）；"downloads"
+    # 是相对路径，锚定 CWD，CI checkout 没有 gitignore 的本地目录，这里补建。
+    Path("downloads").mkdir(exist_ok=True)
     # 授权 "downloads" 目录，使 API 请求中的 save_dir 通过目录权限校验
     context.approve_directory("downloads")
     return client

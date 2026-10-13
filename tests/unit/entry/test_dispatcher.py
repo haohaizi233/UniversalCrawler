@@ -383,6 +383,10 @@ class DispatcherTests(unittest.TestCase):
             check=False,
             capture_output=True,
             text=True,
+            # 子进程在 PYTHONUTF8/PYTHONIOENCODING 下输出 UTF-8；不显式
+            # 指定解码时 Windows 用 GBK 读管道，遇到多字节序列随机崩溃。
+            encoding="utf-8",
+            errors="replace",
         )
 
         self.assertEqual(result.returncode, 0, result.stderr)

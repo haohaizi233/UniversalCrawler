@@ -3371,7 +3371,19 @@ def test_windows_verifier_passes_package_path_as_independent_literalpath(tmp_pat
         script_path = Path(argv[argv.index("-File") + 1])
         captured["argv"] = list(argv)
         captured["script"] = script_path.read_text(encoding="utf-8-sig")
-        return subprocess.run(argv, **kwargs)
+        # 本测试守护 argv/脚本形态（防 -Command 注入、路径独立传参）。
+        # 真实 PowerShell 对非 PE 载荷的 Get-AuthenticodeSignature 行为随
+        # runner 版本漂移（NotSigned 或 terminating error），签名解析
+        # 语义已由 _authenticode_run 系列 stub 测试覆盖。
+        payload = {
+            "Status": "NotSigned",
+            "Subject": "",
+            "Thumbprint": "",
+            "SHA256Fingerprint": "",
+        }
+        return subprocess.CompletedProcess(
+            list(argv), 0, stdout=json.dumps(payload), stderr=""
+        )
 
     with pytest.raises(VerificationError, match="not valid"):
         PackageVerifier(

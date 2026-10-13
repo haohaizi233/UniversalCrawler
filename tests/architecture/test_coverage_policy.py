@@ -33,7 +33,7 @@ MEASURED_NETWORK_COOKIE_OR_SESSION = (
     "app/core/lib/douyin/tools/session.py",
 )
 _CI_COVERAGE_ARGS = (
-    '"--data-file=artifacts/.coverage-$shard", "--branch", '
+    '"--data-file=artifacts/coverage-$shard.dat", "--branch", '
     '"--source=app,cli,entry,shared", "--omit=$omit"'
 )
 
@@ -86,10 +86,11 @@ def test_ci_uses_the_same_coverage_floor() -> None:
     assert _coverage_config()["report"]["fail_under"] >= 75
     assert "python -m coverage report" in workflow
     assert "coverage report --fail-under" not in workflow
-    # 每个分片把插桩数据写进自己的 data file，再由 core-coverage job 合并统一报告；
+    # 每个分片把插桩数据写进自己的 data file（非隐藏名：upload-artifact 的
+    # glob 不匹配点前缀文件），再由 core-coverage job 合并统一报告；
     # 门槛仍然只由 pyproject 的 fail_under 控制，不允许 CI 私自另设。
     assert _CI_COVERAGE_ARGS in core_block
-    assert "python -m coverage combine covdata/.coverage-*" in workflow
+    assert "python -m coverage combine covdata/coverage-*.dat" in workflow
     expected_source = ",".join(COVERAGE_SOURCE)
     expected_omit = ",".join(PURE_LOCAL_ALGORITHM_OMIT)
     assert expected_source == ",".join(run["source"])

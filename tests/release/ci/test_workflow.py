@@ -255,7 +255,7 @@ class GitHubActionsWorkflowTests(unittest.TestCase):
         self.assertIn("pytest tests/performance", core_block)
         self.assertIn("pytest tests/e2e", browser_block)
         # 所有分片的插桩数据由独立 job 合并成一份报告，不产生覆盖缺口。
-        self.assertIn("python -m coverage combine covdata/.coverage-*", source)
+        self.assertIn("python -m coverage combine covdata/coverage-*.dat", source)
 
     def test_contract_suite_is_catalog_driven_and_runs_in_bounded_process_shards(self) -> None:
         workflow = PROJECT_ROOT / ".github" / "workflows" / "python-tests.yml"

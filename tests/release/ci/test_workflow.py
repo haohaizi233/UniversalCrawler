@@ -45,6 +45,7 @@ class GitHubActionsWorkflowTests(unittest.TestCase):
         self.assertIn("compatibility:", source)
         self.assertIn("security:", source)
         self.assertIn("core-tests:", source)
+        self.assertIn("core-coverage:", source)
         self.assertIn("browser-tests:", source)
         self.assertIn("required-check:", source)
         self.assertIn("runs-on: ubuntu-latest", source)
@@ -72,7 +73,7 @@ class GitHubActionsWorkflowTests(unittest.TestCase):
         self.assertIn("QT_QPA_PLATFORM: offscreen", source)
         self.assertIn('PYTHONFAULTHANDLER: "1"', source)
         self.assertIn("python -m playwright install chromium", source)
-        self.assertIn("python -m coverage run", source)
+        self.assertIn("python -m coverage @coverageArgs -m pytest", source)
         self.assertIn("python -m coverage report", source)
         self.assertNotIn("coverage report --fail-under", source)
 
@@ -189,7 +190,7 @@ class GitHubActionsWorkflowTests(unittest.TestCase):
         workflow = PROJECT_ROOT / ".github" / "workflows" / "python-tests.yml"
         source = workflow.read_text(encoding="utf-8")
         browser_block = source.split("  browser-tests:", 1)[1].split("  required-check:", 1)[0]
-        run_block = browser_block.split("      - name: Run browser suite", 1)[1].split(
+        run_block = browser_block.split("      - name: Run browser shard", 1)[1].split(
             "      - name: Upload browser report",
             1,
         )[0]
@@ -199,10 +200,12 @@ class GitHubActionsWorkflowTests(unittest.TestCase):
         )[0]
 
         self.assertIn("id: browser_suite", run_block)
+        self.assertNotIn("continue-on-error", run_block)
         self.assertIn("if: failure() && steps.browser_suite.outcome == 'failure'", upload_block)
         self.assertIn("continue-on-error: true", upload_block)
         self.assertIn("uses: actions/upload-artifact@v7", upload_block)
-        self.assertIn("artifacts/browser-tests.xml", upload_block)
+        self.assertIn("name: browser-tests-report-${{ matrix.shard }}", upload_block)
+        self.assertIn("artifacts/browser-tests-*.xml", upload_block)
         self.assertIn("compression-level: 0", upload_block)
 
     def test_performance_benchmarks_run_without_coverage_instrumentation(self) -> None:
@@ -210,10 +213,11 @@ class GitHubActionsWorkflowTests(unittest.TestCase):
         source = workflow.read_text(encoding="utf-8")
         core_block = source.split("  core-tests:", 1)[1].split("  browser-tests:", 1)[0]
 
-        coverage_line = next(
-            line for line in core_block.splitlines() if "coverage run" in line
-        )
-        self.assertNotIn("tests/performance", coverage_line)
+        # 性能预算不插桩：coverage 只通过 @coverageArgs 传给 pytest，任何提及
+        # tests/performance 的行都不得同时携带 coverage 插桩。
+        for line in core_block.splitlines():
+            if "tests/performance" in line:
+                self.assertNotIn("coverage", line)
         self.assertIn(
             "python -X faulthandler -m pytest tests/performance -q",
             core_block,
@@ -224,28 +228,34 @@ class GitHubActionsWorkflowTests(unittest.TestCase):
         source = workflow.read_text(encoding="utf-8")
         core_block = source.split("  core-tests:", 1)[1].split("  browser-tests:", 1)[0]
         browser_block = source.split("  browser-tests:", 1)[1].split("  required-check:", 1)[0]
-        coverage_line = next(
-            line for line in core_block.splitlines() if "coverage run" in line
-        )
 
         self.assertIn(
-            "name: Full test suite / Core + performance (Windows, Python 3.13)",
+            "name: Core shard / ${{ matrix.shard }}",
             core_block,
         )
-        self.assertIn("name: Full test suite / Browser (Chromium)", browser_block)
+        self.assertIn("name: Browser shard / ${{ matrix.shard }}", browser_block)
+        # 分片后没有单一的 coverage 命令行：每条插桩调用都通过 @coverageArgs
+        # 携带同一份配置，这里聚合所有插桩行，确认核心套件无一漏网。
+        instrumented = "\n".join(
+            line for line in core_block.splitlines() if "@coverageArgs" in line
+        )
+        self.assertIn("coverage @coverageArgs -m pytest", instrumented)
         for suite_path in (
             "tests/unit",
             "tests/integration",
-            "tests/architecture",
             "tests/release",
+            "tests/architecture",
             "tests/testkit",
         ):
-            self.assertIn(suite_path, coverage_line)
-        self.assertNotIn("tests/contract", coverage_line)
-        self.assertNotIn("tests/e2e", coverage_line)
-        self.assertNotIn("tests/performance", coverage_line)
+            self.assertIn(suite_path, instrumented)
+        # contract 节点通过 catalog 变量插桩运行，e2e/performance 始终不插桩。
+        self.assertIn("coverage @coverageArgs -m pytest $chunk", instrumented)
+        for suite_path in ("tests/contract", "tests/e2e", "tests/performance"):
+            self.assertNotIn(suite_path, instrumented)
         self.assertIn("pytest tests/performance", core_block)
         self.assertIn("pytest tests/e2e", browser_block)
+        # 所有分片的插桩数据由独立 job 合并成一份报告，不产生覆盖缺口。
+        self.assertIn("python -m coverage combine covdata/.coverage-*", source)
 
     def test_contract_suite_is_catalog_driven_and_runs_in_bounded_process_shards(self) -> None:
         workflow = PROJECT_ROOT / ".github" / "workflows" / "python-tests.yml"
@@ -265,16 +275,26 @@ class GitHubActionsWorkflowTests(unittest.TestCase):
         ):
             self.assertNotIn(legacy_domain, core_block)
         self.assertIn("--collect-only -q", core_block)
-        self.assertIn("$contractChunkSize = 12", core_block)
-        self.assertIn("coverage run --append", core_block)
-        self.assertIn("artifacts/contract-*.xml", core_block)
+        # 契约节点按目录发现顺序均分为固定数量的分片，每片独立 pytest 进程，
+        # 不再把数千节点挤进单个进程。
+        self.assertIn("$groupCount = 4", core_block)
+        self.assertIn("$contractNodes[$start..$end]", core_block)
+        self.assertIn("coverage @coverageArgs -m pytest $chunk", core_block)
+        self.assertIn('artifacts/core-contract-$shardIndex.xml', core_block)
 
     def test_required_check_aggregates_all_blocking_jobs(self) -> None:
         workflow = PROJECT_ROOT / ".github" / "workflows" / "python-tests.yml"
         source = workflow.read_text(encoding="utf-8")
         required_block = source.split("  required-check:", 1)[1]
 
-        for job in ("quality", "compatibility", "security", "core-tests", "browser-tests"):
+        for job in (
+            "quality",
+            "compatibility",
+            "security",
+            "core-tests",
+            "core-coverage",
+            "browser-tests",
+        ):
             self.assertIn(f"      - {job}", required_block)
 
     def test_linux_quality_job_does_not_install_runtime_requirements(self) -> None:

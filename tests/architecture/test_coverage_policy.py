@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import re
 import subprocess
 import sys
 from pathlib import Path
@@ -33,9 +32,9 @@ MEASURED_NETWORK_COOKIE_OR_SESSION = (
     "app/core/lib/douyin/link/requester.py",
     "app/core/lib/douyin/tools/session.py",
 )
-_COVERAGE_RUN = re.compile(
-    r"python -m coverage run(?: --append)? --branch "
-    r'--source=(?P<source>\S+) --omit="(?P<omit>[^"]*)"'
+_CI_COVERAGE_ARGS = (
+    '"--data-file=artifacts/.coverage-$shard", "--branch", '
+    '"--source=app,cli,entry,shared", "--omit=$omit"'
 )
 
 
@@ -44,11 +43,11 @@ def _coverage_config() -> dict:
     return pyproject["tool"]["coverage"]
 
 
-def _workflow_coverage_invocations() -> list[re.Match[str]]:
+def _core_workflow_block() -> str:
     workflow = (PROJECT_ROOT / ".github" / "workflows" / "python-tests.yml").read_text(
         encoding="utf-8"
     )
-    return list(_COVERAGE_RUN.finditer(workflow))
+    return workflow.split("  core-tests:", 1)[1].split("  browser-tests:", 1)[0]
 
 
 def test_coverage_run_policy_tracks_core_production_packages_and_branches() -> None:
@@ -82,19 +81,20 @@ def test_ci_uses_the_same_coverage_floor() -> None:
         encoding="utf-8"
     )
     run = _coverage_config()["run"]
-    invocations = _workflow_coverage_invocations()
+    core_block = _core_workflow_block()
 
     assert _coverage_config()["report"]["fail_under"] >= 75
     assert "python -m coverage report" in workflow
     assert "coverage report --fail-under" not in workflow
-    assert len(invocations) == 2
+    # 每个分片把插桩数据写进自己的 data file，再由 core-coverage job 合并统一报告；
+    # 门槛仍然只由 pyproject 的 fail_under 控制，不允许 CI 私自另设。
+    assert _CI_COVERAGE_ARGS in core_block
+    assert "python -m coverage combine covdata/.coverage-*" in workflow
     expected_source = ",".join(COVERAGE_SOURCE)
     expected_omit = ",".join(PURE_LOCAL_ALGORITHM_OMIT)
     assert expected_source == ",".join(run["source"])
     assert expected_omit == ",".join(run["omit"])
-    for invocation in invocations:
-        assert invocation.group("source") == expected_source
-        assert invocation.group("omit") == expected_omit
+    assert f'$omit = "{expected_omit}"' in core_block
 
 
 def test_coverage_policy_imports_when_stdlib_tomllib_is_unavailable() -> None:

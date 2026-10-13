@@ -303,7 +303,11 @@ def test_tools_run_composes_real_runner_to_terminal_and_closes_without_thread_le
         return result
 
     def observe_close(self: ToolsAPI) -> bool:
-        result = original_close(self)
+        # CLI 默认 1s 清理预算是产品契约（由 test_tools_api 专测守护）。
+        # CI 分片 runner 负载下线程 join 偶发超 1s（超时后清理仍由非守护
+        # 线程后台完成）；本测试守护的是真实清理完成且无线程泄漏，观察层
+        # 放宽预算不放松被测语义。
+        result = original_close(self, timeout=30.0)
         close_results.append(result)
         return result
 

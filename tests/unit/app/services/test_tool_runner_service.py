@@ -1141,7 +1141,9 @@ def test_runner_trims_oldest_terminal_rows_behind_an_active_run(tmp_path: Path) 
         assert service.get_run(active["run_id"], execution_profile=profile) is not None
     finally:
         service.cancel(active["run_id"], execution_profile=profile)
-        assert service.shutdown(wait=True, timeout=1.0) is True
+        # finally 清理预算，非被测语义：取消 blocking worker + join 双执行器
+        # + flush 历史在 CI 负载下偶发超 1s；修剪语义已由上方断言覆盖。
+        assert service.shutdown(wait=True, timeout=10.0) is True
 
 
 def test_runner_wait_for_run_times_out_without_cross_owner_visibility(tmp_path: Path) -> None:

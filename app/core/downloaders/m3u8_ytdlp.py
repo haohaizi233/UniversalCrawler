@@ -6,7 +6,7 @@ import os
 from pathlib import Path
 from typing import Any
 
-from app.config import DEFAULT_USER_AGENT, cfg
+from app.config import DEFAULT_USER_AGENT, cfg, effective_download_retry_count
 from app.debug_logger import debug_logger
 from app.exceptions import DownloaderStoppedError, ExternalToolError, ExternalToolNotFoundError
 from app.models import VideoItem
@@ -36,6 +36,10 @@ class Nm3u8YtDlpSupport:
         target = Path(save_path)
         target.parent.mkdir(parents=True, exist_ok=True)
         ydl_headers = self._headers_for_yt_dlp(headers)
+        retry_count = effective_download_retry_count(
+            cfg.get("download", "max_retries", 3),
+            cfg.get("download", "auto_retry", True),
+        )
 
         def progress_hook(status: dict[str, Any]) -> None:
             if check_stop_func():
@@ -65,6 +69,8 @@ class Nm3u8YtDlpSupport:
             try:
                 self._run_yt_dlp(source_url, dict(params))
             except YoutubeDLError as exc:
+                if retry_count <= 0 and not self._is_impersonation_capability_error(exc):
+                    raise ExternalToolError(f"yt-dlp fallback failed: {exc}") from exc
                 params.pop("impersonate", None)
                 try:
                     self._run_yt_dlp(source_url, dict(params))
@@ -81,6 +87,23 @@ class Nm3u8YtDlpSupport:
                     )
             if not target.exists() or target.stat().st_size <= 0:
                 raise ExternalToolError("yt-dlp fallback did not create a valid output file")
+
+    @staticmethod
+    def _is_impersonation_capability_error(error: BaseException) -> bool:
+        """Identify yt-dlp errors that specifically report unsupported impersonation."""
+        message = str(error).lower()
+        return any(
+            marker in message
+            for marker in (
+                "no impersonate target is available",
+                "none of these impersonate targets are available",
+                "unsupported impersonate target",
+                "unsupported extensions: impersonate",
+            )
+        ) or (
+            "impersonate target" in message
+            and ("not available" in message or "unavailable" in message)
+        )
 
     @staticmethod
     def _headers_for_yt_dlp(headers: dict[str, str]) -> dict[str, str]:
@@ -109,7 +132,10 @@ class Nm3u8YtDlpSupport:
         proxy: str | None,
         progress_hook,
     ) -> dict[str, Any]:
-        retry_count = BaseDownloader._coerce_retry_count(cfg.get("download", "max_retries", 3))
+        retry_count = effective_download_retry_count(
+            cfg.get("download", "max_retries", 3),
+            cfg.get("download", "auto_retry", True),
+        )
         resume_enabled = BaseDownloader._coerce_bool_setting(cfg.get("download", "resume_enabled", True))
         try:
             speed_limit_kb = max(0, int(cfg.get("download", "speed_limit_kb", 0) or 0))

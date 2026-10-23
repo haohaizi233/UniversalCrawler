@@ -11,7 +11,7 @@ import time
 
 import requests
 
-from app.config import DEFAULT_USER_AGENT, cfg
+from app.config import DEFAULT_USER_AGENT, cfg, effective_download_retry_count
 from app.debug_logger import debug_logger
 from app.exceptions import DownloaderStoppedError, StreamDownloadError
 from app.models import VideoItem
@@ -67,7 +67,10 @@ class ChunkedDownloader(BaseDownloader):
         proxy = video_item.meta.get("proxy")
         proxies = requests_proxy_mapping(proxy)
         timeout = cfg.get("download", "request_timeout", 60)
-        retry_count = self._coerce_retry_count(cfg.get("download", "max_retries", 3))
+        retry_count = effective_download_retry_count(
+            cfg.get("download", "max_retries", 3),
+            cfg.get("download", "auto_retry", True),
+        )
         resume_enabled = self._coerce_bool_setting(cfg.get("download", "resume_enabled", True))
         domain_policy = self._domain_policy_for_item(video_item)
         try:

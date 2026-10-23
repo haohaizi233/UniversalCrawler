@@ -15,7 +15,7 @@ import threading
 from pathlib import Path
 from typing import Any, Callable
 
-from app.config import DEFAULT_USER_AGENT, cfg
+from app.config import DEFAULT_USER_AGENT, cfg, effective_download_retry_count
 from app.core.anti_detection import build_browser_anti_detection
 from app.debug_logger import debug_logger
 from shared import playwright_network_guard
@@ -160,6 +160,10 @@ class N_m3u8DL_RE_Downloader(Nm3u8YtDlpSupport, BaseDownloader):
         thread_count = video_item.meta.get("m3u8_thread_count")
         if str(video_item.source or "").lower() == "missav" and not thread_count:
             thread_count = 16
+        auto_retry = effective_download_retry_count(
+            cfg.get("download", "max_retries", 3),
+            cfg.get("download", "auto_retry", True),
+        ) > 0
 
         self._emit_progress(progress_callback, 0)
         download_succeeded = False
@@ -196,6 +200,9 @@ class N_m3u8DL_RE_Downloader(Nm3u8YtDlpSupport, BaseDownloader):
                         context={"title": video_item.title, "save_path": save_path, "source_url": url},
                         trace_id=trace_id,
                     )
+                    if not auto_retry:
+                        self._cleanup_external_temp_files(save_path)
+                        raise ExternalToolError(f"N_m3u8DL-RE failed: {external_exc}") from external_exc
 
         if self._should_try_curl_cffi_first(video_item):
             try:
@@ -228,6 +235,9 @@ class N_m3u8DL_RE_Downloader(Nm3u8YtDlpSupport, BaseDownloader):
                     context={"title": video_item.title, "save_path": save_path, "source_url": url},
                     trace_id=trace_id,
                 )
+                if not auto_retry:
+                    self._cleanup_external_temp_files(save_path)
+                    raise ExternalToolError(f"curl_cffi HLS failed: {curl_exc}") from curl_exc
                 try:
                     debug_logger.log(
                         component="N_m3u8DL_RE_Downloader",
@@ -370,7 +380,7 @@ class N_m3u8DL_RE_Downloader(Nm3u8YtDlpSupport, BaseDownloader):
                 context={"title": video_item.title, "save_path": save_path, "source_url": url},
                 trace_id=trace_id,
             )
-            if self._should_try_yt_dlp_fallback(video_item):
+            if auto_retry and self._should_try_yt_dlp_fallback(video_item):
                 try:
                     debug_logger.log(
                         component="N_m3u8DL_RE_Downloader",
@@ -592,12 +602,14 @@ class N_m3u8DL_RE_Downloader(Nm3u8YtDlpSupport, BaseDownloader):
 
             for path in candidates:
                 try:
-                    if cls._is_reparse_point(path):
-                        errors.append({"path": str(path), "error": "refuse reparse point"})
-                        continue
                     try:
                         root_stat = os.lstat(path)
                     except FileNotFoundError:
+                        continue
+                    # 首次启动或上次清理后，受控根目录不存在是正常情况。
+                    # _is_reparse_point 对 stat 失败保守拒绝，不能用它判断目录存在性。
+                    if cls._is_reparse_point(path):
+                        errors.append({"path": str(path), "error": "refuse reparse point"})
                         continue
                     if not stat.S_ISDIR(root_stat.st_mode):
                         continue
@@ -753,6 +765,9 @@ class N_m3u8DL_RE_Downloader(Nm3u8YtDlpSupport, BaseDownloader):
                 temp_paths=[fragment_dir],
             )
             if process.returncode != 0:
+                self._join_nm3u8_output_reader(output_reader)
+                output_reader = None
+                output_progress.log_process_failure(executable, process.returncode, trace_id)
                 raise ExternalToolError(f"N_m3u8DL-RE exited abnormally (Code: {process.returncode})")
             produced = self._locate_staged_media(staged_output)
             self._assert_nm3u8_output(produced, video_item)

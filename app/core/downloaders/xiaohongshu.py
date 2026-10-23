@@ -48,8 +48,9 @@ class XiaohongshuDownloader(BaseDownloader):
                 check_stop_func,
                 headers,
             )
-            return
 
+        content_type = str(video_item.meta.get("content_type") or "")
+        is_image = content_type == "image" or content_type.startswith("image/")
         self._download_with_strategy_fallback(
             video_item=video_item,
             save_path=save_path,
@@ -60,7 +61,7 @@ class XiaohongshuDownloader(BaseDownloader):
             timeout=cfg.get("download", "request_timeout", 60),
             chunk_size=cfg.get("download", "chunk_size", 65536),
             support_resume=self._coerce_bool_setting(cfg.get("download", "resume_enabled", True)),
-            error_message="小红书视频下载失败",
+            error_message="小红书图片下载失败" if is_image else "小红书视频下载失败",
         )
 
     def _download_gallery(

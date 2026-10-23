@@ -187,7 +187,6 @@ def test_normalize_and_persist_download_options_caps_user_values():
         set_calls.append((section, key, value))
 
     cache_get = Mock(return_value=True)
-    cache_set = Mock()
 
     options = normalize_download_options_payload(
         {"max_concurrent": 24, "max_retries": 11, "video_only": True},
@@ -198,8 +197,8 @@ def test_normalize_and_persist_download_options_caps_user_values():
     assert options["max_concurrent"] == 5
     assert options["max_retries"] == 10
     assert options["video_only"] is True
-    persist_download_options(config_set, cache_set, options)
-    cache_set.assert_called_once_with("download.auto_retry", True, persist=False)
+    persist_download_options(config_set, options)
     assert ("download", "max_concurrent", 5) in set_calls
     assert ("download", "max_retries", 10) in set_calls
+    assert ("download", "auto_retry", True) in set_calls
     assert ("download", "video_only", True) in set_calls

@@ -58,6 +58,15 @@ _ALL_COMPLETED_RE = re.compile(
     rf"^{_DYNAMIC_PREFIX}全部完成[:：]\s*(?:成功|success)\s*(?P<success>\d+)\s*/\s*(?P<total>\d+)\s*\|\s*(?:失败|failed)\s*(?P<failed>\d+)$",
     re.IGNORECASE,
 )
+_CAPTURE_INCOMPLETE_ZH_RE = re.compile(
+    rf"^{_DYNAMIC_PREFIX}(?:捕获|捕獲)不完整(?P<colon>[:：])\s*已提交\s*"
+    r"(?P<submitted>\d+)\s*/\s*(?P<total>\d+)\s*(?:个下载任务|個下載任務)$"
+)
+_CAPTURE_INCOMPLETE_EN_RE = re.compile(
+    rf"^{_DYNAMIC_PREFIX}Capture incomplete:\s*submitted\s*"
+    r"(?P<submitted>\d+)\s*/\s*(?P<total>\d+)\s*download tasks?$",
+    re.IGNORECASE,
+)
 _MOJIBAKE_REPAIR_PHRASES = (
     "下载失败",
     "下载任务失败",
@@ -861,6 +870,25 @@ _RUNTIME_LOG_PHRASE_TRANSLATIONS = (
     ("任务选择框打开失败，停止爬虫任务", "Failed to open the task selection dialog; crawl task stopped", "任務選擇框開啟失敗，停止爬蟲任務"),
 )
 
+_NEW_RUNTIME_LOG_PHRASE_TRANSLATIONS = (
+    (
+        "抖音号格式无效，请使用 @账号名（1-20 位字母、数字、下划线或点）",
+        "Invalid Douyin ID format; use an @handle (1-20 letters, digits, underscores, or dots)",
+        "抖音號格式無效，請使用 @帳號名（1-20 位字母、數字、底線或點）",
+    ),
+    (
+        "未捕获到可下载媒体流，未提交任何任务",
+        "No downloadable media stream was captured; no tasks were submitted",
+        "未擷取到可下載媒體串流，未提交任何任務",
+    ),
+    (
+        "N_m3u8DL-RE 执行失败，保留工具输出以定位缺失依赖",
+        "N_m3u8DL-RE execution failed; retained tool output to help identify the missing dependency",
+        "N_m3u8DL-RE 執行失敗，保留工具輸出以協助定位缺少的相依性",
+    ),
+)
+_RUNTIME_LOG_PHRASE_TRANSLATIONS += _NEW_RUNTIME_LOG_PHRASE_TRANSLATIONS
+
 _EN_DYNAMIC_REPLACEMENTS = (
     ("已刷新 B站 CDN URL 成功", "Refreshed B-site CDN URL successfully"),
     ("重新刷新 B站 CDN URL 成功", "Refreshed B-site CDN URL again successfully"),
@@ -1227,6 +1255,13 @@ def _localize_english_dynamic(text: str) -> str:
     宽泛句式之前；未命中正则时才依次应用 ``_EN_DYNAMIC_REPLACEMENTS``，若仍
     无替换则返回输入文本。该顺序是动态翻译契约的一部分。
     """
+    capture_incomplete = _CAPTURE_INCOMPLETE_ZH_RE.match(text)
+    if capture_incomplete:
+        return (
+            f"{capture_incomplete.group('prefix') or ''}Capture incomplete: submitted "
+            f"{capture_incomplete.group('submitted')}/{capture_incomplete.group('total')} download tasks"
+        )
+
     select_tasks_relay = re.match(
         r"^select_tasks\s+(?:转发延迟|轉發延遲)=(?P<lag>[\d.]+)\s*毫秒[，,]\s*"
         r"(?:项目数|項目數)=(?P<items>\d+)$",
@@ -1398,6 +1433,32 @@ def _apply_runtime_phrase_translations(text: str, language: str) -> str:
     return result
 
 
+def _localize_new_runtime_message_before_dictionary(
+    text: str,
+    language: str,
+) -> str | None:
+    """Localize new diagnostics before the static dictionary can split phrases."""
+    message = re.sub(rf"^{_EMOJI_PREFIX_PATTERN}\s*", "", text, count=1)
+    if any(
+        message == source
+        for entry in _NEW_RUNTIME_LOG_PHRASE_TRANSLATIONS
+        for source in entry
+    ):
+        return _apply_runtime_phrase_translations(text, language)
+
+    if _CAPTURE_INCOMPLETE_ZH_RE.match(text):
+        if language == "en-US":
+            return _localize_english_dynamic(text)
+        return _localize_non_english_dynamic(text, language)
+
+    if _CAPTURE_INCOMPLETE_EN_RE.match(text):
+        if language == "en-US":
+            return text
+        return _localize_non_english_dynamic(text, language)
+
+    return None
+
+
 def _localize_structured_segments(text: str, language: str) -> str:
     """翻译来源/动作等结构化片段；没有别名或翻译变化时返回原文本。"""
     if " · " not in text and " / " not in text and " 路 " not in text:
@@ -1450,6 +1511,24 @@ def _localize_non_english_dynamic(text: str, language: str) -> str:
     mapped = _NON_EN_DYNAMIC_EXACT.get(text)
     if mapped:
         return _localized(mapped, language)
+
+    capture_incomplete = _CAPTURE_INCOMPLETE_EN_RE.match(text)
+    if capture_incomplete:
+        submitted = capture_incomplete.group("submitted")
+        total = capture_incomplete.group("total")
+        prefix = capture_incomplete.group("prefix") or ""
+        if language == "zh-TW":
+            return f"{prefix}捕獲不完整: 已提交 {submitted}/{total} 個下載任務"
+        return f"{prefix}捕获不完整: 已提交 {submitted}/{total} 个下载任务"
+
+    capture_incomplete = _CAPTURE_INCOMPLETE_ZH_RE.match(text)
+    if capture_incomplete:
+        submitted = capture_incomplete.group("submitted")
+        total = capture_incomplete.group("total")
+        prefix = capture_incomplete.group("prefix") or ""
+        if language == "zh-TW":
+            return f"{prefix}捕獲不完整{capture_incomplete.group('colon')} 已提交 {submitted}/{total} 個下載任務"
+        return f"{prefix}捕获不完整{capture_incomplete.group('colon')} 已提交 {submitted}/{total} 个下载任务"
 
     select_tasks_relay = re.match(
         r"^select_tasks relay lag=(?P<lag>[\d.]+)ms items=(?P<items>\d+)$",
@@ -1645,6 +1724,9 @@ def localize_log_text(text: object, language: str | None) -> str:
     if not value:
         return value
     normalized = normalize_language(language)
+    result = _localize_new_runtime_message_before_dictionary(value, normalized)
+    if result is not None:
+        return _cleanup_english_log_fragments(result) if normalized == "en-US" else result
     result = tr(value, normalized)
     result = _localize_structured_segments(result, normalized)
     result = _apply_runtime_phrase_translations(result, normalized)

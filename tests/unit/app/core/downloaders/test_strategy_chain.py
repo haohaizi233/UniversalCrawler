@@ -23,6 +23,12 @@ class _ExplodingStrategy:
     def execute(self, _downloader, _request):
         raise StreamDownloadError("boom")
 
+class _UnavailableStrategy:
+    name = "unavailable"
+
+    def execute(self, _downloader, _request):
+        return False
+
 class _HttpProbeStrategy:
     name = "http"
 
@@ -124,6 +130,42 @@ class DownloadStrategyChainTests(unittest.TestCase):
 
         self.assertEqual(len(downloader.http_calls), 1)
 
+    @patch("app.core.downloaders.chunked.ChunkedDownloader.download", side_effect=StreamDownloadError("chunked failed"))
+    @patch("app.core.downloaders.chunked.ChunkedDownloader.should_use", return_value=True)
+    @patch("app.core.downloaders.ffmpeg.FFmpegDownloader.should_use", return_value=False)
+    @patch("app.core.downloaders.m3u8.N_m3u8DL_RE_Downloader.is_m3u8_url", return_value=False)
+    def test_chunked_failure_does_not_start_http_after_auto_retry_is_disabled(
+        self,
+        _mocked_is_m3u8_url,
+        _mocked_ffmpeg_should_use,
+        _mocked_chunked_should_use,
+        _mocked_chunked_download,
+    ):
+        item = VideoItem(url="https://example.com/video.mp4", title="demo", source="douyin")
+        item.meta["size_mb"] = 500
+        downloader = _ProbeDownloader()
+        config = {
+            ("download", "auto_retry"): False,
+            ("download", "max_retries"): 3,
+            ("download", "speed_limit_kb"): 0,
+        }
+
+        with patch("app.core.downloaders.base.cfg.get", side_effect=lambda section, key, default=None: config.get((section, key), default)):
+            with self.assertRaises(StreamDownloadError):
+                downloader._download_with_strategy_fallback(
+                    video_item=item,
+                    save_path="demo.mp4",
+                    headers={"User-Agent": "ua"},
+                    progress_callback=lambda _value: None,
+                    check_stop_func=lambda: False,
+                    max_retries=3,
+                    timeout=10,
+                    chunk_size=1024,
+                )
+
+        self.assertEqual(downloader.http_calls, [])
+        _mocked_chunked_download.assert_called_once()
+
     def test_invalid_explicit_strategy_raises_clear_error(self):
         item = VideoItem(url="https://example.com/video.mp4", title="demo", source="douyin")
         item.meta["download_strategy"] = "nonexistent"
@@ -141,18 +183,55 @@ class DownloadStrategyChainTests(unittest.TestCase):
                 chunk_size=1024,
             )
 
-    def test_strategy_exception_falls_back_to_later_strategy(self):
-        chain = DownloadStrategyChain([_ExplodingStrategy(), _HttpProbeStrategy()])
+    def test_backend_failure_stops_strategy_fallback_when_auto_retry_is_disabled(self):
+        fallback = _HttpProbeStrategy()
+        chain = DownloadStrategyChain([_ExplodingStrategy(), fallback])
         request = SimpleNamespace(
             video_item=VideoItem(url="https://example.com/video.mp4", title="demo", source="douyin"),
             headers={},
             explicit_strategy="",
+            auto_retry=False,
+            error_message="下载失败",
+            context=SimpleNamespace(trace_id="trace-strategy"),
+        )
+        downloader = _ProbeDownloader()
+
+        with self.assertRaises(StreamDownloadError):
+            chain.execute(downloader, request)
+        self.assertEqual(fallback.calls, 0)
+
+    def test_unavailable_strategy_still_allows_capability_fallback_when_auto_retry_is_disabled(self):
+        fallback = _HttpProbeStrategy()
+        chain = DownloadStrategyChain([_UnavailableStrategy(), fallback])
+        request = SimpleNamespace(
+            video_item=VideoItem(url="https://example.com/video.mp4", title="demo", source="douyin"),
+            headers={},
+            explicit_strategy="",
+            auto_retry=False,
+            error_message="下载失败",
+            context=SimpleNamespace(trace_id="trace-strategy"),
+        )
+
+        chain.execute(_ProbeDownloader(), request)
+
+        self.assertEqual(fallback.calls, 1)
+
+    def test_backend_failure_still_falls_back_when_auto_retry_is_enabled(self):
+        fallback = _HttpProbeStrategy()
+        chain = DownloadStrategyChain([_ExplodingStrategy(), fallback])
+        request = SimpleNamespace(
+            video_item=VideoItem(url="https://example.com/video.mp4", title="demo", source="douyin"),
+            headers={},
+            explicit_strategy="",
+            auto_retry=True,
             error_message="下载失败",
             context=SimpleNamespace(trace_id="trace-strategy"),
         )
         downloader = _ProbeDownloader()
 
         chain.execute(downloader, request)
+
+        self.assertEqual(fallback.calls, 1)
 
 if __name__ == "__main__":
     unittest.main()

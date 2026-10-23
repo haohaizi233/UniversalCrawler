@@ -6,6 +6,7 @@ import os
 import threading
 import time
 from collections.abc import Callable
+from urllib.parse import urlsplit
 
 from app.core.download_manager_core import DownloadManagerCore
 from app.core.download_path_policy import resolve_task_save_directory
@@ -400,6 +401,11 @@ class DownloadWorker(threading.Thread):
             return ".jpeg"
         if content_type == "video":
             return ".mp4"
+        if content_type == "image" or str(content_type).startswith("image/"):
+            # CDN 图片地址常只有资源 ID。先按图片落盘，下载完成后再用签名
+            # 校正真实格式，避免 .mp4 的发布校验把合法图片当作坏视频拒绝。
+            suffix = os.path.splitext(urlsplit(self.video.url).path)[1].lower()
+            return suffix if suffix in {".jpg", ".jpeg", ".png", ".webp", ".gif"} else ".jpeg"
 
         url_lower = self.video.url.lower()
         if ".gif" in url_lower:

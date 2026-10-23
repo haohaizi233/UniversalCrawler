@@ -10,7 +10,7 @@ import threading
 import time
 from collections import deque
 
-from app.config import DEFAULT_USER_AGENT, cfg
+from app.config import DEFAULT_USER_AGENT, cfg, effective_download_retry_count
 from app.debug_logger import debug_logger
 from app.exceptions import DownloaderStoppedError, ExternalToolError, ExternalToolNotFoundError
 from app.models import VideoItem
@@ -313,7 +313,10 @@ class FFmpegDownloader(BaseDownloader):
 
         startupinfo = build_hidden_startupinfo()
 
-        max_retries = self._coerce_retry_count(cfg.get("download", "max_retries", 3))
+        max_retries = effective_download_retry_count(
+            cfg.get("download", "max_retries", 3),
+            cfg.get("download", "auto_retry", True),
+        )
         temp_path = save_path + ".downloading"
         if isinstance(getattr(video_item, "meta", None), dict):
             # 记录给文件服务删除失败项时使用，避免只删最终文件而漏掉 ffmpeg 半成品。

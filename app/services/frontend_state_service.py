@@ -238,6 +238,9 @@ class FrontendStateService(FrontendToolboxStateMixin, FrontendSettingActionsMixi
 
     def _load_download_auto_retry(self) -> bool:
         try:
+            configured = self.config.get("download", "auto_retry", None)
+            if configured is not None:
+                return bool(configured)
             return bool(self.cache_service.get(DOWNLOAD_AUTO_RETRY_CACHE_KEY, True))
         except Exception as exc:
             debug_logger.log_exception(
@@ -933,6 +936,7 @@ class FrontendStateService(FrontendToolboxStateMixin, FrontendSettingActionsMixi
             {
                 "max_concurrent": 3,
                 "max_retries": 3,
+                "auto_retry": True,
                 "request_timeout": 60,
                 "resume_enabled": True,
                 "speed_limit_kb": 0,
@@ -946,6 +950,7 @@ class FrontendStateService(FrontendToolboxStateMixin, FrontendSettingActionsMixi
             set_runtime_options(
                 max_concurrent=download_cfg.get("max_concurrent", 3),
                 max_retries=download_cfg.get("max_retries", 3),
+                auto_retry=download_cfg.get("auto_retry", True),
                 request_timeout=download_cfg.get("request_timeout", 60),
                 resume_enabled=download_cfg.get("resume_enabled", True),
                 speed_limit_kb=download_cfg.get("speed_limit_kb", 0),
@@ -2412,7 +2417,6 @@ class FrontendStateService(FrontendToolboxStateMixin, FrontendSettingActionsMixi
             with self._capture_config_runtime_failures() as runtime_failures:
                 settings_adapter.persist_download_options(
                     self.config.set,
-                    self.cache_service.set,
                     options,
                     config_set_many=getattr(self.config, "set_many", None),
                 )

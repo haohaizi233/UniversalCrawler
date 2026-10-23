@@ -200,6 +200,7 @@ class DownloadManagerCore(DownloadManagerStartupMaintenance):
         self._dispatching_tasks: list[tuple[VideoItem, str]] = []
         self.max_concurrent = normalize_download_concurrency(max_concurrent or cfg.get("download", "max_concurrent", 3))
         self.max_retries = cfg.get("download", "max_retries", 3)
+        self.auto_retry = bool(cfg.get("download", "auto_retry", True))
         self.request_timeout = cfg.get("download", "request_timeout", 60)
         self.resume_enabled = cfg.get("download", "resume_enabled", True)
         self.speed_limit_kb = cfg.get("download", "speed_limit_kb", 0)
@@ -328,6 +329,13 @@ class DownloadManagerCore(DownloadManagerStartupMaintenance):
             except (TypeError, ValueError):
                 pass
             applied["max_retries"] = self.max_retries
+        if "auto_retry" in options:
+            value = options["auto_retry"]
+            if isinstance(value, str):
+                self.auto_retry = value.strip().lower() not in {"0", "false", "no", "off"}
+            else:
+                self.auto_retry = True if value is None else bool(value)
+            applied["auto_retry"] = self.auto_retry
         if "request_timeout" in options:
             try:
                 self.request_timeout = max(10, min(int(options["request_timeout"]), 300))

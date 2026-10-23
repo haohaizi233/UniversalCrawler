@@ -26,6 +26,7 @@ class DownloadRequest:
     max_retries: int
     timeout: int
     chunk_size: int
+    auto_retry: bool = True
     support_resume: bool = False
     error_message: str = "下载失败"
 
@@ -114,6 +115,8 @@ class ChunkedDownloadStrategy:
             )
             return True
         except StreamDownloadError as exc:
+            if not request.auto_retry:
+                raise
             debug_logger.log(
                 component=type(downloader).__name__,
                 action="chunked_fallback",
@@ -230,6 +233,8 @@ class DownloadStrategyChain:
                 raise
             except Exception as exc:
                 last_error = exc
+                if not getattr(request, "auto_retry", True):
+                    raise StreamDownloadError(f"{request.error_message}: {exc}") from exc
                 debug_logger.log(
                     component=type(downloader).__name__,
                     action="strategy_fallback",

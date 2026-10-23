@@ -11,7 +11,7 @@ from typing import Any, Callable, cast
 
 import requests
 
-from app.config import DEFAULT_USER_AGENT, cfg
+from app.config import DEFAULT_USER_AGENT, cfg, effective_download_retry_count
 from app.debug_logger import debug_logger
 from app.exceptions import DownloaderStoppedError, StreamDownloadError
 from app.models import VideoItem
@@ -294,6 +294,10 @@ class BaseDownloader:
             progress_callback=progress_callback,
             check_stop_func=check_stop_func,
             max_retries=max_retries,
+            auto_retry=effective_download_retry_count(
+                max_retries,
+                cfg.get("download", "auto_retry", True),
+            ) > 0,
             timeout=timeout,
             chunk_size=chunk_size,
             support_resume=support_resume,
@@ -399,7 +403,10 @@ class BaseDownloader:
         response_content_type = ""
         content_length_known = False
         proxies = requests_proxy_mapping(proxy)
-        retry_count = self._coerce_retry_count(max_retries)
+        retry_count = effective_download_retry_count(
+            max_retries,
+            cfg.get("download", "auto_retry", True),
+        )
         rate_limiter = TransferRateLimiter(cfg.get("download", "speed_limit_kb", 0))
 
         # retry_count 表示失败后的重试次数，因此总尝试次数是 retry_count + 1。

@@ -10,7 +10,7 @@ import urllib.parse
 
 import requests
 
-from app.config import DEFAULT_USER_AGENT, cfg
+from app.config import DEFAULT_USER_AGENT, cfg, effective_download_retry_count
 from app.debug_logger import debug_logger
 from app.exceptions import (
     DownloaderStoppedError,
@@ -182,7 +182,10 @@ class BilibiliDownloader(BaseDownloader):
         stream_temp_files = [temp_v, temp_a] if audio_url else [temp_v]
         video_item.meta["download_temp_files"] = [*stream_temp_files, merging_path]
         chunk_size = max(cfg.get("download", "chunk_size", 65536), 256 * 1024)
-        max_retries = self._coerce_retry_count(cfg.get("download", "max_retries", 3))
+        max_retries = effective_download_retry_count(
+            cfg.get("download", "max_retries", 3),
+            cfg.get("download", "auto_retry", True),
+        )
         resume_raw = cfg.get("download", "resume_enabled", True)
         resume_enabled = self._coerce_bool_setting(resume_raw)
         # DASH 的音频和视频并行下载，共享额度后总吞吐才符合设置页的 KB/s 语义。

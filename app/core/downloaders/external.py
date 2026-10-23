@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import urllib.parse
 import time
 
-from app.config import DEFAULT_USER_AGENT, cfg
+from app.config import DEFAULT_USER_AGENT, cfg, effective_download_retry_count
 from app.debug_logger import debug_logger
 from app.exceptions import DownloaderStoppedError
 from app.utils.runtime_paths import resolve_tool_file
@@ -34,11 +35,11 @@ def build_no_window_flags() -> int:
     return getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 def _configured_retry_count(default: int = 3) -> int:
-    try:
-        retry_count = int(cfg.get("download", "max_retries", default))
-    except (TypeError, ValueError):
-        retry_count = default
-    return max(0, min(retry_count, 10))
+    return effective_download_retry_count(
+        cfg.get("download", "max_retries", default),
+        cfg.get("download", "auto_retry", True),
+        default=default,
+    )
 
 def _configured_request_timeout(default: int = 60) -> int:
     try:
@@ -176,19 +177,24 @@ class FFmpegExternalTool:
             user_agent,
             "-headers",
             f"Referer: {referer}\r\n",
-            "-reconnect",
-            "1",
-            "-reconnect_at_eof",
-            "1",
-            "-reconnect_streamed",
-            "1",
-            "-reconnect_delay_max",
-            "5",
+        ]
+        if _configured_retry_count() > 0:
+            cmd.extend([
+                "-reconnect",
+                "1",
+                "-reconnect_at_eof",
+                "1",
+                "-reconnect_streamed",
+                "1",
+                "-reconnect_delay_max",
+                "5",
+            ])
+        cmd.extend([
             "-timeout",
             timeout_us,
             "-rw_timeout",
             timeout_us,
-        ]
+        ])
         if proxy:
             cmd.extend(["-http_proxy", proxy])
         cmd.extend([
@@ -416,6 +422,11 @@ class NM3U8DLREExternalTool:
         ]
         if tmp_dir:
             cmd.extend(["--tmp-dir", str(tmp_dir)])
+        ffmpeg = FFmpegExternalTool.resolve_executable()
+        if ffmpeg:
+            # 工具可以分别位于显式工具目录和 _internal；不要让子进程再从
+            # 当前工作目录或用户 PATH 猜测另一份 ffmpeg。
+            cmd.extend(["--ffmpeg-binary-path", os.path.abspath(shutil.which(ffmpeg) or ffmpeg)])
         cmd.extend([
             "--thread-count",
             thread_count_text,

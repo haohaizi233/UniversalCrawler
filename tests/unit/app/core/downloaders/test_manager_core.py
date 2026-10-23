@@ -87,6 +87,16 @@ class _CoreManager(DownloadManagerCore):
         worker.deleteLater()
 
 class DownloadManagerCoreTests(unittest.TestCase):
+    def test_runtime_auto_retry_toggle_preserves_configured_retry_budget(self):
+        manager = DownloadManagerCore.__new__(DownloadManagerCore)
+        manager.max_retries = 5
+
+        applied = manager.set_runtime_options(auto_retry=False)
+
+        self.assertFalse(manager.auto_retry)
+        self.assertEqual(manager.max_retries, 5)
+        self.assertEqual(applied, {"auto_retry": False})
+
     def test_pending_download_queue_removes_item_without_private_queue_state(self):
         pending = PendingDownloadQueue()
         first = VideoItem(url="https://example.com/1.mp4", title="first", source="douyin")

@@ -40,6 +40,16 @@ from app.core.plugins.metadata import PlatformAuthSpec
 from app.debug_logger import debug_logger
 from app.services.auth_service import AuthService
 
+_MISSING = object()
+
+
+def _download_auto_retry(config_get, cache_get) -> bool:
+    """Prefer the persisted setting while accepting the former in-memory cache fallback."""
+    configured = config_get("download", "auto_retry", _MISSING)
+    if configured is not _MISSING and configured is not None:
+        return bool(configured)
+    return bool(cache_get("download.auto_retry", True))
+
 
 def resolve_platform_auth_spec(plugin_id: str) -> PlatformAuthSpec:
     """Resolve the canonical authentication contract from plugin metadata."""
@@ -228,7 +238,7 @@ def build_download_options_snapshot(
         max_retries = int(config_get("download", "max_retries", 3))
     except (TypeError, ValueError):
         max_retries = 3
-    auto_retry = bool(cache_get("download.auto_retry", True))
+    auto_retry = _download_auto_retry(config_get, cache_get)
     image_respects_concurrency = bool(config_get("download", "image_respects_concurrency", False))
     if manager is not None and hasattr(manager, "image_respects_concurrency"):
         image_respects_concurrency = bool(manager.image_respects_concurrency)
@@ -259,8 +269,13 @@ def normalize_download_options_payload(
         max_retries = int(data.get("max_retries", config_get("download", "max_retries", 3)))
     except (TypeError, ValueError):
         max_retries = 3
+    raw_auto_retry = data.get("auto_retry", _MISSING)
     return {
-        "auto_retry": bool(data.get("auto_retry", cache_get("download.auto_retry", True))),
+        "auto_retry": (
+            bool(raw_auto_retry)
+            if raw_auto_retry is not _MISSING and raw_auto_retry is not None
+            else _download_auto_retry(config_get, cache_get)
+        ),
         "max_retries": max(0, min(max_retries, 10)),
         "max_concurrent": normalize_download_concurrency(max_concurrent),
         "video_only": bool(data.get("video_only", config_get("download", "video_only", False))),
@@ -283,7 +298,6 @@ def apply_manager_concurrency(manager: Any | None, max_concurrent: Any) -> int:
 
 def persist_download_options(
     config_set,
-    cache_set,
     options: Mapping[str, Any],
     *,
     config_set_many=None,
@@ -296,6 +310,7 @@ def persist_download_options(
     config_values = {
         "max_concurrent": normalize_download_concurrency(options.get("max_concurrent")),
         "max_retries": max(0, min(max_retries, 10)),
+        "auto_retry": bool(options.get("auto_retry", True)),
         "video_only": bool(options.get("video_only", False)),
         "image_respects_concurrency": bool(options.get("image_respects_concurrency", False)),
     }
@@ -304,7 +319,6 @@ def persist_download_options(
     else:
         for key, value in config_values.items():
             config_set("download", key, value)
-    cache_set("download.auto_retry", bool(options.get("auto_retry", True)), persist=False)
 
 
 def platform_settings_rows(

@@ -250,6 +250,7 @@ class DownloadSettings:
     max_concurrent: int = 3
     local_scan_limit: int = 1000
     max_retries: int = 3
+    auto_retry: bool = True
     request_timeout: int = 60
     chunk_size: int = 65536
     resume_enabled: bool = True
@@ -263,6 +264,7 @@ class DownloadSettings:
         self.max_concurrent = normalize_download_concurrency(self.max_concurrent)
         self.local_scan_limit = max(100, min(self.local_scan_limit, 5000))
         self.max_retries = max(0, min(self.max_retries, 10))
+        self.auto_retry = bool(self.auto_retry)
         self.request_timeout = max(10, min(self.request_timeout, 300))
         self.chunk_size = max(8192, min(self.chunk_size, 1024 * 1024))
         self.speed_limit_kb = max(0, min(self.speed_limit_kb, 999999))
@@ -272,6 +274,23 @@ class DownloadSettings:
         except (TypeError, ValueError):
             image_limit = 10
         self.image_fast_lane_limit = max(1, min(image_limit, 10))
+
+
+def effective_download_retry_count(max_retries: Any, auto_retry: Any = True, *, default: int = 3) -> int:
+    """Return the configured failure retry budget, or zero when retries are disabled."""
+    if auto_retry is None:
+        retries_enabled = True
+    elif isinstance(auto_retry, str):
+        retries_enabled = auto_retry.strip().lower() not in {"0", "false", "no", "off"}
+    else:
+        retries_enabled = bool(auto_retry)
+    if not retries_enabled:
+        return 0
+    try:
+        retry_count = int(max_retries)
+    except (TypeError, ValueError, OverflowError):
+        retry_count = default
+    return max(0, min(retry_count, 10))
 
 @dataclass
 class PlaybackSettings:

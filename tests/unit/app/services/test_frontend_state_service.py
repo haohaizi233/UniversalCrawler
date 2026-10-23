@@ -18,6 +18,25 @@ from app.services.frontend_state_service import FrontendStateService, QUEUE_STAT
 from app.services.media_metadata_service import MediaMetadata
 
 class FrontendStateServiceTests(unittest.TestCase):
+    def test_auto_retry_toggle_persists_without_changing_retry_budget(self):
+        with TemporaryDirectory() as temp_dir:
+            config_path = str(Path(temp_dir) / "config.json")
+            config = ConfigManager(config_path)
+            config.set("download", "max_retries", 5)
+            service = FrontendStateService(config_manager=config, cache_service=Mock())
+
+            result = service.handle_action("update_download_options", {"auto_retry": False})
+
+            self.assertEqual(result["status"], "ok")
+            self.assertFalse(result["data"]["auto_retry"])
+            self.assertEqual(result["data"]["max_retries"], 5)
+            self.assertFalse(config.get("download", "auto_retry", True))
+            self.assertEqual(config.get("download", "max_retries"), 5)
+
+            restarted_config = ConfigManager(config_path)
+            self.assertFalse(restarted_config.get("download", "auto_retry", True))
+            self.assertEqual(restarted_config.get("download", "max_retries"), 5)
+
     def test_external_config_change_refreshes_service_snapshot_and_delta(self):
         with TemporaryDirectory() as temp_dir:
             config_path = str(Path(temp_dir) / "config.json")
@@ -2466,7 +2485,10 @@ class FrontendStateServiceTests(unittest.TestCase):
                 self.values[(section, key)] = value
                 self.set_calls.append((section, key, value))
 
-        manager = SimpleNamespace(set_max_concurrent=Mock(return_value=5))
+        manager = SimpleNamespace(
+            set_max_concurrent=Mock(return_value=5),
+            set_runtime_options=Mock(),
+        )
         controller = SimpleNamespace(_dl_manager=manager)
         cache = Mock()
         config = FakeConfig()
@@ -2474,14 +2496,14 @@ class FrontendStateServiceTests(unittest.TestCase):
 
         result = service.handle_action(
             "update_download_options",
-            {"auto_retry": True, "max_retries": 5, "max_concurrent": 6},
+            {"auto_retry": False, "max_retries": 5, "max_concurrent": 6},
         )
 
         self.assertEqual(result["status"], "ok")
         self.assertEqual(
             result["data"],
             {
-                "auto_retry": True,
+                "auto_retry": False,
                 "max_retries": 5,
                 "max_concurrent": 5,
                 "video_only": False,
@@ -2490,10 +2512,13 @@ class FrontendStateServiceTests(unittest.TestCase):
         )
         self.assertIn(("download", "max_concurrent", 5), config.set_calls)
         self.assertIn(("download", "max_retries", 5), config.set_calls)
+        self.assertIn(("download", "auto_retry", False), config.set_calls)
         self.assertIn(("download", "video_only", False), config.set_calls)
         self.assertIn(("download", "image_respects_concurrency", False), config.set_calls)
         manager.set_max_concurrent.assert_called_once_with(5)
-        cache.set.assert_called_once_with("download.auto_retry", True, persist=False)
+        manager.set_runtime_options.assert_called_once()
+        self.assertFalse(manager.set_runtime_options.call_args.kwargs["auto_retry"])
+        cache.set.assert_not_called()
 
     def test_update_download_options_rejects_string_boolean(self):
         with TemporaryDirectory() as temp_dir:
@@ -2577,6 +2602,7 @@ class FrontendStateServiceTests(unittest.TestCase):
         self.assertIn(("download", "image_respects_concurrency", True), config.set_calls)
         manager.set_runtime_options.assert_called_once()
         self.assertTrue(manager.set_runtime_options.call_args.kwargs["image_respects_concurrency"])
+        self.assertTrue(manager.set_runtime_options.call_args.kwargs["auto_retry"])
 
     def test_download_options_snapshot_uses_effective_manager_values(self):
         class FakeConfig:

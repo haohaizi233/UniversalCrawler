@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import threading
+import traceback
 from concurrent.futures import FIRST_COMPLETED, CancelledError, ThreadPoolExecutor, wait
 from typing import Any
 from urllib.parse import quote
@@ -1039,6 +1040,7 @@ class XiaohongshuSpider(BaseSpider):
                 message="小红书爬虫运行异常",
                 status_code="XHS_SPIDER_ERROR",
                 details={"error": str(exc)},
+                level="ERROR",
             )
         except Exception as exc:
             self.log(f"💥 小红书运行时异常: {exc}")
@@ -1046,7 +1048,14 @@ class XiaohongshuSpider(BaseSpider):
                 action="run_error",
                 message="小红书爬虫运行异常",
                 status_code="XHS_SPIDER_ERROR",
-                details={"error": str(exc)},
+                details={
+                    "error": str(exc),
+                    "exception_type": type(exc).__name__,
+                    "winerror": getattr(exc, "winerror", None),
+                    "filename": getattr(exc, "filename", None),
+                    "traceback": traceback.format_exc(),
+                },
+                level="ERROR",
             )
         finally:
             client = getattr(self, "_client", None)

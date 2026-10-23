@@ -895,7 +895,12 @@ class KuaishouSpider(
         base_count = len(items_for_dialog)
         return max(base_count, base_count * 2)
 
-    def _run_capture_pipeline(self, page, items_for_dialog: list[dict[str, int | str]], target_fingerprints_map: dict[int, set[str]]) -> None:
+    def _run_capture_pipeline(
+        self,
+        page,
+        items_for_dialog: list[dict[str, int | str]],
+        target_fingerprints_map: dict[int, set[str]],
+    ) -> int:
         """滚动详情流，并把网络响应匹配到用户选择的卡片。"""
         page = self._resolve_active_page(page, getattr(page, "context", None) or None) or page
         target_indices_set = set(self._selected_indices)
@@ -910,11 +915,24 @@ class KuaishouSpider(
             previous = published.get(idx)
             if previous == choice or (previous and previous[0] == "playlist"):
                 return
-            published[idx] = choice
-            submitted_indices.add(idx)
             title = str(items_for_dialog[idx]["title"])
             stream_url = choice[1]
             trace_id = self.new_trace_id("stream")
+            referer = page.url
+            meta = self.task_builder.build_download_meta(
+                trace_id,
+                referer,
+                stream_url,
+                self._user_agent(),
+            )
+            self.emit_video(
+                url=stream_url,
+                title=title,
+                source="kuaishou",
+                meta=meta,
+            )
+            published[idx] = choice
+            submitted_indices.add(idx)
             self.log(f"   ✨ [捕获] {title[:15]}... -> 加入下载队列")
             self.debug_state(
                 action="emit_download_task",
@@ -925,14 +943,8 @@ class KuaishouSpider(
                     "title": title,
                     "stream_url": stream_url,
                     "download_strategy": "m3u8" if choice[0] == "playlist" else "http",
-                    "referer": page.url,
+                    "referer": referer,
                 },
-            )
-            self.emit_video(
-                url=stream_url,
-                title=title,
-                source="kuaishou",
-                meta=self.task_builder.build_download_meta(trace_id, page.url, stream_url, self._user_agent()),
             )
 
         def flush_pending() -> None:
@@ -991,8 +1003,9 @@ class KuaishouSpider(
 
         context = page.context
         listened_page = page
-        page.on("response", handle_response)
-        try:
+
+        def run_capture() -> None:
+            nonlocal page, current_focus_index
             page = self._resolve_active_page(page, context)
             if not page:
                 self.log("❌ 详情页已关闭，无法启动捕获流水线")
@@ -1046,25 +1059,9 @@ class KuaishouSpider(
                     pass
             flush_pending()
 
-            self.log("\n📊 流程结束。")
-            self.debug_state(
-                action="capture_pipeline_finish",
-                message="快手流捕获流水线结束",
-                status_code="KUAISHOU_CAPTURE_DONE",
-                details={
-                    "scroll_budget": total_scrolls,
-                    "selected_count": len(target_indices_set),
-                    "submitted_count": len(submitted_indices),
-                    "not_found_count": len(target_indices_set - submitted_indices),
-                },
-            )
-            not_found = target_indices_set - submitted_indices
-            if not_found:
-                self.log(f"⚠️ {len(not_found)} 个视频未捕获:")
-                for idx in sorted(list(not_found)):
-                    self.log(f"   - [{idx + 1}] {items_for_dialog[idx]['title'][:20]}...")
-            else:
-                self.log("✅ 全部任务完成！")
+        page.on("response", handle_response)
+        try:
+            run_capture()
         finally:
             try:
                 flush_pending()
@@ -1074,6 +1071,29 @@ class KuaishouSpider(
                 listened_page.remove_listener("response", handle_response)
             except (AttributeError, PlaywrightError):
                 pass
+        with self._lock:
+            submitted_indices_snapshot = set(submitted_indices)
+        submitted_count = len(submitted_indices_snapshot)
+        not_found = target_indices_set - submitted_indices_snapshot
+        self.log("\n📊 流程结束。")
+        self.debug_state(
+            action="capture_pipeline_finish",
+            message="快手流捕获流水线结束",
+            status_code="KUAISHOU_CAPTURE_DONE",
+            details={
+                "scroll_budget": total_scrolls,
+                "selected_count": len(target_indices_set),
+                "submitted_count": submitted_count,
+                "not_found_count": len(not_found),
+            },
+        )
+        if not_found:
+            self.log(f"⚠️ {len(not_found)} 个视频未捕获:")
+            for idx in sorted(list(not_found)):
+                self.log(f"   - [{idx + 1}] {items_for_dialog[idx]['title'][:20]}...")
+        else:
+            self.log("✅ 全部任务完成！")
+        return submitted_count
 
     def _entry_url_for_login(self) -> str | None:
         if self._is_detail_url(self.keyword):
@@ -1215,7 +1235,21 @@ class KuaishouSpider(
             self.is_running = True
             self._selected_indices = selected_indices
             self.log(f"✅ 选中 {len(selected_indices)} 个任务，流水线启动...")
-            self._run_capture_pipeline(page, items_for_dialog, target_fingerprints_map)
+            submitted_count = self._run_capture_pipeline(
+                page,
+                items_for_dialog,
+                target_fingerprints_map,
+            )
+            if not self.is_running or self.interrupt_requested:
+                return "stopped"
+            if submitted_count <= 0:
+                self.log("❌ 未捕获到可下载媒体流，未提交任何任务")
+                return "failed"
+            if submitted_count < len(selected_indices):
+                self.log(
+                    f"⚠️ 捕获不完整: 已提交 {submitted_count}/{len(selected_indices)} 个下载任务"
+                )
+                return "partial"
             return "completed"
         finally:
             self._close_playwright_session(context, browser)
@@ -1291,7 +1325,7 @@ class KuaishouSpider(
                             headless=True,
                             allow_manual_login=False,
                         )
-            if result == "completed" and self.is_running and not self.interrupt_requested:
+            if result in {"completed", "partial"} and self.is_running and not self.interrupt_requested:
                 self.run_succeeded = True
         except (PlaywrightError, OSError, ValueError, RuntimeError) as e:
             self.log(f"💥 爬虫错误: {e}")

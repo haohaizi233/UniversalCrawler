@@ -619,9 +619,14 @@ class DouyinSpider(BaseSpider):
             self._log_unsupported_numeric_uid()
             return
 
-        if raw_text.isalnum() and len(raw_text) <= 20 and ' ' not in raw_text:
-            self.log(f"👤 识别为可能的抖音号: {raw_text}，尝试搜索...")
-            await self._process_user_search(params, raw_text)
+        if raw_text.startswith("@"):
+            account_id = raw_text[1:]
+            if re.fullmatch(r"[A-Za-z0-9._]{1,20}", account_id):
+                self.log(f"👤 识别为可能的抖音号: {account_id}，尝试搜索...")
+                await self._process_user_search(params, account_id)
+                return
+
+            self.log("⚠️ 抖音号格式无效，请使用 @账号名（1-20 位字母、数字、下划线或点）")
             return
 
         await self._process_search(params, raw_text)

@@ -3041,9 +3041,9 @@ class SpiderHelperTests(unittest.TestCase):
 
     @patch("app.spiders.douyin.spider.LinkExtractor")
     @patch("app.spiders.douyin.spider.Parameter")
-    def test_douyin_async_main_routes_alnum_to_user_search(self, mock_parameter, mock_link_extractor):
-        """验证 `test_douyin_async_main_routes_alnum_to_user_search` 对应场景是否符合预期，供 `SpiderHelperTests` 使用。"""
-        spider = self._make_douyin_spider("testuser123")
+    def test_douyin_async_main_routes_explicit_handle_to_user_search(self, mock_parameter, mock_link_extractor):
+        """验证显式 @ 抖音号路由到用户搜索，供 `SpiderHelperTests` 使用。"""
+        spider = self._make_douyin_spider("@testuser123")
         params = Mock(chunk=1024 * 1024, max_retry=3)
         params.update_params = AsyncMock()
         mock_parameter.return_value = params

@@ -41,6 +41,28 @@ class XiaohongshuRuntimeTests(unittest.TestCase):
 
         self.assertFalse(spider.run_succeeded)
 
+    def test_missing_runtime_records_traceback_and_filename_at_error_level(self):
+        spider = XiaohongshuSpider("关键词", {})
+        spider.log = Mock()
+        spider.debug_state = Mock()
+        spider._emit_finished = Mock()
+        spider._ensure_cookie_string = Mock(
+            side_effect=FileNotFoundError(2, "missing browser driver", "node.exe")
+        )
+
+        spider.run()
+
+        self.assertFalse(spider.run_succeeded)
+        failure = next(
+            call.kwargs for call in spider.debug_state.call_args_list
+            if call.kwargs.get("action") == "run_error"
+        )
+        self.assertEqual(failure["level"], "ERROR")
+        self.assertEqual(failure["details"]["exception_type"], "FileNotFoundError")
+        self.assertEqual(failure["details"]["filename"], "node.exe")
+        self.assertIn("_ensure_cookie_string", failure["details"]["traceback"])
+        spider._emit_finished.assert_called_once()
+
     def test_stopped_parse_without_delivery_does_not_revive(self):
         spider = XiaohongshuSpider("主页", {"stream_downloads": True})
         spider.log = Mock()

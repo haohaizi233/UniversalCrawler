@@ -92,6 +92,8 @@ WizardSmallImageBackColor=clWhite
 UninstallDisplayIcon={app}\{#AppExeName}
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
+; Qt 6.10 supports Windows 10 version 1809 (build 17763) and later.
+MinVersion=10.0.17763
 AppComments={#AppComments}
 VersionInfoProductName={#AppName} Setup
 VersionInfoDescription={#AppComments}

@@ -39,6 +39,8 @@ if __package__ in (None, ""):
         WEBUI_ICON_NAME,
         WEBUI_USER_MODEL_ID,
     )
+    from media_tools import MediaToolValidationError, validate_media_tools
+    from playwright_bundle import PlaywrightDriverValidationError, validate_playwright_driver
 else:
     from .release_lock import leaf_build_guard  # type: ignore[no-redef]
     from .project_meta import (
@@ -62,6 +64,8 @@ else:
         WEBUI_ICON_NAME,
         WEBUI_USER_MODEL_ID,
     )
+    from .media_tools import MediaToolValidationError, validate_media_tools
+    from .playwright_bundle import PlaywrightDriverValidationError, validate_playwright_driver
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -102,6 +106,9 @@ REQUIRED_INSTALL_SOURCE_ENTRIES = (
     lambda: DIST_DIR / "README_EN.md",
     lambda: DIST_DIR / "_internal" / "_sqlite3.pyd",
     lambda: DIST_DIR / "_internal" / "sqlite3.dll",
+    lambda: DIST_DIR / "_internal" / "playwright" / "driver" / "node.exe",
+    lambda: DIST_DIR / "_internal" / "playwright" / "driver" / "package" / "cli.js",
+    lambda: DIST_DIR / "_internal" / "playwright" / "driver" / "package" / "browsers.json",
     lambda: DIST_DIR / "_internal" / "app" / "web" / "static" / "index.html",
     lambda: DIST_DIR / "_internal" / "app" / "web" / "static" / "app.css",
     lambda: DIST_DIR / "_internal" / "app" / "web" / "static" / "log_layout.css",
@@ -249,6 +256,20 @@ def ensure_prerequisites() -> str:
             "安装源目录不完整，请重新运行 `python packaging/build_portable.py`。\n- "
             + "\n- ".join(missing_install_sources)
         )
+    try:
+        validate_media_tools(DIST_DIR)
+    except MediaToolValidationError as exc:
+        raise SystemExit(
+            "安装源中的外部媒体工具不可用，请重新运行 `python packaging/build_portable.py`： "
+            + str(exc)
+        ) from exc
+    try:
+        validate_playwright_driver(DIST_DIR / "_internal" / "playwright" / "driver")
+    except PlaywrightDriverValidationError as exc:
+        raise SystemExit(
+            "安装源中的 Playwright driver 不可用，请重新运行 `python packaging/build_portable.py`： "
+            + str(exc)
+        ) from exc
     if not ISS_FILE.exists():
         raise SystemExit(f"未找到安装脚本: {ISS_FILE}")
     missing_wizard_assets = [

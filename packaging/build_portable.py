@@ -34,7 +34,13 @@ if __package__ in (None, ""):
         WEBUI_EXE_NAME,
         WEBUI_ICON_NAME,
     )
-    from playwright_bundle import resolve_playwright_browser_directories
+    from media_tools import MediaToolValidationError, validate_media_tools
+    from playwright_bundle import (
+        PlaywrightDriverValidationError,
+        installed_playwright_driver_directory,
+        resolve_playwright_browser_directories,
+        validate_playwright_driver,
+    )
 else:
     from .release_lock import leaf_build_guard  # type: ignore[no-redef]
     from .project_meta import (
@@ -54,7 +60,13 @@ else:
         WEBUI_EXE_NAME,
         WEBUI_ICON_NAME,
     )
-    from .playwright_bundle import resolve_playwright_browser_directories
+    from .media_tools import MediaToolValidationError, validate_media_tools
+    from .playwright_bundle import (
+        PlaywrightDriverValidationError,
+        installed_playwright_driver_directory,
+        resolve_playwright_browser_directories,
+        validate_playwright_driver,
+    )
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -171,10 +183,17 @@ def kill_locking_processes() -> None:
             pass  # 进程不存在时 taskkill 会报错，忽略
 
 def ensure_prerequisites() -> None:
-    
     missing = [str(path) for path in REQUIRED_FILES if not path.exists()]
     if missing:
         raise SystemExit("缺少必要文件:\n- " + "\n- ".join(missing))
+    try:
+        validate_media_tools(PROJECT_ROOT)
+    except MediaToolValidationError as exc:
+        raise SystemExit(str(exc)) from exc
+    try:
+        validate_playwright_driver(installed_playwright_driver_directory())
+    except PlaywrightDriverValidationError as exc:
+        raise SystemExit(str(exc)) from exc
     try:
         resolve_playwright_browser_directories(BROWSER_DIR)
     except (FileNotFoundError, RuntimeError) as exc:
@@ -261,10 +280,15 @@ def verify_output() -> None:
         if not (DIST_DIR / readme_name).exists():
             raise SystemExit(f"缺少随包说明文件: {readme_name}")
 
-    for required_name in ("ffmpeg.exe", "ffprobe.exe", "N_m3u8DL-RE.exe"):
-        matches = list(DIST_DIR.glob(f"**/{required_name}"))
-        if not matches:
-            raise SystemExit(f"缺少运行依赖: {required_name}")
+    try:
+        validate_media_tools(DIST_DIR)
+    except MediaToolValidationError as exc:
+        raise SystemExit(str(exc)) from exc
+
+    try:
+        validate_playwright_driver(DIST_DIR / "_internal" / "playwright" / "driver")
+    except PlaywrightDriverValidationError as exc:
+        raise SystemExit(str(exc)) from exc
 
     chrome_candidates = list(DIST_DIR.glob("**/chrome.exe"))
     if not chrome_candidates:

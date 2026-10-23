@@ -9,6 +9,8 @@
 
 如果你更关心“发布流程”和“人工验收清单”，请优先阅读 [docs/guides/packaging.md](../docs/guides/packaging.md)。
 
+当前 Windows 包的运行基线是 64 位 Windows 10 1809（构建号 17763）或更高版本、以及 Windows 11；这是随包 Qt 6.10 的支持下限，详见 [Qt for Windows](https://doc.qt.io/qt-6.10/windows.html)。
+
 当前打包链路已经适配本项目的真实入口结构：
 
 - 源码自适应入口：`main.py` / `ucrawl-auto` → `entry/dispatcher.py`
@@ -34,6 +36,10 @@
   - `--build-only` 仅供本地构建或生产信任 bootstrap
 - `portable.spec`
   - PyInstaller 打包规格
+- `media_tools.py`
+  - 统一校验 `ffmpeg.exe`、`ffprobe.exe` 与 `N_m3u8DL-RE.exe`
+  - 只解析运行时可见的便携版根目录和 `_internal/`，拒绝任意更深层目录中的同名文件
+  - 在独立可写临时工作目录中用绝对路径执行版本探测，并限制为系统运行时环境；便携版构建前、产物回验和安装器编译前都会执行该门禁
 - `installer.iss`
   - Inno Setup 安装脚本
 - `runtime_hook.py`
@@ -98,6 +104,11 @@ python packaging/build_portable.py
 只收集当前 Chromium revision。不要把 `%LOCALAPPDATA%\ms-playwright` 整目录加入
 `portable.spec`；该缓存会保留历史 Chromium、Firefox 和 WebKit，导致构建结果依赖
 发布机使用历史并持续膨胀。
+
+Playwright 的 `driver/` 目录也会完整复制到 `_internal/playwright/driver/`，其中的
+`node.exe`、`package/cli.js` 和 `package/browsers.json` 是启动浏览器所需的运行时文件。
+便携版构建、产物回验和安装器编译前都会用绝对路径探测 `node.exe ... cli.js --version`；
+缺少这些文件或探测失败时必须先重新构建便携版。
 
 ### 典型产物
 

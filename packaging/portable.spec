@@ -21,7 +21,11 @@ from project_meta import (
     WEBUI_ICON_NAME,
     WEBUI_NAME,
 )
-from playwright_bundle import resolve_playwright_browser_directories
+from playwright_bundle import (
+    installed_playwright_driver_directory,
+    resolve_playwright_browser_directories,
+    validate_playwright_driver,
+)
 
 project_root = Path(SPEC).resolve().parents[1]
 main_script = project_root / "main.py"
@@ -71,6 +75,13 @@ datas += optional_tree(project_root / "ucrawl", "ucrawl")
 
 for browser_dir in resolve_playwright_browser_directories(browser_root):
     datas.append((str(browser_dir), f"ms-playwright/{browser_dir.name}"))
+
+# Playwright starts its own Node driver before it can launch Chromium.  Keep the
+# complete driver directory beside the frozen ``playwright`` package; copying
+# only the browser cache leaves sync_playwright() with WinError 2 at startup.
+playwright_driver_dir = installed_playwright_driver_directory()
+validate_playwright_driver(playwright_driver_dir, probe=False)
+datas.append((str(playwright_driver_dir), "playwright/driver"))
 
 # 所有运行时导入的项目子包都需列入 hiddenimports，防止 PyInstaller 静态扫描
 # 漏掉 entry/ 等动态加载模块。

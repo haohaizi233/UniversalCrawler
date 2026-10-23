@@ -2,11 +2,15 @@ import argparse
 import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
-def _create_test_client():
+from tests.support.web_client_cleanup import close_web_test_client
+
+
+def _create_test_client(owner):
     from fastapi.testclient import TestClient
     from app.web.server import create_app, SESSION_TOKEN_HEADER
 
     client = TestClient(create_app())
+    owner.addClassCleanup(close_web_test_client, client)
     # 建立 session 并获取 token
     client.get("/api/session/bootstrap")
     cookie_name = client.app.state.web_session_cookie_name
@@ -328,7 +332,7 @@ class CliSdkFacadeContractTests(unittest.TestCase):
 class FastApiWorkflowRouteContractTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.client = _create_test_client()
+        cls.client = _create_test_client(cls)
 
     def test_search_route_delegates_to_shared_search_runtime(self):
         with patch("app.core.plugin_registry.registry.get_plugin", return_value=object()), patch(

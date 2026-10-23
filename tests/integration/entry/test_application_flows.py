@@ -281,7 +281,9 @@ class RESTAPIEndToEndTests(unittest.TestCase):
     def setUpClass(cls):
         from fastapi.testclient import TestClient
         from app.web.server import create_app
+        from tests.support.web_client_cleanup import close_web_test_client
         cls.client = TestClient(create_app())
+        cls.addClassCleanup(close_web_test_client, cls.client)
 
     def test_health_check(self):
         """健康检查：ping → platforms → state 完整链路。"""
@@ -482,7 +484,9 @@ class FullIntegrationTests(unittest.TestCase):
     def setUpClass(cls):
         from fastapi.testclient import TestClient
         from app.web.server import create_app
+        from tests.support.web_client_cleanup import close_web_test_client
         cls.client = TestClient(create_app())
+        cls.addClassCleanup(close_web_test_client, cls.client)
 
     def test_full_workflow_no_crawl(self):
         """完整工作流（不含真爬虫）。"""

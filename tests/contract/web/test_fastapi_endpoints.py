@@ -22,11 +22,15 @@ from tempfile import TemporaryDirectory
 from typing import Any
 from unittest.mock import AsyncMock, Mock, patch
 
-def _create_test_client():
+from tests.support.web_client_cleanup import close_web_test_client
+
+
+def _create_test_client(owner):
     """创建 FastAPI TestClient（fixture）。"""
     from fastapi.testclient import TestClient
     from app.web.server import create_app
     client = TestClient(create_app())
+    owner.addClassCleanup(close_web_test_client, client)
     client.get("/api/session/bootstrap")
     cookie_name = client.app.state.web_session_cookie_name
     session_id = client.cookies.get(cookie_name)
@@ -48,7 +52,7 @@ class PingEndpointTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.client = _create_test_client()
+        cls.client = _create_test_client(cls)
 
     def test_ping_returns_200(self):
         r = self.client.get("/api/ping")
@@ -89,7 +93,7 @@ class PlatformsEndpointTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.client = _create_test_client()
+        cls.client = _create_test_client(cls)
 
     def test_platforms_returns_200(self):
         r = self.client.get("/api/platforms")
@@ -117,7 +121,7 @@ class ConfigEndpointTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.client = _create_test_client()
+        cls.client = _create_test_client(cls)
 
     def test_get_config(self):
         r = self.client.get("/api/config")
@@ -151,7 +155,7 @@ class StateEndpointTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.client = _create_test_client()
+        cls.client = _create_test_client(cls)
 
     def test_state_returns_200(self):
         r = self.client.get("/api/state")
@@ -244,7 +248,7 @@ class FrontendToolBoundaryEndpointTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.client = _create_test_client()
+        cls.client = _create_test_client(cls)
 
     def test_frontend_action_openapi_preserves_strict_request_contract(self):
         document = self.client.get("/openapi.json").json()
@@ -403,7 +407,7 @@ class ScanEndpointTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.client = _create_test_client()
+        cls.client = _create_test_client(cls)
 
     def test_scan_missing_directory(self):
         """空 body 时应 fallback 到 controller.current_save_dir 或返回 error。"""
@@ -456,7 +460,7 @@ class SearchEndpointValidationTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.client = _create_test_client()
+        cls.client = _create_test_client(cls)
 
     def test_search_missing_source(self):
         r = self.client.post("/api/search", json={"keyword": "kw"})
@@ -573,7 +577,7 @@ class CrawlStartStopTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.client = _create_test_client()
+        cls.client = _create_test_client(cls)
 
     def test_crawl_start_validation(self):
         r = self.client.post("/api/crawl/start", json={})
@@ -603,7 +607,7 @@ class CrawlSelectTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.client = _create_test_client()
+        cls.client = _create_test_client(cls)
 
     def test_crawl_select_no_active_spider(self):
         r = self.client.post("/api/crawl/select", json={"indices": [0, 1]})
@@ -626,7 +630,7 @@ class VideoDeleteRenameTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.client = _create_test_client()
+        cls.client = _create_test_client(cls)
 
     def test_delete_nonexistent_video(self):
         r = self.client.delete("/api/video/nonexistent_id_12345")
@@ -657,7 +661,7 @@ class DownloadEndpointValidationTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.client = _create_test_client()
+        cls.client = _create_test_client(cls)
 
     def test_download_missing_url(self):
         r = self.client.post("/api/download", json={"source": "douyin"})
@@ -722,7 +726,7 @@ class MediaEndpointTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.client = _create_test_client()
+        cls.client = _create_test_client(cls)
 
     def test_media_nonexistent(self):
         r = self.client.get("/api/media/nonexistent_id")
@@ -740,7 +744,7 @@ class DirListChangeTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.client = _create_test_client()
+        cls.client = _create_test_client(cls)
 
     def test_dir_list(self):
         r = self.client.get("/api/dir/list")
@@ -799,7 +803,7 @@ class DebugEndpointTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.client = _create_test_client()
+        cls.client = _create_test_client(cls)
 
     def test_debug_trigger_select_is_disabled_by_default(self):
         with patch.dict(os.environ, {"UCRAWL_DEBUG_ROUTES": "0"}):
@@ -846,7 +850,7 @@ class IndexEndpointTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.client = _create_test_client()
+        cls.client = _create_test_client(cls)
 
     def test_root_returns_html(self):
         r = self.client.get("/")
@@ -872,7 +876,7 @@ class ServerCORSHeadersTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.client = _create_test_client()
+        cls.client = _create_test_client(cls)
 
     def test_cors_header_present(self):
         foreign_loopback = self.client.get(
@@ -896,7 +900,7 @@ class ServerCORSHeadersTests(unittest.TestCase):
 
     def test_cors_header_present_for_explicitly_configured_origin(self):
         with patch.dict(os.environ, {"UCRAWL_ALLOWED_ORIGINS": "https://console.example"}):
-            client = _create_test_client()
+            client = _create_test_client(type(self))
             r = client.get("/api/ping", headers={"Origin": "https://console.example"})
         self.assertEqual(r.status_code, 200)
         self.assertEqual(r.headers.get("access-control-allow-origin"), "https://console.example")
@@ -978,7 +982,7 @@ class CrossLayerContractTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.client = _create_test_client()
+        cls.client = _create_test_client(cls)
 
     def test_platforms_match_plugin_registry(self):
         """API 返回的平台列表必须与 plugin_registry 一致。"""

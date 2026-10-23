@@ -772,7 +772,9 @@ def test_runner_shutdown_cancels_cooperative_tool_and_flushes_history(tmp_path: 
     service.run("blocking", {}, execution_profile=_profile(tmp_path))
     assert tool.started.wait(1.0)
 
-    assert service.shutdown(wait=True, timeout=1.0) is True
+    # This checks cancellation and durable history, not a wall-clock deadline.
+    # Dedicated timeout tests below keep their short, explicit budgets.
+    assert service.shutdown(wait=True, timeout=10.0) is True
     persisted = json.loads(history_path.read_text(encoding="utf-8"))
     assert persisted[0]["status"] == "cancelled"
 

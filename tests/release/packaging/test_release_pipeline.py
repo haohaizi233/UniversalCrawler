@@ -107,9 +107,14 @@ def _release_payload(installer: Path, *, source_commit: str = "a" * 40) -> dict:
     }
 
 
-def _write_staged_release(tmp_path: Path, *, source_commit: str = "a" * 40):
+def _write_staged_release(
+    tmp_path: Path,
+    *,
+    source_commit: str = "a" * 40,
+    installer_content: bytes = b"installer",
+):
     installer = tmp_path / "UniversalCrawlerPro_Setup_3.6.21.exe"
-    installer.write_bytes(b"installer")
+    installer.write_bytes(installer_content)
     payload = _release_payload(installer, source_commit=source_commit)
     (tmp_path / "latest.json").write_text(json.dumps(payload), encoding="utf-8")
     (tmp_path / "latest.json.sig").write_bytes(b"signature")
@@ -2660,8 +2665,9 @@ def test_windows_release_tool_validation_rejects_invalid_pe_or_tiny_file(
 ):
     tool = _load_tool()
     for name in ("N_m3u8DL-RE.exe", "ffmpeg.exe", "ffprobe.exe"):
-        (tmp_path / name).write_bytes(b"MZ" + b"x" * (1024 * 1024))
-    (tmp_path / "ffprobe.exe").write_bytes(payload)
+        # Write each PE fixture once; Windows scanners may briefly lock new files.
+        content = payload if name == "ffprobe.exe" else b"MZ" + b"x" * (1024 * 1024)
+        (tmp_path / name).write_bytes(content)
 
     with pytest.raises(SystemExit, match=message):
         tool._validate_windows_release_tools(tmp_path)
@@ -3160,9 +3166,13 @@ def test_final_asset_validation_rejects_non_exact_triplet(tmp_path):
 
 def test_final_asset_validation_rejects_tampered_installer_hash(tmp_path):
     tool = _load_tool()
-    installer, _payload = _write_staged_release(tmp_path)
+    installer, _payload = _write_staged_release(
+        tmp_path,
+        installer_content=b"tampered-installer",
+    )
     kwargs = _staged_validation_kwargs(installer)
-    installer.write_bytes(b"tampered-installer")
+    # Pin the pre-tampering digest without rewriting a freshly scanned .exe.
+    kwargs["installer_sha256"] = hashlib.sha256(b"installer").hexdigest()
 
     with patch.object(tool, "_verify_staged_manifest"), pytest.raises(RuntimeError, match="SHA-256"):
         tool._validate_staged_assets(tmp_path, **kwargs)

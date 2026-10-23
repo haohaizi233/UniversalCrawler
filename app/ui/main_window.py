@@ -66,7 +66,7 @@ from shared.execution_profile import (
     local_execution_profile,
 )
 from app.ui.plugin_settings import read_plugin_run_options
-from app.ui.main_window_theme import apply_main_window_theme_stylesheet
+from app.ui.main_window_theme import apply_main_window_theme_stylesheet, schedule_main_window_theme_callback
 from app.ui.styles import apply_application_theme, build_palette
 from app.ui.ui_update_scheduler import UiUpdateScheduler
 from app.ui import window_state_persistence
@@ -1674,7 +1674,7 @@ class MainWindow(QMainWindow):
         self._schedule_theme_callback(0, lambda: self._commit_theme_toggle_interactive(is_dark, sequence))
 
     def _schedule_theme_callback(self, delay_ms: int, callback) -> None:
-        QTimer.singleShot(int(delay_ms), self, callback)
+        schedule_main_window_theme_callback(self, delay_ms, callback, timer=QTimer)
 
     def _theme_sequence_stopped(self) -> bool:
         return bool(self.__dict__.get("_theme_callbacks_stopped"))

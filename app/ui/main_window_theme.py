@@ -4,6 +4,23 @@ from __future__ import annotations
 
 from PyQt6.QtWidgets import QWidget
 
+from app.debug_logger import debug_logger
+
+
+def schedule_main_window_theme_callback(window, delay_ms: int, callback, *, timer) -> None:
+    # PyQt6 exposes (msec, slot), not Qt/C++'s receiver-context overload.
+    # Callbacks check the window's stopped flag and transition sequence.
+    try:
+        timer.singleShot(int(delay_ms), callback)
+    except (TypeError, RuntimeError, OverflowError) as exc:
+        # No callback can finish a failed schedule: invalidate it and allow retry.
+        window.__dict__["_theme_transition_sequence"] = int(
+            window.__dict__.get("_theme_transition_sequence", 0) or 0
+        ) + 1
+        window.__dict__["_queued_theme_is_dark"] = None
+        window._finish_theme_transition(bool(window.is_dark_theme), 0.0, failed=True)
+        debug_logger.log_exception("MainWindow", "theme_callback_schedule", exc)
+
 
 def apply_main_window_theme_stylesheet(
     window,

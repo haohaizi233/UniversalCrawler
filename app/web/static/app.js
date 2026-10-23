@@ -9,6 +9,7 @@ let selected = {
   tool: "link_parser",
 };
 let systemThemeListenerRegistered = false;
+let topCountSelectionContext = null;
 /*
  * `__ucrawlFrontendStateLoaded` 在本生命周期首次接受可用的 REST 或 WebSocket 状态后置为 `true`，重试不会清零。
  * `__ucrawlFrontendStateSettled` 表示最近一次未被替代的 REST 全量快照请求已经结束，重试开始时重置为 `false`。
@@ -696,6 +697,7 @@ document.addEventListener("DOMContentLoaded", () => {
   playbackControllerService().installMediaControlHandlers();
   playbackControllerService().updateControls();
   document.getElementById("sourceSelect").addEventListener("change", cacheSource);
+  document.getElementById("videoCountSelect").addEventListener("change", rememberTopCountSelection);
   document.getElementById("searchInput").addEventListener("keydown", event => {
     if (event.key === "Enter") startCrawl();
   });
@@ -970,6 +972,19 @@ function normalizeTopCountOption(option) {
   }
   return { value: String(option ?? ""), label: String(option ?? "") };
 }
+function topCountSelectionKey(sourceId, unit) {
+  return JSON.stringify([String(sourceId || ""), String(unit || "videos")]);
+}
+function rememberTopCountSelection() {
+  const select = byId("videoCountSelect");
+  const sourceSelect = byId("sourceSelect");
+  if (!select || !sourceSelect || !topCountSelectionContext) return;
+  const row = platformSettingsRow(sourceSelect.value);
+  const unit = row && row.count_unit ? row.count_unit : "videos";
+  const key = topCountSelectionKey(sourceSelect.value, unit);
+  if (topCountSelectionContext.key !== key) return;
+  topCountSelectionContext = { key, value: String(select.value), changedByUser: true };
+}
 function configureTopCountForSource(sourceId) {
   const row = platformSettingsRow(sourceId);
   const unit = row && row.count_unit ? row.count_unit : "videos";
@@ -977,8 +992,16 @@ function configureTopCountForSource(sourceId) {
   const label = document.querySelector(".count-label");
   if (!select) return;
 
-  let options = ((row && row.count_options) || countFallbackOptions(unit)).map(normalizeTopCountOption).filter(option => option.value);
-  const currentValue = String((row && row.default_count) || defaultCountForUnit(unit));
+  let options = Array.isArray(row && row.count_options) && row.count_options.length
+    ? row.count_options.map(normalizeTopCountOption).filter(option => option.value)
+    : countFallbackOptions(unit).map(normalizeTopCountOption).filter(option => option.value);
+  if (!options.length) options = countFallbackOptions(unit).map(normalizeTopCountOption).filter(option => option.value);
+  const key = topCountSelectionKey(sourceId, unit);
+  const configuredDefault = String((row && row.default_count) || defaultCountForUnit(unit));
+  const remembered = topCountSelectionContext && topCountSelectionContext.key === key && topCountSelectionContext.changedByUser
+    ? topCountSelectionContext.value
+    : "";
+  const currentValue = options.some(option => option.value === remembered) ? remembered : configuredDefault;
   if (!options.some(option => option.value === currentValue)) {
     options.unshift({
       value: currentValue,
@@ -991,6 +1014,11 @@ function configureTopCountForSource(sourceId) {
   select.setAttribute("aria-label", t(labelText));
   enhanceSelects(select.parentElement || document);
   syncCustomSelectForSelect(select);
+  topCountSelectionContext = {
+    key,
+    value: currentValue,
+    changedByUser: Boolean(remembered && currentValue === remembered),
+  };
   setCrawlUiState(crawlRunning);
 }
 

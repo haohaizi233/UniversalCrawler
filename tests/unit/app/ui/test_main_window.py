@@ -2822,7 +2822,7 @@ class MainWindowTests(unittest.TestCase):
         window.sig_theme_changed.emit.assert_not_called()
         self.assertEqual(window._frontend_action_worker.requests, [])
 
-        self.assertIs(mock_single_shot.call_args.args[1], window)
+        self.assertEqual(len(mock_single_shot.call_args.args), 2)
         mock_single_shot.call_args.args[-1]()
 
         self.assertFalse(window.is_dark_theme)
@@ -2874,7 +2874,7 @@ class MainWindowTests(unittest.TestCase):
         self.assertEqual(window._frontend_action_worker.requests, [])
         window.top_bar.set_theme_icon.assert_not_called()
 
-        self.assertIs(mock_single_shot.call_args.args[1], window)
+        self.assertEqual(len(mock_single_shot.call_args.args), 2)
         mock_single_shot.call_args.args[-1]()
 
         self.assertFalse(window.is_dark_theme)
@@ -2911,7 +2911,7 @@ class MainWindowTests(unittest.TestCase):
 
         window.toggle_theme()
         window.toggle_theme()
-        self.assertIs(mock_single_shot.call_args.args[1], window)
+        self.assertEqual(len(mock_single_shot.call_args.args), 2)
         mock_single_shot.call_args.args[-1]()
 
         self.assertTrue(window.is_dark_theme)

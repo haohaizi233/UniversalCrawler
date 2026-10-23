@@ -334,8 +334,10 @@ class WebController(WebMediaScanRuntimeMixin, ControllerSessionMixin, MediaLibra
         导致 current_spider 残留、isRunning() 返回 False 但引用未清空。
         """
         if self.current_spider and not self.current_spider.isRunning():
+            spider = self.current_spider
             self.bridge.emit("log", {"message": "⚠️ 上次任务未正常结束，正在清理..."})
-            self._disconnect_spider_signals(self.current_spider)
+            self._disconnect_spider_signals(spider)
+            self._clear_stop_wait(spider)
             self.current_spider = None
             self._pending_selection_strategy = None
             self.bridge.emit("crawl_state", {"is_running": False})
@@ -473,22 +475,28 @@ class WebController(WebMediaScanRuntimeMixin, ControllerSessionMixin, MediaLibra
         def on_items_found(items, _session_id=session_id):
             self._on_spider_items_found(items, session_id=_session_id)
 
+        def on_finished():
+            self._on_spider_finished(spider)
+
         spider.sig_log.connect(on_log)
         spider.sig_item_found.connect(on_item_found)
         batch_signal = getattr(spider, "sig_items_found", None)
         if batch_signal is not None:
             batch_signal.connect(on_items_found)
         spider.sig_select_tasks.connect(self._on_spider_select_tasks)
-        spider.sig_finished.connect(self._on_spider_finished)
+        spider.sig_finished.connect(on_finished)
+        self._spider_signal_owner = spider
         self._spider_signal_handlers = {
             "on_log": on_log,
             "on_item_found": on_item_found,
             "on_items_found": on_items_found if batch_signal is not None else None,
             "on_select_tasks": self._on_spider_select_tasks,
-            "on_finished": self._on_spider_finished,
+            "on_finished": on_finished,
         }
 
     def _disconnect_spider_signals(self, spider) -> None:
+        if getattr(self, "_spider_signal_owner", None) is not spider:
+            return
         handlers = getattr(self, "_spider_signal_handlers", None) or {}
         mapping = (
             ("sig_log", handlers.get("on_log")),
@@ -508,6 +516,7 @@ class WebController(WebMediaScanRuntimeMixin, ControllerSessionMixin, MediaLibra
                 except (TypeError, ValueError):
                     pass
         self._spider_signal_handlers = {}
+        self._spider_signal_owner = None
 
     def _open_spider_intake_session(self) -> str:
         session_id = uuid.uuid4().hex
@@ -673,13 +682,17 @@ class WebController(WebMediaScanRuntimeMixin, ControllerSessionMixin, MediaLibra
             },
         )
 
-    def _on_spider_finished(self):
+    def _on_spider_finished(self, spider=None):
         with self._lifecycle_lock:
-            self._on_spider_finished_unlocked()
+            self._on_spider_finished_unlocked(spider)
 
-    def _on_spider_finished_unlocked(self):
+    def _on_spider_finished_unlocked(self, spider=None):
         import threading
-        spider = self.current_spider
+        if spider is None:
+            spider = self.current_spider
+        if spider is None or self.current_spider is not spider:
+            return
+        self._clear_stop_wait(spider)
         debug_logger.log(
             component="WebController",
             action="_on_spider_finished_enter",
@@ -726,7 +739,7 @@ class WebController(WebMediaScanRuntimeMixin, ControllerSessionMixin, MediaLibra
             return
         # 防抖：如果已经在停止等待中，忽略重复请求
         with self._stop_wait_lock:
-            if getattr(self, '_stop_wait_spider', None) is not None:
+            if self._stop_wait_spider is self.current_spider:
                 return
         self._do_stop_crawl()
 
@@ -736,7 +749,13 @@ class WebController(WebMediaScanRuntimeMixin, ControllerSessionMixin, MediaLibra
         if not spider:
             return
         self._close_spider_intake_session()
+        with self._stop_wait_lock:
+            self._stop_wait_count = 0
+            self._stop_wait_spider = spider
         spider.stop()
+        # stop() 也可能同步触发 finished；此时其收尾已经完成。
+        if self.current_spider is not spider:
+            return
         self.bridge.emit("log", {"message": "🛑 正在停止任务..."})
         debug_logger.log(
             component="WebController",
@@ -746,16 +765,28 @@ class WebController(WebMediaScanRuntimeMixin, ControllerSessionMixin, MediaLibra
             status_code="WEB_CRAWL_STOP",
         )
         # 轮询退出状态，避免同步等待阻塞 Web 调度线程。
-        with self._stop_wait_lock:
-            self._stop_wait_count = 0
-            self._stop_wait_spider = spider
-        self._schedule_stop_wait()
+        self._schedule_stop_wait(spider)
 
-    def _schedule_stop_wait(self):
-        """通过事件循环定时器等待 spider 线程退出，避免同步阻塞。"""
+    def _clear_stop_wait(self, spider):
         with self._stop_wait_lock:
-            spider = getattr(self, '_stop_wait_spider', None)
+            if self._stop_wait_spider is spider:
+                self._stop_wait_spider = None
+                self._stop_wait_count = 0
+
+    def _schedule_stop_wait(self, spider=None):
+        """通过事件循环定时器等待 spider 线程退出，避免同步阻塞。"""
+        with self._lifecycle_lock:
+            self._schedule_stop_wait_unlocked(spider)
+
+    def _schedule_stop_wait_unlocked(self, spider=None):
+        with self._stop_wait_lock:
             if spider is None:
+                spider = self._stop_wait_spider
+            if (
+                spider is None
+                or self._stop_wait_spider is not spider
+                or self.current_spider is not spider
+            ):
                 return
             self._stop_wait_count += 1
             stop_wait_count = self._stop_wait_count
@@ -766,13 +797,13 @@ class WebController(WebMediaScanRuntimeMixin, ControllerSessionMixin, MediaLibra
 
         if stop_wait_count >= 300:  # 30 秒超时（300 * 100ms）
             if self._spider_in_selection_wait(spider) and stop_wait_count < 600:
-                self.bridge.call_later(0.1, self._schedule_stop_wait)
+                self.bridge.call_later(0.1, partial(self._schedule_stop_wait, spider))
                 return
             # spider 仍在运行（Playwright 阻塞），强制清理
             self._finish_stop(spider, forced=True)
             return
 
-        self.bridge.call_later(0.1, self._schedule_stop_wait)
+        self.bridge.call_later(0.1, partial(self._schedule_stop_wait, spider))
 
     @staticmethod
     def _spider_in_selection_wait(spider) -> bool:
@@ -789,6 +820,8 @@ class WebController(WebMediaScanRuntimeMixin, ControllerSessionMixin, MediaLibra
 
     def _finish_stop_unlocked(self, spider, forced: bool = False):
         """完成停止操作的清理。"""
+        if self.current_spider is not spider or self._stop_wait_spider is not spider:
+            return
         # 强制释放时断开 spider 信号，防止幽灵 spider 继续发消息到前端
         self._disconnect_spider_signals(spider)
         if forced:
@@ -798,9 +831,7 @@ class WebController(WebMediaScanRuntimeMixin, ControllerSessionMixin, MediaLibra
         if self.current_spider is spider:
             self.current_spider = None
         self._pending_selection_strategy = None
-        with self._stop_wait_lock:
-            self._stop_wait_spider = None
-            self._stop_wait_count = 0
+        self._clear_stop_wait(spider)
         self.bridge.emit("crawl_state", {"is_running": False})
 
     def resume_spider_selection(self, selected_indices: list[int] | None):

@@ -221,6 +221,93 @@ def test_wait_for_ready_page_honours_task_cancellation(tmp_path: Path) -> None:
         )
 
 
+def test_loading_title_does_not_report_cloudflare(tmp_path: Path) -> None:
+    session = _session(tmp_path)
+    target_url = "https://missav.ai/dm37/cn/actresses/demo"
+    loading = {"id": "page", "type": "page", "url": target_url, "title": ""}
+    session._read_targets = Mock(
+        side_effect=[[loading], [{**loading, "title": "Demo - MissAV"}]]
+    )
+    reported: list[str] = []
+
+    target = session.wait_for_ready_page(
+        target_url, timeout_seconds=1, cancelled=lambda: False,
+        on_challenge=reported.append,
+    )
+
+    assert target.title == "Demo - MissAV"
+    assert reported == []
+
+
+@pytest.mark.parametrize("path", ["天音唯", "%e5%a4%a9%e9%9f%b3%e5%94%af"])
+def test_ready_page_matches_browser_encoded_chinese_path(tmp_path: Path, path: str) -> None:
+    session = _session(tmp_path)
+    browser_url = "https://missav.ai/dm37/cn/actresses/%E5%A4%A9%E9%9F%B3%E5%94%AF"
+    ready = {"id": "ready", "type": "page", "url": browser_url, "title": "天音唯 - MissAV"}
+    session._read_targets = Mock(return_value=[ready])
+
+    with patch("app.spiders.missav.challenge_session.time.monotonic", side_effect=[0, 0, 2]):
+        target = session.wait_for_ready_page(
+            f"https://missav.ai/dm37/cn/actresses/{path}",
+            timeout_seconds=1, cancelled=lambda: False,
+        )
+
+    assert target.target_id == "ready"
+
+
+@pytest.mark.parametrize(("candidate", "target"), [
+    ("https://evil.example/cn/actresses/天音唯", "https://missav.ai/cn/actresses/天音唯"),
+    ("https://missav.ai/cn/actresses/other", "https://missav.ai/cn/actresses/天音唯"),
+    ("https://missav.ai/cn/actresses/a%2Fb", "https://missav.ai/cn/actresses/a/b"),
+    ("https://missav.ai/cn/actresses/%25E5%25A4%25A9", "https://missav.ai/cn/actresses/天"),
+    ("https://missav.ai/cn/actresses/天音唯", "https://missav.ai/cn/actresses/天音唯?filters=individual"),
+])
+def test_target_matching_keeps_host_and_path_boundaries(candidate: str, target: str) -> None:
+    assert not ExternalChromeChallengeSession._urls_match(candidate, target)
+
+
+@pytest.mark.parametrize("prefix", ["", "/dm37"])
+def test_attach_matches_browser_encoded_chinese_path(tmp_path: Path, prefix: str) -> None:
+    session = _session(tmp_path)
+    page = Mock(url="https://missav.ai/dm37/cn/actresses/%E5%A4%A9%E9%9F%B3%E5%94%AF")
+    context = Mock(pages=[page])
+    playwright = Mock()
+    playwright.chromium.connect_over_cdp.return_value = Mock(contexts=[context])
+
+    attachment = session.attach(playwright, f"https://missav.ai{prefix}/cn/actresses/天音唯")
+
+    assert attachment.page is page
+
+
+def test_ready_page_recognizes_missav_route_prefix_redirect(tmp_path: Path) -> None:
+    session = _session(tmp_path)
+    ready = {
+        "id": "ready", "type": "page", "title": "天音唯 - MissAV",
+        "url": "https://missav.ai/dm37/cn/actresses/%E5%A4%A9%E9%9F%B3%E5%94%AF?page=2",
+    }
+    session._read_targets = Mock(return_value=[ready])
+    with patch("app.spiders.missav.challenge_session.time.monotonic", side_effect=[0, 0, 2]):
+        result = session.wait_for_ready_page(
+            "https://missav.ai/cn/actresses/天音唯?page=2",
+            timeout_seconds=1, cancelled=lambda: False,
+        )
+    assert result.target_id == "ready"
+
+
+@pytest.mark.parametrize("candidate", [
+    "https://missav.ai/other/cn/actresses/demo?page=2",
+    "https://missav.ai/dm37/cn/actresses/other?page=2",
+    "https://missav.ai/dm37/cn/actresses/demo?page=3",
+    "https://missav.ai/dm37/cn/actresses/demo",
+    "https://evil.example/dm37/cn/actresses/demo?page=2",
+    "https://missav.ai/dm37/other/actresses/demo?page=2",
+])
+def test_route_prefix_alias_does_not_weaken_other_boundaries(candidate: str) -> None:
+    assert not ExternalChromeChallengeSession._urls_match(
+        candidate, "https://missav.ai/cn/actresses/demo?page=2"
+    )
+
+
 def test_attach_selects_the_requested_filtered_tab(tmp_path: Path) -> None:
     session = _session(tmp_path)
     base_page = Mock(url="https://missav.ai/cn/search/CAWD-377")

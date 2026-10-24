@@ -1,3 +1,4 @@
+# app/core/lib/douyin/tools/error.py
 try:
     from ..translation import _
 except ImportError:

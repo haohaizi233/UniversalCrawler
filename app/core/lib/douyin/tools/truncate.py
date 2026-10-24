@@ -1,3 +1,4 @@
+# app/core/lib/douyin/tools/truncate.py
 from unicodedata import name
 
 def is_chinese_char(char: str) -> bool:

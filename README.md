@@ -1,120 +1,173 @@
-# Universal Crawler Pro 🚀
+﻿# UniversalCrawler 多平台媒体采集与下载管理器
 
-[![Python](https://img.shields.io/badge/Python-3.8%2B-blue.svg)](https://www.python.org/)
-[![PyQt6](https://img.shields.io/badge/GUI-PyQt6-green.svg)](https://riverbankcomputing.com/software/pyqt/)
-[![Playwright](https://img.shields.io/badge/Browser-Playwright-orange.svg)](https://playwright.dev/)
-[![License](https://img.shields.io/badge/license-MIT-lightgrey.svg)](LICENSE)
+![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?style=flat-square&logo=python&logoColor=white)
+![PyQt6](https://img.shields.io/badge/GUI-PyQt6-41CD52?style=flat-square)
+![Playwright](https://img.shields.io/badge/Automation-Playwright-2EAD33?style=flat-square)
+![FFmpeg](https://img.shields.io/badge/Media-FFmpeg-007808?style=flat-square)
+![Status](https://img.shields.io/badge/Status-Course%20%2F%20Personal%20Project-555555?style=flat-square)
 
-**Universal Crawler Pro** 是一个功能强大的桌面端视频爬虫与下载管理工具。它基于 **Python** + **PyQt6** 构建现代化暗黑风格界面，利用 **Playwright** 实现智能网页交互与嗅探，支持多平台视频的高速下载与管理。
+> 一个基于 Python、PyQt6 和 Playwright 的桌面端媒体采集与下载管理工具。项目重点不是“下载站点本身”，而是把浏览器自动化、插件化采集、任务队列、并发下载、本地文件管理和桌面 UI 串成一套完整工程。
 
----
+## 项目定位
 
-## ✨ 核心功能 (Features)
+`UniversalCrawler` 是大学阶段的 Python 桌面应用实践项目。它通过插件注册表接入不同平台的采集逻辑，由 PyQt6 提供深色主题界面，使用 Playwright 完成登录、页面滚动、链接嗅探和 Cookie 持久化，再交给下载管理器并发处理文件下载、音视频合并和本地播放。
 
-该项目采用插件化架构，支持以下平台的视频抓取：
+当前 UI 默认注册的平台插件：
 
-### 📺 Bilibili (B站)
-- **多模式支持**：支持 BV 号、UP 主主页（UID）、搜索关键词、合集/列表 URL。
-- **高清画质**：自动解析 Dash 流，支持 8K/4K/1080P60 高帧率下载。
-- **音画合并**：自动调用 FFmpeg 将音频与视频流无损合并。
-- **登录支持**：内置扫码登录功能，支持获取会员高画质权限。
-- **批量下载**：支持多P视频、剧集、合集的批量选择与下载。
+- `Bilibili`：支持 BV 号、视频链接、搜索词、UP 主空间等入口，解析 DASH 音视频流并调用 FFmpeg 合并。
+- `快手`：使用 Playwright 打开页面、保存登录态、滚动扫描列表、生成待下载清单。
+- `HLS/M3U8 站点插件`：演示代理配置、列表扫描、m3u8 嗅探和外部下载器接入；公开展示前建议按合规要求移除或改成通用测试站点。
 
-### 🎥 Kuaishou (快手)
-- **智能嗅探**：模拟真人操作滚动“瀑布流”页面，自动拦截网络数据包。
-- **去水印**：自动提取无水印高清视频源。
-- **批量采集**：支持按作者主页或搜索关键词批量扫描。
+代码中还保留了抖音相关适配代码，但 `PluginRegistry` 当前默认没有注册该插件，不能视为稳定可用功能。
 
-### 🔞 MissAV
-- **智能筛选**：支持“中文字幕优先”、“无码优先”等智能排序算法。
-- **HLS 下载**：集成 `N_m3u8DL-RE`，支持多线程并发下载 M3U8 流媒体。
-- **代理支持**：内置代理设置（Clash/v2ray），解决网络访问问题。
+## 核心能力
 
-### 🛠️ 通用功能
-- **现代化 UI**：基于 PyQt6 的深色主题（Dark Mode），包含任务队列、进度条、内置播放器。
-- **交互式选择**：爬虫扫描完成后弹出清单，用户可自由勾选需要下载的项目。
-- **本地管理**：内置简易播放器，支持本地文件的重命名、播放和删除。
-- **断点恢复**：自动保存应用配置（窗口位置、上次源、代理设置等）。
+| 能力 | 实现方式 | 关键文件 |
+| --- | --- | --- |
+| 桌面应用界面 | PyQt6 主窗口、深色主题、下载队列、日志面板、内置播放器 | `main.py`、`app/ui/main_window.py` |
+| 插件化采集 | `PluginRegistry` 管理平台插件，插件提供 UI 参数和 Spider 类 | `app/core/registry.py` |
+| 浏览器自动化 | Playwright 处理登录、页面跳转、滚动加载、网络请求监听 | `app/spiders/*.py` |
+| 线程通信 | Spider 继承 `QThread`，用 Qt Signal 将日志、候选项和结果回传 UI | `app/spiders/base_spider.py` |
+| 任务选择 | 扫描后弹窗勾选目标，再把选中项加入下载队列 | `app/ui/dialogs.py` |
+| 并发下载 | `DownloadManager` + `DownloadWorker` + `QSemaphore` 控制并发 | `app/core/download_manager.py` |
+| 媒体处理 | requests 流式下载、FFmpeg 音画合并、N_m3u8DL-RE 处理 HLS | `app/core/downloaders.py` |
+| 本地管理 | 扫描本地 MP4、表格重命名、播放、删除和进度展示 | `main.py` |
+| 命令行入口 | 提供轻量 CLI，可用于 Bilibili 单视频/直链场景测试 | `cli_crawler.py` |
 
----
+## 技术栈
 
-## ⚙️ 环境依赖 (Prerequisites)
+- 语言：Python
+- 桌面界面：PyQt6、Qt Signal/Slot、QThread、QMediaPlayer
+- 浏览器自动化：Playwright Chromium
+- 网络请求：requests、httpx
+- 媒体处理：FFmpeg、N_m3u8DL-RE
+- 配置与状态：JSON 配置文件、Cookie 文件、窗口状态持久化
 
-在运行本项目之前，您需要准备以下环境和工具：
+## 目录结构
 
-1.  **Python 3.8+**
-2.  **外部工具 (必须放入项目根目录)**:
-    *   [FFmpeg](https://ffmpeg.org/download.html): 用于 Bilibili 音视频合并 (`ffmpeg.exe`)。
-    *   [N_m3u8DL-RE](https://github.com/nilaoda/N_m3u8DL-RE/releases): 用于 m3u8 视频下载 (`N_m3u8DL-RE.exe`)。
-
----
-
-## 📥 安装与运行 (Installation)
-
-### 1. 克隆项目
-```bash
-git clone https://github.com/yourusername/Universal-Crawler-Pro.git
-cd Universal-Crawler-Pro
+```text
+UniversalCrawler/
+├── main.py                       # 桌面端主入口，连接 UI、Spider 和下载管理器
+├── cli_crawler.py                # 命令行采集/下载入口
+├── kuaishou_single.py            # 快手单独调试脚本
+├── requirements.txt              # Python 依赖
+├── ffmpeg.exe                    # 本地媒体合并工具，公开仓库建议改为自行下载
+├── N_m3u8DL-RE.exe               # HLS 下载工具，公开仓库建议改为自行下载
+├── chromium-1200/                # Playwright/Chromium 本地运行缓存
+├── Logs/                         # 运行日志
+└── app/
+    ├── models.py                 # VideoItem 数据模型与配置对象
+    ├── utils.py                  # 配置读写、文件名清理等工具
+    ├── core/
+    │   ├── registry.py           # 插件注册表
+    │   ├── download_manager.py   # 下载任务队列与并发控制
+    │   ├── downloaders.py        # 不同来源的下载策略
+    │   └── lib/douyin/           # 抖音相关第三方/适配代码，当前默认未启用
+    ├── spiders/
+    │   ├── base_spider.py        # Spider 基类
+    │   ├── bilibili_spider.py    # Bilibili 采集逻辑
+    │   ├── kuaishou_spider.py    # 快手采集逻辑
+    │   ├── missav_spider.py      # HLS/m3u8 站点适配示例
+    │   └── douyin_spider.py      # 抖音适配代码，默认未注册
+    └── ui/
+        ├── main_window.py        # 主界面
+        ├── dialogs.py            # 任务选择弹窗
+        ├── widgets.py            # 自定义视频控件
+        └── styles.py             # 深色主题样式
 ```
 
-### 2. 安装 Python 依赖
+## 架构流程
+
+```mermaid
+flowchart LR
+  A[用户输入关键词或链接] --> B[PluginRegistry 选择平台插件]
+  B --> C[Spider 线程启动 Playwright 或 API 采集]
+  C --> D[候选视频列表]
+  D --> E[SelectionDialog 用户勾选]
+  E --> F[VideoItem 加入下载队列]
+  F --> G[DownloadManager 并发调度]
+  G --> H{下载策略}
+  H --> I[requests 直链下载]
+  H --> J[FFmpeg 音视频合并]
+  H --> K[N_m3u8DL-RE 下载 HLS]
+  I --> L[本地文件管理与播放器]
+  J --> L
+  K --> L
+```
+
+## 安装与运行
+
+> 本项目更偏 Windows 桌面端；仓库中出现的 `.exe`、`chromium-1200/` 和 `Logs/` 属于本地运行产物，正式开源时建议用 `.gitignore` 排除。
+
+1. 创建 Python 环境。
+
+```bash
+python -m venv .venv
+.venv\Scripts\activate
+```
+
+2. 安装依赖。
+
 ```bash
 pip install -r requirements.txt
 ```
 
-### 3. 安装浏览器内核
-本项目依赖 Playwright 进行网页渲染：
+3. 安装 Playwright Chromium。
+
 ```bash
 playwright install chromium
 ```
 
-### 4. 配置外部工具
-**非常重要**：请确保下载 `ffmpeg.exe` 和 `N_m3u8DL-RE.exe` 并将它们直接放置在 `main.py` 同级目录下。
+4. 准备外部工具。
 
-### 5. 启动程序
+- Bilibili 音视频合并需要 `ffmpeg.exe`，也可以安装系统版 FFmpeg 并加入 PATH。
+- HLS/m3u8 下载需要 `N_m3u8DL-RE.exe`，放在 `main.py` 同级目录。
+
+5. 启动桌面程序。
+
 ```bash
 python main.py
 ```
 
----
+6. 可选：使用命令行入口测试。
 
-## 📂 项目结构 (Structure)
-
-```text
-Universal-Crawler-Pro/
-├── app/
-│   ├── core/           # 核心逻辑 (下载器、插件注册)
-│   ├── spiders/        # 爬虫逻辑 (B站、快手、MissAV)
-│   ├── ui/             # 界面代码 (主窗口、弹窗、样式)
-│   ├── models.py       # 数据模型
-│   └── utils.py        # 配置管理工具
-├── main.py             # 程序入口
-├── config.json         # 配置文件 (自动生成)
-├── requirements.txt    # 依赖列表
-├── ffmpeg.exe          # [需自行下载]
-└── N_m3u8DL-RE.exe     # [需自行下载]
+```bash
+python cli_crawler.py bilibili BVxxxxxx --output downloads
 ```
 
----
+## 使用说明
 
-## 🖥️ 使用指南 (Usage)
+1. 在顶部下拉框选择平台插件。
+2. 输入 BV 号、视频链接、UP 主空间、作者主页或关键词。
+3. 按需设置插件参数，例如 Bilibili 扫描页数、HLS 插件代理。
+4. 点击启动任务，等待 Spider 扫描并弹出候选清单。
+5. 勾选要处理的项目后，下载任务进入左侧队列。
+6. 下载完成后，可在右侧播放器预览，也可以在表格中重命名或删除本地文件。
 
-1.  **选择模式**：在顶部下拉框选择目标平台（Bilibili / 快手 / MissAV）。
-2.  **配置参数**：
-    *   **Bilibili**：设置爬取页数，首次使用若需会员画质会自动弹窗扫码登录。
-    *   **MissAV**：可设置代理端口（默认 7890）及筛选偏好。
-3.  **输入目标**：在搜索框输入 关键词、URL、BV号或番号。
-4.  **启动任务**：点击“🚀 启动任务”。
-5.  **选择视频**：等待扫描完成后，会弹出选择对话框，勾选你想要下载的视频。
-6.  **下载管理**：视频将自动加入左侧下载队列，下载完成后可直接在右侧播放或双击全屏。
+## 本轮审查结论
 
----
+这是一个有工程含量的 Python 桌面应用项目，适合在简历中提炼成“插件化媒体采集与下载管理器”。它的亮点在于：能把 PyQt6 UI、浏览器自动化、Qt 线程通信、下载队列、外部媒体工具和本地文件管理组合起来；相比单脚本爬虫，更能体现工程组织和桌面端开发能力。
 
-## ⚠️ 免责声明 (Disclaimer)
+适合写进简历的表达：
 
-1.  本项目仅供 **Python 爬虫技术交流与学习** 使用，不得用于任何商业用途。
-2.  使用者请遵守各目标网站的 `robots.txt` 协议及服务条款。
-3.  对于使用本项目下载的任何内容，使用者需自行承担版权风险和法律责任。
-4.  本项目集成的 MissAV 模块仅作为技术研究（如 M3U8 解析、HLS 下载技术），请勿在禁止该类内容的地区使用。
+- 基于 PyQt6 设计桌面端采集与下载管理器，实现插件注册、任务队列、并发下载和本地播放器。
+- 使用 Playwright 自动化浏览器完成登录态保存、滚动加载、候选数据采集和网络资源嗅探。
+- 设计统一 `VideoItem` 模型与下载策略层，按来源选择 requests、FFmpeg 或 HLS 外部下载器处理不同媒体流。
+- 通过 `QThread`、Qt Signal 和 `QSemaphore` 解耦 UI、采集线程和下载线程，减少界面阻塞。
 
----
+公开展示或继续优化前建议处理：
+
+- README 与窗口标题中的 `Pro` 命名和目录名不一致，后续可统一为 `UniversalCrawler` 或明确版本关系。
+- 仓库包含 `ffmpeg.exe`、`N_m3u8DL-RE.exe`、`chromium-1200/` 和日志文件，建议改为安装说明并从仓库排除。
+- Cookie、登录态、配置文件、下载目录和运行日志需要加入 `.gitignore`，避免泄露账号或本地路径。
+- HLS/成人站点相关插件不适合作为求职主推内容，公开简历项目时建议移除、默认禁用或替换为合规测试源。
+- 抖音适配代码存在但默认未注册，README 中应避免宣传为已稳定支持。
+- 当前缺少自动化测试，可补充文件名清理、下载器策略选择、配置读写和插件注册表的单元测试。
+
+## 合规说明
+
+本项目仅用于学习 Python 桌面开发、浏览器自动化、网络请求分析和媒体处理流程。请只处理自己拥有权利、已获授权或允许下载的内容，并遵守目标网站服务条款、版权规则和所在地法律法规。项目作者不鼓励也不承担任何未经授权下载、传播或商用行为。
+
+## License
+
+仓库当前未看到独立 `LICENSE` 文件。如需正式开源，建议补充许可证，并确认外部工具、站点适配代码和第三方库的许可边界。

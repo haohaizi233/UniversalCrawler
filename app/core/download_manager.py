@@ -1,11 +1,10 @@
 # app/core/download_manager.py
-
 import os
 import threading
 import queue
 from PyQt6.QtCore import QThread, pyqtSignal, QObject, QSemaphore
 from app.models import VideoItem
-from app.core.downloaders import KuaishouDownloader, MissAVDownloader, BilibiliDownloader
+from app.core.downloaders import KuaishouDownloader, MissAVDownloader, BilibiliDownloader, DouyinDownloader
 
 class DownloadWorker(QThread):
     sig_start = pyqtSignal(str)
@@ -28,7 +27,16 @@ class DownloadWorker(QThread):
             if not os.path.exists(self.save_dir):
                 os.makedirs(self.save_dir, exist_ok=True)
             # 获取文件名
-            filename = self.video.get_safe_filename("mp4")
+            ext = ".mp4"
+            if ".jpeg" in self.video.url:
+                ext = ".jpeg"
+            elif ".jpg" in self.video.url:
+                ext = ".jpg"
+            elif ".png" in self.video.url:
+                ext = ".png"
+            elif ".webp" in self.video.url:
+                ext = ".webp"
+            filename = self.video.get_safe_filename("ext")
             filepath = os.path.join(self.save_dir, filename)
             self.video.local_path = filepath
             # 策略选择
@@ -39,6 +47,8 @@ class DownloadWorker(QThread):
                 downloader = MissAVDownloader()
             elif self.video.source == "bilibili":
                 downloader = BilibiliDownloader()
+            elif self.video.source == "douyin":
+                downloader = DouyinDownloader()
             else:
                 raise ValueError(f"Unknown source: {self.video.source}")
             # 执行下载 (传入回调和停止检查)

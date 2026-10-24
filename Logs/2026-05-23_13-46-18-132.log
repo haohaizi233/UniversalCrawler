@@ -1,0 +1,28 @@
+﻿LOG 2026/05/23
+Save Path: D:\desktop\UniversalCrawler\Logs
+Task Start: 2026/05/23 13:46:18
+Task CommandLine: N_m3u8DL-RE.exe https://surrit.com/878b5ac2-adbe-41db-976b-9062bf8280c1/playlist.m3u8 --save-dir D:/desktop/lly/emo --save-name "[中字] 日向&美月&美宇&光&桃" --thread-count 16 --download-retry-count 10 --auto-select true --header "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" --header "Referer: https://missav.ai/dm13/cn/oreco-254" --mux-after-done format=mp4
+
+13:46:18.139 INFO : N_m3u8DL-RE (Beta version) 20251029
+13:46:18.144 EXTRA: ffmpeg => D:\desktop\UniversalCrawler\ffmpeg.exe
+13:46:18.145 EXTRA: User-Defined Header => user-agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36
+13:46:18.146 EXTRA: User-Defined Header => referer: https://missav.ai/dm13/cn/oreco-254
+13:46:18.146 INFO : 加载URL: https://surrit.com/878b5ac2-adbe-41db-976b-9062bf8280c1/playlist.m3u8
+13:46:18.597 INFO : 内容匹配: HTTP Live Streaming
+13:46:18.600 INFO : 正在解析媒体信息...
+13:46:18.602 WARN : 检测到Master列表，开始解析全部流信息
+13:46:18.606 WARN : 写出meta json
+13:46:18.619 INFO : 已解析, 共计 3 条媒体流, 基本流 3 条, 可选音频流 0 条, 可选字幕流 0 条
+13:46:18.620 INFO : Vid 1280x720 | 2800 Kbps
+13:46:18.622 INFO : Vid 842x480 | 1400 Kbps
+13:46:18.623 INFO : Vid 640x360 | 800 Kbps
+13:46:18.624 INFO : 正在解析媒体信息...
+13:46:18.760 INFO : 已选择的流:
+13:46:18.763 INFO : Vid 1280x720 | 2800 Kbps | 1309 Segments | ~01h27m15s
+13:46:18.766 WARN : 写出meta json
+13:46:18.782 INFO : 保存文件名: [中字] 日向&美月&美宇&光&桃
+13:46:18.783 WARN : 你已开启下载完成后混流，自动开启二进制合并
+13:46:18.787 INFO : 开始下载...Vid 1280x720 | 2800 Kbps
+13:46:24.389 WARN : 读取媒体信息...
+13:46:24.611 INFO : [0x100]: Video, h264 (Main) ([27][0][0][0]), 1280x720, 24 fps
+13:46:24.614 INFO : [0x101]: Audio, aac (LC) ([15][0][0][0]), 216 kb/s

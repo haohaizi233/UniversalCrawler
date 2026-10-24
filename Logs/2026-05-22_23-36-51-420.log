@@ -1,0 +1,38 @@
+﻿LOG 2026/05/22
+Save Path: D:\desktop\UniversalCrawler\Logs
+Task Start: 2026/05/22 23:36:51
+Task CommandLine: N_m3u8DL-RE.exe https://surrit.com/c4eaecd4-9003-449b-89d9-fa6c0d5be1b6/playlist.m3u8 --save-dir D:/desktop/Downloads --save-name "[中字] 在女学生耳边低语的诱惑让我不知所措，放学后我在情人旅馆和图书馆疯狂地重复禁止阴道射精。天音结衣" --thread-count 16 --download-retry-count 10 --auto-select true --header "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" --header "Referer: https://missav.ai/dm82/cn/cawd-377" --mux-after-done format=mp4
+
+23:36:51.426 INFO : N_m3u8DL-RE (Beta version) 20251029
+23:36:51.429 EXTRA: ffmpeg => D:\desktop\UniversalCrawler\ffmpeg.exe
+23:36:51.429 EXTRA: User-Defined Header => user-agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36
+23:36:51.430 EXTRA: User-Defined Header => referer: https://missav.ai/dm82/cn/cawd-377
+23:36:51.430 INFO : 加载URL: https://surrit.com/c4eaecd4-9003-449b-89d9-fa6c0d5be1b6/playlist.m3u8
+23:37:00.547 INFO : 内容匹配: HTTP Live Streaming
+23:37:00.550 INFO : 正在解析媒体信息...
+23:37:00.552 WARN : 检测到Master列表，开始解析全部流信息
+23:37:00.559 WARN : 写出meta json
+23:37:00.564 INFO : 已解析, 共计 3 条媒体流, 基本流 3 条, 可选音频流 0 条, 可选字幕流 0 条
+23:37:00.567 INFO : Vid 1280x720 | 2800 Kbps
+23:37:00.569 INFO : Vid 842x480 | 1400 Kbps
+23:37:00.571 INFO : Vid 640x360 | 800 Kbps
+23:37:00.573 INFO : 正在解析媒体信息...
+23:37:02.083 INFO : 已选择的流:
+23:37:02.085 INFO : Vid 1280x720 | 2800 Kbps | 1777 Segments | ~01h58m28s
+23:37:02.087 WARN : 写出meta json
+23:37:02.104 INFO : 保存文件名: [中字] 在女学生耳边低语的诱惑让我不知所措，放学后我在情人旅馆和图书馆疯狂地重复禁止阴道射精。天音结衣
+23:37:02.105 WARN : 你已开启下载完成后混流，自动开启二进制合并
+23:37:02.108 INFO : 开始下载...Vid 1280x720 | 2800 Kbps
+23:37:03.371 WARN : 读取媒体信息...
+23:37:04.142 INFO : [0x100]: Video, h264 (Main) ([27][0][0][0]), 1280x720, 29.97 fps
+23:37:04.144 INFO : [0x101]: Audio, aac (LC) ([15][0][0][0]), 240 kb/s
+23:42:57.294 EXTRA: Ah oh!
+RetryCount => 10
+Exception  => Received an unexpected EOF or 0 bytes from the transport stream.
+Url        => https://surrit.com/c4eaecd4-9003-449b-89d9-fa6c0d5be1b6/1280x720/video820.jpeg
+23:45:51.278 INFO : 二进制合并中...
+23:45:52.442 WARN : [中字] 在女学生耳边低语的诱惑让我不知所措，放学后我在情人旅馆和图书馆疯狂地重复禁止阴道射精。天音结衣.ts
+23:45:52.443 WARN : Muxing to [中字] 在女学生耳边低语的诱惑让我不知所措，放学后我在情人旅馆和图书馆疯狂地重复禁止阴道射精。天音结衣.MUX.mp4
+23:45:56.304 WARN : Cleaning files...
+23:45:56.432 WARN : Rename to [中字] 在女学生耳边低语的诱惑让我不知所措，放学后我在情人旅馆和图书馆疯狂地重复禁止阴道射精。天音结衣.mp4
+23:45:56.434 INFO : Done

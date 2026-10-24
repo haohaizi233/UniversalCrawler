@@ -1,11 +1,12 @@
+# app/core/lib/douyin/interface/account_tiktok.py
 from typing import TYPE_CHECKING, Callable, Coroutine, Type, Union
-
-from src.interface.account import Account
-from src.interface.template import APITikTok
+from .account import Account
+from .template import APITikTok
 
 if TYPE_CHECKING:
-    from src.config import Parameter
-    from src.testers import Params
+    from typing import Any
+    Parameter = Any
+    Params = Any
 
 
 class AccountTikTok(
@@ -136,19 +137,8 @@ class AccountTikTok(
 
 
 async def test():
-    from src.testers import Params
-
-    async with Params() as params:
-        AccountTikTok.params["msToken"] = params.msToken_tiktok
-        i = AccountTikTok(
-            params,
-            sec_user_id="",
-            earliest=15,
-        )
-        print(await i.run())
-
+    pass
 
 if __name__ == "__main__":
     from asyncio import run
-
     run(test())

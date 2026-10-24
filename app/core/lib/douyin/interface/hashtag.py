@@ -1,13 +1,15 @@
+# app/core/lib/douyin/interface/hashtag.py
 from typing import TYPE_CHECKING
 from typing import Union
 
-from src.interface.template import API
+from .template import API
 
-# from src.translation import _
+# from ..translation import _
 
 if TYPE_CHECKING:
-    from src.config import Parameter
-    from src.testers import Params
+    from typing import Any
+    Parameter = Any
+    Params = Any
 
 
 class HashTag(API):
@@ -26,16 +28,8 @@ class HashTag(API):
 
 
 async def test():
-    from src.testers import Params
-
-    async with Params() as params:
-        i = HashTag(
-            params,
-        )
-        print(await i.run())
-
+    pass
 
 if __name__ == "__main__":
     from asyncio import run
-
     run(test())

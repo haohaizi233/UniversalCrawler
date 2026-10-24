@@ -1,0 +1,24 @@
+﻿LOG 2026/06/21
+Save Path: D:\desktop\project\UniversalCrawler\Logs
+Task Start: 2026/06/21 22:16:53
+Task CommandLine: N_m3u8DL-RE.exe https://surrit.com/a90a52b5-0a0a-4c2f-98b9-1a863b345a07/playlist.m3u8 --save-dir D:/desktop/女朋友 --save-name "[中字] 即使在“我已经射精”的状态下也追求荡妇的Ijiwaru导师Yui Amane" --thread-count 16 --download-retry-count 10 --auto-select true --header "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" --header "Referer: https://missav.ai/dm60/cn/miaa-553" --mux-after-done format=mp4
+
+22:16:53.547 INFO : N_m3u8DL-RE (Beta version) 20251029
+22:16:53.550 EXTRA: ffmpeg => D:\desktop\project\UniversalCrawler\ffmpeg.exe
+22:16:53.550 EXTRA: User-Defined Header => user-agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36
+22:16:53.551 EXTRA: User-Defined Header => referer: https://missav.ai/dm60/cn/miaa-553
+22:16:53.551 INFO : 加载URL: https://surrit.com/a90a52b5-0a0a-4c2f-98b9-1a863b345a07/playlist.m3u8
+22:16:54.062 WARN : Response status code does not indicate success: 403 (Forbidden). (1/10)
+22:16:55.576 INFO : 加载URL: https://surrit.com/a90a52b5-0a0a-4c2f-98b9-1a863b345a07/playlist.m3u8
+22:16:55.967 WARN : Response status code does not indicate success: 403 (Forbidden). (2/10)
+22:16:57.475 INFO : 加载URL: https://surrit.com/a90a52b5-0a0a-4c2f-98b9-1a863b345a07/playlist.m3u8
+22:16:57.887 WARN : Response status code does not indicate success: 403 (Forbidden). (3/10)
+22:16:59.396 INFO : 加载URL: https://surrit.com/a90a52b5-0a0a-4c2f-98b9-1a863b345a07/playlist.m3u8
+22:17:03.132 WARN : Response status code does not indicate success: 403 (Forbidden). (4/10)
+22:17:04.644 INFO : 加载URL: https://surrit.com/a90a52b5-0a0a-4c2f-98b9-1a863b345a07/playlist.m3u8
+22:17:05.049 WARN : Response status code does not indicate success: 403 (Forbidden). (5/10)
+22:17:06.560 INFO : 加载URL: https://surrit.com/a90a52b5-0a0a-4c2f-98b9-1a863b345a07/playlist.m3u8
+22:17:06.939 WARN : Response status code does not indicate success: 403 (Forbidden). (6/10)
+22:17:08.452 INFO : 加载URL: https://surrit.com/a90a52b5-0a0a-4c2f-98b9-1a863b345a07/playlist.m3u8
+22:17:17.880 WARN : Response status code does not indicate success: 403 (Forbidden). (7/10)
+22:17:19.386 INFO : 加载URL: https://surrit.com/a90a52b5-0a0a-4c2f-98b9-1a863b345a07/playlist.m3u8

@@ -1,11 +1,16 @@
+# app/core/lib/douyin/interface/live.py
 from typing import TYPE_CHECKING, Union
+from .template import API
 
-from src.interface.template import API
-from src.tools import DownloaderError
+try:
+    from ..tools import DownloaderError
+except ImportError:
+    class DownloaderError(Exception): pass
 
 if TYPE_CHECKING:
-    from src.config import Parameter
-    from src.testers import Params
+    from typing import Any
+    Parameter = Any
+    Params = Any
 
 
 class Live(API):
@@ -83,17 +88,8 @@ class Live(API):
 
 
 async def test():
-    from src.testers import Params
-
-    async with Params() as params:
-        i = Live(
-            params,
-            room_id="",
-        )
-        print(await i.run())
-
+    pass
 
 if __name__ == "__main__":
     from asyncio import run
-
     run(test())

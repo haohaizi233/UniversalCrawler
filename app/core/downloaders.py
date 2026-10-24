@@ -203,3 +203,61 @@ class BilibiliDownloader(BaseDownloader):
             if os.path.exists(temp_v): os.remove(temp_v)
             if os.path.exists(temp_a): os.remove(temp_a)
             raise Exception(f"B站下载失败: {e}")
+
+
+class DouyinDownloader(BaseDownloader):
+    def download(self, video_item, save_path, progress_callback, check_stop_func):
+        # 抖音下载器 (兼容视频和图片)
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Referer": "https://www.douyin.com/"
+        }
+
+        # 如果是图片文件，通常较小，但也使用流式下载保持一致性
+        temp_path = save_path + ".downloading"
+        max_retries = 3
+        success = False
+
+        for attempt in range(max_retries):
+            if check_stop_func(): break
+            try:
+                # 抖音CDN通常不需要Cookie，但Referer最好带上
+                with requests.get(video_item.url, headers=headers, stream=True, timeout=60) as r:
+                    r.raise_for_status()
+                    total_size = int(r.headers.get('content-length', 0))
+                    downloaded = 0
+                    with open(temp_path, 'wb') as f:
+                        for chunk in r.iter_content(chunk_size=8192):
+                            if check_stop_func(): raise InterruptedError("用户停止下载")
+                            if chunk:
+                                f.write(chunk)
+                                downloaded += len(chunk)
+                                if total_size > 0:
+                                    percent = int((downloaded / total_size) * 100)
+                                    # 降低回调频率，避免UI卡顿
+                                    if downloaded % (8192 * 200) == 0 or percent == 100:
+                                        progress_callback(percent)
+                success = True
+                break
+            except InterruptedError:
+                break
+            except Exception as e:
+                print(f"⚠️ [Douyin] 下载中断 ({attempt + 1}/{max_retries}): {e}")
+                time.sleep(2)
+
+        if success:
+            if os.path.exists(save_path):
+                try:
+                    os.remove(save_path)
+                except:
+                    pass
+            os.rename(temp_path, save_path)
+            progress_callback(100)
+        else:
+            if os.path.exists(temp_path):
+                try:
+                    os.remove(temp_path)
+                except:
+                    pass
+            if not check_stop_func():
+                raise Exception("下载失败，请检查网络或链接是否失效")

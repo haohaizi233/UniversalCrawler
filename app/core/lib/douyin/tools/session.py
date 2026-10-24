@@ -1,15 +1,23 @@
-from typing import TYPE_CHECKING, Union
-
+# app/core/lib/douyin/tools/session.py
+from typing import TYPE_CHECKING, Union, Any
 from httpx import AsyncClient, AsyncHTTPTransport, Client, HTTPTransport
 
-from ..custom import TIMEOUT, USERAGENT
-from ..tools import DownloaderError
+# 调整引用路径：常量现在位于当前包的 __init__.py 中
+try:
+    from . import TIMEOUT, USERAGENT
+except ImportError:
+    TIMEOUT = 10
+    USERAGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36"
+
+from .error import DownloaderError
 from .capture import capture_error_params
 from .retry import Retry
 
 if TYPE_CHECKING:
-    from ..record import BaseLogger, LoggerManager
-    from ..testers import Logger
+    # 占位符，防止静态类型检查报错
+    BaseLogger = Any
+    LoggerManager = Any
+    Logger = Any
 
 __all__ = ["request_params", "create_client"]
 

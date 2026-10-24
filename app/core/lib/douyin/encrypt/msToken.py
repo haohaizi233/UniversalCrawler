@@ -1,3 +1,5 @@
+# app/core/lib/douyin/encrypt/msToken.py
+
 from asyncio import run
 from json import dumps
 from random import randint
@@ -6,15 +8,28 @@ from time import time
 from typing import TYPE_CHECKING, Union
 from urllib.parse import quote
 
-from src.custom import PARAMS_HEADERS, PARAMS_HEADERS_TIKTOK, USERAGENT
-from src.encrypt.ttWid import TtWid
-from src.encrypt.xBogus import XBogusTikTok
-from src.tools import request_params
-from src.translation import _
+# 调整引用路径
+try:
+    from ..tools import PARAMS_HEADERS, PARAMS_HEADERS_TIKTOK, USERAGENT, request_params
+except ImportError:
+    PARAMS_HEADERS = {}
+    PARAMS_HEADERS_TIKTOK = {}
+    USERAGENT = ""
+    async def request_params(*args, **kwargs): pass
+
+from .ttWid import TtWid
+from .xBogus import XBogusTikTok
+
+try:
+    from ..translation import _
+except ImportError:
+    def _(x): return x
 
 if TYPE_CHECKING:
-    from src.record import BaseLogger, LoggerManager
-    from src.testers import Logger
+    from typing import Any
+    BaseLogger = Any
+    LoggerManager = Any
+    Logger = Any
 
 __all__ = ["MsToken", "MsTokenTikTok"]
 
@@ -234,7 +249,9 @@ class MsTokenTikTok(MsToken):
 
 
 async def test():
-    from src.testers import Logger
+    class Logger:
+        def error(self, msg): print(msg)
+        def info(self, msg, *args): print(msg)
 
     print("抖音", await MsToken.get_real_ms_token(Logger(), PARAMS_HEADERS, proxy=None))
     print(
@@ -248,13 +265,13 @@ async def test():
     print(
         "TikTok",
         await MsTokenTikTok.get_real_ms_token(
-            Logger(), PARAMS_HEADERS_TIKTOK, proxy="http://127.0.0.1:10809"
+            Logger(), PARAMS_HEADERS_TIKTOK, proxy="http://127.0.0.1:7890"
         ),
     )
     print(
         "TikTok",
         await MsTokenTikTok.get_long_ms_token(
-            Logger(), PARAMS_HEADERS_TIKTOK, proxy="http://127.0.0.1:10809"
+            Logger(), PARAMS_HEADERS_TIKTOK, proxy="http://127.0.0.1:7890"
         ),
     )
 

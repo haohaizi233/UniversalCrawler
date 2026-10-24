@@ -1,15 +1,28 @@
+# app/core/lib/douyin/interface/search.py
 from json import dumps
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Union
 from urllib.parse import quote
 
-from src.interface.template import API
-from src.tools import DownloaderError
-from src.translation import _
+from .template import API
+
+try:
+    from ..tools import DownloaderError
+except ImportError:
+    class DownloaderError(Exception):
+        pass
+
+try:
+    from ..translation import _
+except ImportError:
+    def _(x):
+        return x
 
 if TYPE_CHECKING:
-    from src.config import Parameter
-    from src.testers import Params
+    from typing import Any
+
+    Parameter = Any
+    Params = Any
 
 
 class Search(API):
@@ -132,24 +145,24 @@ class Search(API):
     }
 
     def __init__(
-        self,
-        params: Union["Parameter", "Params"],
-        cookie: str = "",
-        proxy: str = None,
-        keyword: str = ...,
-        channel: int = 0,
-        pages: int = 99999,
-        sort_type: int = 0,
-        publish_time: int = 0,
-        duration: int = 0,
-        search_range: int = 0,
-        content_type: int = 0,
-        douyin_user_fans: int = 0,
-        douyin_user_type: int = 0,
-        offset: int = 0,
-        count: int = 10,
-        *args,
-        **kwargs,
+            self,
+            params: Union["Parameter", "Params"],
+            cookie: str = "",
+            proxy: str = None,
+            keyword: str = ...,
+            channel: int = 0,
+            pages: int = 99999,
+            sort_type: int = 0,
+            publish_time: int = 0,
+            duration: int = 0,
+            search_range: int = 0,
+            content_type: int = 0,
+            douyin_user_fans: int = 0,
+            douyin_user_type: int = 0,
+            offset: int = 0,
+            count: int = 10,
+            *args,
+            **kwargs,
     ):
         super().__init__(params, cookie, proxy, *args, **kwargs)
         self.keyword = keyword
@@ -206,16 +219,16 @@ class Search(API):
         return self.response
 
     def generate_filter_selected(
-        self,
+            self,
     ) -> str | None:
         if any(
-            (
-                self.sort_type,
-                self.publish_time,
-                self.duration,
-                self.search_range,
-                self.content_type,
-            )
+                (
+                        self.sort_type,
+                        self.publish_time,
+                        self.duration,
+                        self.search_range,
+                        self.content_type,
+                )
         ):
             return dumps(
                 {
@@ -230,13 +243,13 @@ class Search(API):
         return None
 
     def generate_search_filter_value(
-        self,
+            self,
     ) -> str | None:
         if any(
-            (
-                self.douyin_user_fans,
-                self.douyin_user_type,
-            )
+                (
+                        self.douyin_user_fans,
+                        self.douyin_user_type,
+                )
         ):
             return dumps(
                 {
@@ -248,7 +261,7 @@ class Search(API):
         return None
 
     def _generate_params_general(
-        self,
+            self,
     ) -> dict:
         params = self.params | {
             "pc_search_top_1_params": '{"enable_ai_search_top_1":1}',
@@ -277,7 +290,7 @@ class Search(API):
         return params
 
     def _generate_params_video(
-        self,
+            self,
     ) -> dict:
         params = self.params | {
             "pc_search_top_1_params": '{"enable_ai_search_top_1":1}',
@@ -321,7 +334,7 @@ class Search(API):
         return params
 
     def _generate_params_user(
-        self,
+            self,
     ) -> dict:
         params = self._generate_params_live()
         if self.search_filter_value:
@@ -332,7 +345,7 @@ class Search(API):
         return params
 
     def _generate_params_live(
-        self,
+            self,
     ) -> dict:
         params = self.params | {
             "pc_search_top_1_params": '{"enable_ai_search_top_1":1}',
@@ -355,14 +368,14 @@ class Search(API):
         return params
 
     def check_response(
-        self,
-        data_dict: dict,
-        data_key: str,
-        error_text="",
-        cursor="cursor",
-        has_more="has_more",
-        *args,
-        **kwargs,
+            self,
+            data_dict: dict,
+            data_key: str,
+            error_text="",
+            cursor="cursor",
+            has_more="has_more",
+            *args,
+            **kwargs,
     ):
         try:
             if not isinstance(d := data_dict[data_key], list):
@@ -374,7 +387,10 @@ class Search(API):
                 self.finished = True
             else:
                 self.offset = data_dict[cursor]
-                self.search_id = data_dict["log_pb"]["impr_id"]
+                # 有些接口可能没有 log_pb，这里加个容错
+                if "log_pb" in data_dict:
+                    self.search_id = data_dict["log_pb"].get("impr_id")
+
                 match self.type:
                     case "general" | "video" | "user":
                         self.append_response(d)
@@ -386,38 +402,22 @@ class Search(API):
                     case _:
                         raise DownloaderError
                 self.finished = not data_dict[has_more]
-        except KeyError:
+        except KeyError as e:
             self.log.error(
-                _("数据解析失败，请告知作者处理: {data}").format(data=data_dict)
+                _("数据解析失败，请告知作者处理: {data} (KeyError: {e})").format(data=data_dict, e=e)
             )
             self.finished = True
 
     def append_response_video(
-        self,
-        data: list[dict],
-        key: str,
+            self,
+            data: list[dict],
+            key: str,
     ) -> None:
         self.append_response([i[key] for i in data])
 
 
 async def test():
-    from src.testers import Params
-
-    async with Params() as params:
-        Search.params["uifid"] = params.uifid
-        Search.params["msToken"] = params.msToken_tiktok
-        i = Search(
-            params,
-            keyword="",
-            channel=3,
-            sort_type=2,
-            publish_time=7,
-            duration=2,
-            douyin_user_fans=5,
-            pages=1,
-        )
-        print(await i.run())
-
+    pass
 
 if __name__ == "__main__":
     from asyncio import run

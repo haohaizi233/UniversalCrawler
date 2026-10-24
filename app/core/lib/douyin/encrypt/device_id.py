@@ -1,13 +1,22 @@
+# app/core/lib/douyin/encrypt/device_id.py
 from asyncio import run
 from re import compile
 from typing import TYPE_CHECKING, Union
 
-from src.custom import PARAMS_HEADERS_TIKTOK
-from src.tools import request_params
+# 调整引用路径
+try:
+    from ..tools import PARAMS_HEADERS_TIKTOK, request_params
+except ImportError:
+    PARAMS_HEADERS_TIKTOK = {}
+    async def request_params(*args, **kwargs): pass
 
 if TYPE_CHECKING:
-    from src.record import BaseLogger, LoggerManager
-    from src.testers import Logger
+    from typing import Any
+    BaseLogger = Any
+    LoggerManager = Any
+    Logger = Any
+
+__all__ = ["DeviceId"]
 
 
 class DeviceId:
@@ -56,22 +65,23 @@ class DeviceId:
 
 
 async def test():
-    from src.testers import Logger
+    class Logger:
+        def error(self, msg): print(msg)
+        def info(self, msg, *args): print(msg)
 
     print(
         await DeviceId.get_device_id(
             Logger(),
             PARAMS_HEADERS_TIKTOK,
-            proxy="http://127.0.0.1:10809",
+            proxy="http://127.0.0.1:7890",
         )
     )
     # print(await DeviceId.get_device_ids(
     #     Logger(),
     #     PARAMS_HEADERS_TIKTOK,
     #     5,
-    #     proxy="http://127.0.0.1:10809",
+    #     proxy="http://127.0.0.1:7890",
     # ))
-
 
 if __name__ == "__main__":
     run(test())

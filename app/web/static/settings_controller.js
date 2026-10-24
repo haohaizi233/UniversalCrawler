@@ -265,6 +265,10 @@
       patchPlatformSetting(platformId, "default_count", Number.isFinite(Number(text)) ? Number(text) : text);
       return true;
     }
+    if (key === row.search_max_pages_config_key || key === "search_max_pages") {
+      patchPlatformSetting(platformId, "search_max_pages", Number.isFinite(Number(text)) ? Number(text) : text);
+      return true;
+    }
     if (key === row.timeout_config_key || key === "timeout" || key === "default_timeout") {
       patchPlatformSetting(platformId, "default_timeout", Number.isFinite(Number(text)) ? Number(text) : text);
       return true;

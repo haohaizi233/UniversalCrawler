@@ -458,7 +458,19 @@
 
 .setting-platform .platform-name { grid-column: 1; grid-row: 1; }
 .setting-platform .platform-auth { grid-column: 2; grid-row: 1; }
-.setting-platform .platform-count { grid-column: 3; grid-row: 1; }
+.setting-platform .platform-count-controls { grid-column: 3; grid-row: 1; }
+.platform-count-controls {
+  display: grid;
+  gap: 6px;
+  align-items: center;
+  min-width: 0;
+}
+.setting-platform .platform-count-controls .platform-count { grid-column: auto; grid-row: auto; }
+.platform-search-pages-label {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 700;
+}
 .setting-platform .platform-timeout { grid-column: 4; grid-row: 1; }
 .setting-platform .platform-proxy-entry { grid-column: 5; grid-row: 1; }
 
@@ -660,7 +672,7 @@
     grid-row: auto;
   }
 
-  .setting-platform .platform-count {
+  .setting-platform .platform-count-controls {
     grid-column: 2;
     grid-row: auto;
   }
@@ -726,7 +738,7 @@
 
   .setting-platform .platform-name,
   .setting-platform .platform-auth,
-  .setting-platform .platform-count,
+  .setting-platform .platform-count-controls,
   .setting-platform .platform-timeout,
   .setting-platform .platform-proxy-entry {
     grid-column: 1;

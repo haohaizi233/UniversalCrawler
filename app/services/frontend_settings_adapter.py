@@ -15,6 +15,7 @@ from app.config.settings import (
     filename_template_options,
     font_size_label,
     font_size_options,
+    get_setting_default,
     image_auto_advance_interval_options,
     language_label,
     language_options,
@@ -172,6 +173,49 @@ def platform_count_contract(plugin_id: str, section: Mapping[str, Any]) -> dict[
     if value_text not in allowed_values:
         value = 1 if unit == "pages" else 20
     return {"key": key, "unit": unit, "value": value, "options": options}
+
+
+def platform_search_page_contract(
+    plugin_id: str,
+    section: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Project MissAV's independently editable scan-page setting."""
+    if str(plugin_id or "").strip().lower() != "missav":
+        return {
+            "search_max_pages": None,
+            "search_max_pages_config_key": "",
+            "search_max_pages_editable": False,
+            "search_max_pages_options": [],
+        }
+
+    default_pages = get_setting_default("missav", "search_max_pages")
+    raw_value = section.get("search_max_pages", default_pages)
+    try:
+        pages = int(raw_value)
+    except (TypeError, ValueError):
+        pages = int(default_pages)
+
+    choices = ()
+    plugin = registry.get_plugin("missav")
+    if plugin is not None:
+        for field in plugin.get_interactive_spec().fields:
+            if field.key == "search_max_pages":
+                choices = field.choices
+                break
+    options = [
+        {"value": str(choice.value), "label": str(choice.label or choice.value)}
+        for choice in choices
+        if isinstance(choice.value, int) and not isinstance(choice.value, bool)
+    ]
+    value_text = str(pages)
+    if not any(option["value"] == value_text for option in options):
+        options.insert(0, {"value": value_text, "label": f"{value_text} 页（当前）"})
+    return {
+        "search_max_pages": pages,
+        "search_max_pages_config_key": "search_max_pages",
+        "search_max_pages_editable": True,
+        "search_max_pages_options": options,
+    }
 
 
 def platform_proxy_contract(plugin_id: str, section: Mapping[str, Any]) -> dict[str, Any]:
@@ -332,6 +376,7 @@ def platform_settings_rows(
     for plugin in plugins if plugins is not None else registry.get_all_plugins():
         section = data.get(plugin.id, {})
         count_contract = platform_count_contract(plugin.id, section)
+        search_page_contract = platform_search_page_contract(plugin.id, section)
         timeout_contract = platform_timeout_contract(section)
         proxy_contract = platform_proxy_contract(plugin.id, section)
         auth_state = (
@@ -349,6 +394,7 @@ def platform_settings_rows(
                 "count_unit": count_contract["unit"],
                 "count_editable": bool(count_contract["key"]),
                 "count_options": count_contract["options"],
+                **search_page_contract,
                 **timeout_contract,
                 **proxy_contract,
             }

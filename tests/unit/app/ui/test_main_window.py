@@ -237,6 +237,28 @@ class MainWindowTests(unittest.TestCase):
         )
         window.top_bar.current_video_count.assert_not_called()
 
+    def test_applying_missav_search_page_setting_does_not_change_top_quantity(self):
+        window = self._make_window()
+        window.current_plugin = Mock(id="missav")
+        window.top_bar = Mock()
+
+        MainWindow._apply_platform_runtime_setting(window, "missav", "search_max_pages", 2)
+
+        window.top_bar.configure_for_platform.assert_not_called()
+        window.top_bar.set_video_count.assert_not_called()
+
+    def test_applying_platform_video_count_still_updates_top_quantity(self):
+        window = self._make_window()
+        window.current_plugin = Mock(id="missav")
+        window.top_bar = Mock()
+        defaults = {"max_items": 20, "search_max_pages": 2}
+
+        with patch("app.ui.main_window.get_platform_runtime_defaults", return_value=defaults):
+            MainWindow._apply_platform_runtime_setting(window, "missav", "max_items", 30)
+
+        window.top_bar.configure_for_platform.assert_called_once_with("missav", defaults)
+        window.top_bar.set_video_count.assert_called_once_with(30)
+
     def test_start_click_rejects_empty_keyword(self):
         """验证 `test_start_click_rejects_empty_keyword` 对应场景是否符合预期，供 `MainWindowTests` 使用。"""
         window = self._make_window()

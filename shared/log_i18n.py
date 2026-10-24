@@ -303,6 +303,7 @@ _RUNTIME_LOG_PHRASE_TRANSLATIONS = (
     ),
     ("Cloudflare 验证已通过", "Cloudflare verification passed", "Cloudflare 驗證已通過"),
     ("Cloudflare 验证等待超时", "Cloudflare verification timed out", "Cloudflare 驗證等待逾時"),
+    ("页面加载等待超时", "Page loading timed out", "頁面載入等待逾時"),
     (
         "MissAV 人工验证使用系统",
         "MissAV manual verification is using system",
@@ -689,6 +690,10 @@ _RUNTIME_LOG_PHRASE_TRANSLATIONS = (
     ("个最佳版本", "best versions", "個最佳版本"),
     ("开始嗅探 m3u8", "starting m3u8 sniffing", "開始嗅探 m3u8"),
     ("停止翻页", "stopping pagination", "停止翻頁"),
+    ("已达到扫描页数上限", "Reached the scan page limit", "已達到掃描頁數上限"),
+    ("列表加载失败，停止本轮扫描", "List loading failed; stopping this scan", "列表載入失敗，停止本輪掃描"),
+    ("下一页链接重复，停止翻页", "Repeated next-page link; stopping pagination", "下一頁連結重複，停止翻頁"),
+    ("翻页失败", "Pagination failed", "翻頁失敗"),
     ("页面扫描异常", "Page scan error", "頁面掃描異常"),
     ("检测到 Cloudflare，等待通过", "Cloudflare detected; waiting to pass", "偵測到 Cloudflare，等待通過"),
     ("开始第一遍扫描", "Starting first scan", "開始第一輪掃描"),

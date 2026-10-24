@@ -60,6 +60,16 @@ MISSAV_TIMEOUT_CHOICES = _choices(
     ("180 秒", 180),
     ("300 秒", 300),
 )
+MISSAV_SCAN_PAGE_CHOICES = _choices(
+    ("1 页", 1),
+    ("2 页", 2),
+    ("3 页", 3),
+    ("5 页", 5),
+    ("10 页", 10),
+    ("20 页", 20),
+    ("50 页", 50),
+    ("100 页", 100),
+)
 
 class KuaishouPlugin(BasePlugin):
     id = "kuaishou"
@@ -137,6 +147,12 @@ class MissAVPlugin(BasePlugin):
                     InteractiveChoice("否", False),
                     InteractiveChoice("是", True),
                 ),
+            ),
+            InteractiveField(
+                key="search_max_pages",
+                prompt="扫描页数",
+                summary_label="扫描页数",
+                choices=MISSAV_SCAN_PAGE_CHOICES,
             ),
             InteractiveField(
                 key="priority",

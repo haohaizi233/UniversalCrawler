@@ -104,6 +104,14 @@ class WebControllerConfigServiceTests(unittest.TestCase):
         self.assertIn("授权", errors[0].error)
         mocked_set.assert_not_called()
 
+    def test_update_config_allows_missav_scan_page_limit(self) -> None:
+        service = WebControllerConfigService()
+        with patch("app.web.controller_config_service.cfg.set") as mocked_set:
+            errors = service.update_config({"missav": {"search_max_pages": 1}})
+
+        self.assertEqual(errors, [])
+        mocked_set.assert_called_once_with("missav", "search_max_pages", 1)
+
 
 if __name__ == "__main__":
     unittest.main()

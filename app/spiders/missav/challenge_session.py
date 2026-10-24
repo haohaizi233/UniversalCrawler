@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import socket
 import subprocess
 import tempfile
@@ -175,7 +176,30 @@ class ExternalChromeChallengeSession:
             return False
         if (candidate.hostname or "").lower() != (target.hostname or "").lower():
             return False
-        if candidate.path.rstrip("/") != target.path.rstrip("/"):
+        # Chrome 的目标元数据会编码中文路径，页面 href 则可能保留中文或小写转义。
+        # 逐段解码一次，保留 %2F 与真正路径分隔符之间的边界。
+        candidate_path = tuple(
+            urllib.parse.unquote(segment)
+            for segment in candidate.path.rstrip("/").split("/")
+        )
+        target_path = tuple(
+            urllib.parse.unquote(segment)
+            for segment in target.path.rstrip("/").split("/")
+        )
+        # 演员列表会从 /cn/... 重定向到 /dm37/cn/...。只允许 MissAV
+        # 已知形态的路由前缀，后续路径和查询条件仍必须匹配。
+        if (candidate.hostname or "").lower() == "missav.ai":
+            def without_route_prefix(path):
+                if len(path) > 3 and re.fullmatch(r"dm[0-9]+", path[1]) and path[2] == "cn":
+                    return ("", *path[2:])
+                return path
+
+            if candidate_path != target_path:
+                if candidate_path[1:2] == ("cn",):
+                    target_path = without_route_prefix(target_path)
+                elif target_path[1:2] == ("cn",):
+                    candidate_path = without_route_prefix(candidate_path)
+        if candidate_path != target_path:
             return False
         return cls._query_pairs(target_url).issubset(cls._query_pairs(candidate_url))
 
@@ -233,15 +257,20 @@ class ExternalChromeChallengeSession:
             if last_target is not None:
                 if not self._is_challenge_title(last_target.title):
                     return last_target
-                if on_challenge is not None and not challenge_reported:
+                if (
+                    last_target.title.strip()
+                    and on_challenge is not None
+                    and not challenge_reported
+                ):
                     on_challenge(last_target.title)
                     challenge_reported = True
             if self._process is not None and self._process.poll() is not None:
                 raise RuntimeError("独立浏览器在挑战完成前异常退出")
             time.sleep(self.poll_interval_seconds)
         last_title = last_target.title if last_target is not None else ""
+        wait_reason = "安全验证" if challenge_reported else "页面加载"
         raise ChallengeWaitTimeout(
-            f"等待独立浏览器完成安全验证超时，最后标题: {last_title or '未加载'}"
+            f"等待独立浏览器完成{wait_reason}超时，最后标题: {last_title or '未加载'}"
         )
 
     def attach(self, playwright, target_url: str) -> BrowserAttachment:

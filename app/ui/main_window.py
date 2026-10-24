@@ -2870,6 +2870,20 @@ class MainWindow(QMainWindow):
         current_plugin_id = str(getattr(getattr(self, "current_plugin", None), "id", "") or "")
         if not section or str(section) != current_plugin_id:
             return
+        if key == "search_max_pages":
+            # The run-options widget can outlive a settings change. Synchronize
+            # its page limit without treating it as the top-bar video count.
+            widget = getattr(self, "plugin_widget", None)
+            combo = getattr(widget, "combo_search_max_pages", None)
+            if str(section) == "missav" and isinstance(combo, QComboBox):
+                pages = int(value)
+                with QSignalBlocker(combo):
+                    index = combo.findData(pages)
+                    if index < 0:
+                        combo.addItem(str(pages), pages)
+                        index = combo.findData(pages)
+                    combo.setCurrentIndex(index)
+            return
         top_bar = getattr(self, "top_bar", None)
         if top_bar is None:
             return

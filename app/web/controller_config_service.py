@@ -93,6 +93,7 @@ class WebControllerConfigService:
         "bilibili": {"max_pages", "max_items", "timeout"},
         "missav": {
             "max_items",
+            "search_max_pages",
             "timeout",
             "individual_only",
             "priority",

@@ -31,6 +31,7 @@ from app.ui.components.settings_path_picker import SettingsPathPicker
 from app.ui.dialogs.file_paths import resolve_existing_directory
 from app.ui.components.settings_platform_controls import (
     build_platform_count_combo,
+    build_platform_count_controls,
     build_platform_proxy_widget,
     build_platform_timeout_combo,
 )
@@ -1182,6 +1183,15 @@ class SettingsPage(PageFrame):
             width=width,
         )
 
+    def _platform_count_controls(self, row: dict[str, Any], *, width: int | None = None) -> QWidget:
+        return build_platform_count_controls(
+            row,
+            build_combo=self._build_combo,
+            emit_setting_changed=self._emit_setting_changed,
+            translate=self._t,
+            width=width,
+        )
+
     def _platform_timeout_combo(self, row: dict[str, Any], *, width: int | None = None) -> QComboBox:
         return build_platform_timeout_combo(
             row,
@@ -1312,9 +1322,11 @@ class SettingsPage(PageFrame):
 
         return body
 
-    @staticmethod
-    def _platform_row_height(row: dict[str, Any]) -> int:
-        return 48
+    def _platform_row_height(self, row: dict[str, Any]) -> int:
+        if not row.get("search_max_pages_config_key"):
+            return 48
+        combo_height = self._scaled_px(FORM_CONTROL_HEIGHT, minimum=FORM_CONTROL_HEIGHT)
+        return combo_height * 2 + 16
 
     def _build_platform_settings(self, layout: QVBoxLayout, value: Any) -> None:
         rows = value if isinstance(value, list) else []
@@ -1390,7 +1402,7 @@ class SettingsPage(PageFrame):
         auth_badge = self._auth_badge(str(row.get("auth_status") or "未认证"), fixed_width=col_widths["auth"])
         line_layout.addWidget(auth_badge, 0)
 
-        line_layout.addWidget(self._platform_count_combo(row, width=col_widths["count"]), 0)
+        line_layout.addWidget(self._platform_count_controls(row, width=col_widths["count"]), 0)
         line_layout.addWidget(self._platform_timeout_combo(row, width=col_widths["timeout"]), 0)
         line_layout.addWidget(self._platform_proxy_widget(row, policy, row_container=line, width=col_widths["proxy"]), 0)
         line_layout.addStretch(1)

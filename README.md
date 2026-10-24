@@ -1,4 +1,4 @@
-# 🚀 Universal Crawler Pro
+﻿# 🚀 Universal Crawler Pro
 
 <p align="left">
   <img alt="Python" src="https://img.shields.io/badge/Python-3.10%2B-blue?logo=python&logoColor=white" />
@@ -32,6 +32,7 @@
 - [🏗️ 核心架构与工程化设计](#architecture)
 - [🛠️ 全链路日志与调试体系](#debugging)
 - [🧪 测试与质量保证](#testing)
+- [🧾 本轮审查结论](#review)
 - [📚 文档与目录索引](#docs)
 - [📦 打包与分发](#packaging)
 - [👨‍💻 二次开发与贡献指南](#contributing)
@@ -369,7 +370,7 @@ Universal Crawler Pro 在这方面做了比较完整的设计。
 
 ### 当前分支的测试信号
 
-- 已具备 **180+** `unittest` 测试用例。
+- 已具备 **211** 个 `unittest` 测试用例，最近一次执行 `python -m unittest discover -s tests` 全部通过。
 - 已覆盖单元测试、半集成测试、mock 化系统流程测试等多个层面。
 - GitHub Actions 已接入基础自动化检查。
 
@@ -394,6 +395,28 @@ python -m unittest discover -s tests
 
 ---
 
+<a id="review"></a>
+## 🧾 本轮审查结论
+
+`UniversalCrawlerPro` 是 `UniversalCrawler` 的工程化升级版，也是当前项目集中最适合放在简历主项目区的 Python 桌面端作品。它已经从“能跑的采集脚本”演进到具备分层架构、插件注册、统一下载器、调试链路、测试套件和打包脚本的完整应用。
+
+适合在简历中重点强调：
+
+- **桌面端工程能力**：使用 PyQt6 拆分主窗口、顶部工具栏、下载队列、日志面板和媒体预览组件。
+- **架构设计能力**：按 `controller / spider / parser / task_builder / downloader / service / ui` 分层，降低平台接入和下载策略扩展成本。
+- **并发与稳定性**：通过 `DownloadManager`、`DownloadWorker`、线程回调和唯一文件名策略管理多任务下载。
+- **可观测性**：设计 trace_id、结构化调试日志、敏感信息脱敏和最近错误摘要，便于定位桌面端长链路问题。
+- **质量意识**：保留 211 个 `unittest` 用例，覆盖模型、配置、控制器、下载器、解析器、日志和半集成流程。
+- **交付意识**：提供 PyInstaller 便携版、Inno Setup 安装包和发布脚本，具备从源码到桌面分发的闭环。
+
+公开展示前建议继续收敛：
+
+- 成人站点相关插件不适合作为求职主推内容，建议默认隐藏、移除，或替换为合规 HLS 示例源。
+- Cookie、用户配置、下载目录、日志和外部二进制工具应继续确认不会被提交到公开仓库。
+- README 中的平台“稳定”状态仍依赖真实站点结构，面试或作品集展示时建议表述为“已实现适配与测试覆盖”，避免承诺长期可用。
+- 运行环境主要面向 Windows，跨平台支持可以作为后续优化方向，而不是当前卖点。
+
+---
 <a id="docs"></a>
 ## 📚 文档与目录索引
 

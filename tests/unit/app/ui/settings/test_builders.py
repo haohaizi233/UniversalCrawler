@@ -1,9 +1,16 @@
 """设置控件构建器的字段映射与布局测试。"""
 
 import unittest
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
-from PyQt6.QtWidgets import QApplication
+from PyQt6.QtWidgets import QApplication, QComboBox
+
+from app.ui.components.settings_platform_controls import (
+    build_platform_count_controls,
+    build_platform_search_pages_combo,
+)
+from app.ui.viewmodels.settings_options import normalize_combo_options
 
 from app.ui.plugin_settings import (
     MissAVSettingsWidget,
@@ -22,6 +29,100 @@ class SettingsBuildersTests(unittest.TestCase):
     def setUpClass(cls):
         
         cls.app = QApplication.instance() or QApplication([])
+
+    def test_saved_scan_page_change_updates_existing_run_widget_without_quantity_change(self):
+        from app.ui.main_window import MainWindow
+
+        for pages in (2, 7):
+            with self.subTest(pages=pages):
+                widget = MissAVSettingsWidget()
+                combo = widget.combo_search_max_pages
+                combo.setCurrentIndex(combo.findData(1))
+                emitted = []
+                combo.currentIndexChanged.connect(emitted.append)
+                window = SimpleNamespace(
+                    current_plugin=SimpleNamespace(id="missav"),
+                    plugin_widget=widget,
+                    top_bar=Mock(),
+                )
+
+                MainWindow._apply_platform_runtime_setting(window, "missav", "search_max_pages", pages)
+
+                self.assertEqual(combo.currentData(), pages)
+                self.assertEqual(emitted, [])
+                window.top_bar.configure_for_platform.assert_not_called()
+                window.top_bar.set_video_count.assert_not_called()
+                with patch("app.core.plugins.settings_builders._runtime_options", return_value={
+                    "search_max_pages": pages, "max_items": 20,
+                }):
+                    options = read_missav_run_options(widget)
+                self.assertEqual(options["search_max_pages"], pages)
+                self.assertEqual(options["max_items"], 20)
+                widget.close()
+
+    @staticmethod
+    def _platform_combo(options, current, *, width=0):
+        combo = QComboBox()
+        if width:
+            combo.setFixedWidth(width)
+        for value, label in normalize_combo_options(options, current):
+            combo.addItem(label, value)
+        index = combo.findData(str(current))
+        if index >= 0:
+            combo.setCurrentIndex(index)
+        return combo
+
+    def test_platform_scan_pages_combo_keeps_current_one_and_emits_independently(self):
+        changes = []
+        row = {
+            "id": "missav",
+            "search_max_pages": 1,
+            "search_max_pages_config_key": "search_max_pages",
+            "search_max_pages_editable": True,
+            "search_max_pages_options": [
+                {"value": str(value), "label": f"{value} 页"}
+                for value in (1, 2, 3, 5, 10, 20, 50, 100)
+            ],
+        }
+        combo = build_platform_search_pages_combo(
+            row,
+            build_combo=self._platform_combo,
+            emit_setting_changed=lambda *args: changes.append(args),
+            translate=str,
+        )
+
+        self.assertEqual(combo.currentData(), "1")
+        combo.setCurrentIndex(combo.findData("2"))
+        self.assertEqual(changes, [("missav", "search_max_pages", 2)])
+
+    def test_platform_count_controls_keep_video_count_and_scan_pages_separate(self):
+        changes = []
+        row = {
+            "id": "missav",
+            "default_count": 20,
+            "count_config_key": "max_items",
+            "count_editable": True,
+            "count_options": [{"value": "20", "label": "20 个视频"}],
+            "search_max_pages": 1,
+            "search_max_pages_config_key": "search_max_pages",
+            "search_max_pages_editable": True,
+            "search_max_pages_options": [{"value": "1", "label": "1 页"}],
+        }
+
+        controls = build_platform_count_controls(
+            row,
+            build_combo=self._platform_combo,
+            emit_setting_changed=lambda *args: changes.append(args),
+            translate=str,
+            width=210,
+        )
+
+        combos = controls.findChildren(QComboBox)
+        self.assertEqual(len(combos), 2)
+        self.assertEqual(combos[0].currentData(), "20")
+        self.assertEqual(combos[1].currentData(), "1")
+        self.assertTrue(combos[1].property("platformSearchPagesControl"))
+        self.assertEqual(controls.objectName(), "SettingsPlatformCountControls")
 
     def test_page_limit_widget_caps_values_to_max_entry(self):
         """验证 `test_page_limit_widget_caps_values_to_max_entry` 对应场景是否符合预期，供 `SettingsBuildersTests` 使用。"""
@@ -126,6 +227,42 @@ class SettingsBuildersTests(unittest.TestCase):
         self.assertIn("max_items", result)
         mocked_set.assert_not_called()
         mocked_update_proxy.assert_not_called()
+
+    def test_missav_scan_page_control_keeps_saved_one_and_custom_value(self):
+        for saved_pages in (1, 4):
+            with self.subTest(saved_pages=saved_pages):
+                runtime_options = {
+                    "individual_only": False,
+                    "priority": "中文字幕优先",
+                    "timeout": 60,
+                    "proxy": "http://127.0.0.1:7890",
+                    "max_items": 20,
+                    "search_max_pages": saved_pages,
+                }
+                config_values = {
+                    "individual_only": False,
+                    "priority": "中文字幕优先",
+                    "proxy_app": "Clash (7890)",
+                }
+                with (
+                    patch("app.ui.plugin_settings.cfg.get", side_effect=lambda _section, key, default=None: config_values.get(key, default)),
+                    patch("app.ui.plugin_settings.get_platform_runtime_defaults", return_value=runtime_options),
+                    patch("app.core.plugins.settings_builders._runtime_options", return_value=runtime_options),
+                ):
+                    widget = MissAVSettingsWidget()
+                    self.assertEqual(widget.label_search_max_pages.text(), "扫描页数:")
+                    self.assertEqual(widget.combo_search_max_pages.currentData(), saved_pages)
+                    self.assertGreaterEqual(widget.combo_search_max_pages.findData(saved_pages), 0)
+                    self.assertEqual(
+                        [widget.combo_search_max_pages.itemData(index) for index in range(widget.combo_search_max_pages.count())],
+                        [1, 2, 3, 5, 10, 20, 50, 100, *([saved_pages] if saved_pages == 4 else [])],
+                    )
+
+                    widget.combo_search_max_pages.setCurrentIndex(widget.combo_search_max_pages.findData(100))
+                    result = read_missav_run_options(widget)
+
+                    self.assertEqual(result["search_max_pages"], 100)
+                    self.assertEqual(result["max_items"], 20)
 
     @patch(
         "app.config.get_platform_runtime_defaults",

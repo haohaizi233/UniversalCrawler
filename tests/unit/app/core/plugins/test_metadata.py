@@ -111,6 +111,13 @@ def test_every_builtin_declares_non_generic_interactive_metadata():
     assert [
         field["key"]
         for field in manifests["missav"]["interactive"]["fields"]
-    ] == ["individual_only", "priority", "timeout", "proxy"]
+    ] == ["individual_only", "search_max_pages", "priority", "timeout", "proxy"]
+    scan_pages_field = next(
+        field
+        for field in manifests["missav"]["interactive"]["fields"]
+        if field["key"] == "search_max_pages"
+    )
+    assert scan_pages_field["prompt"] == "扫描页数"
+    assert [choice["value"] for choice in scan_pages_field["choices"]] == [1, 2, 3, 5, 10, 20, 50, 100]
     assert manifests["kuaishou"]["interactive"]["auth"]["mode"] == "cookie"
     assert manifests["missav"]["interactive"]["auth"]["mode"] == "none"

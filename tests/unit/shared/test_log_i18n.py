@@ -11,6 +11,22 @@ from shared.log_i18n import localize_log_text
     ("source", "english", "traditional"),
     [
         (
+            "已达到扫描页数上限",
+            "Reached the scan page limit",
+            "已達到掃描頁數上限",
+        ),
+        (
+            "列表加载失败，停止本轮扫描",
+            "List loading failed; stopping this scan",
+            "列表載入失敗，停止本輪掃描",
+        ),
+        (
+            "下一页链接重复，停止翻页",
+            "Repeated next-page link; stopping pagination",
+            "下一頁連結重複，停止翻頁",
+        ),
+        ("翻页失败", "Pagination failed", "翻頁失敗"),
+        (
             "⚠️ 抖音号格式无效，请使用 @账号名（1-20 位字母、数字、下划线或点）",
             "⚠️ Invalid Douyin ID format; use an @handle (1-20 letters, digits, underscores, or dots)",
             "⚠️ 抖音號格式無效，請使用 @帳號名（1-20 位字母、數字、底線或點）",

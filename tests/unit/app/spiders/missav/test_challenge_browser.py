@@ -5,7 +5,11 @@ from unittest.mock import Mock, call, patch
 
 from playwright.sync_api import Error as PlaywrightError
 
-from app.spiders.missav.challenge_session import BrowserAttachment, SystemBrowserUnavailable
+from app.spiders.missav.challenge_session import (
+    BrowserAttachment,
+    ChallengeWaitTimeout,
+    SystemBrowserUnavailable,
+)
 from app.spiders.missav.local_proxy import chromium_proxy_launch_args
 from app.spiders.missav.parser import MissAVParser
 from app.spiders.missav.spider import MissAVSpider, _ChallengeBrowserRuntime
@@ -110,6 +114,41 @@ def test_missav_stops_when_cloudflare_rejects_browser() -> None:
     assert spider._wait_for_cloudflare_challenge(Mock(), timeout_ms=5000) is False
     spider.interruptible_sleep.assert_not_called()
     assert "不支持" in spider.log.call_args.args[0]
+
+
+def test_ready_external_page_does_not_claim_cloudflare_verification() -> None:
+    spider = _spider()
+    spider._wait_for_external_challenge(Mock(), "https://missav.ai/cn/search/demo", timeout_ms=1000)
+
+    assert not any("Cloudflare" in str(item.args[0]) for item in spider.log.call_args_list)
+
+
+def test_external_loading_timeout_is_not_reported_as_cloudflare() -> None:
+    spider = _spider()
+    session = Mock()
+    session.wait_for_ready_page.side_effect = ChallengeWaitTimeout("page never loaded")
+
+    assert not spider._wait_for_external_challenge(
+        session, "https://missav.ai/cn/search/demo", timeout_ms=1000
+    )
+    assert not any("Cloudflare" in str(item.args[0]) for item in spider.log.call_args_list)
+
+
+def test_external_challenge_reports_verification_only_after_it_clears() -> None:
+    spider = _spider()
+    session = Mock()
+
+    def complete_challenge(_url, *, on_challenge, **_kwargs):
+        on_challenge("请稍候…")
+
+    session.wait_for_ready_page.side_effect = complete_challenge
+    assert spider._wait_for_external_challenge(
+        session, "https://missav.ai/cn/search/demo", timeout_ms=1000
+    )
+    messages = [item.args[0] for item in spider.log.call_args_list]
+    assert len(messages) == 2
+    assert "人工验证" in messages[0]
+    assert "验证已通过" in messages[1]
 
 
 def test_headed_runtime_waits_for_challenge_before_starting_playwright() -> None:
@@ -370,7 +409,9 @@ def test_external_pagination_does_not_poll_challenge_dom() -> None:
         [{"url": "https://missav.ai/cn/abc-123", "title": "A"}],
         [],
     ]
-    page.query_selector.side_effect = [object(), None]
+    next_link = Mock()
+    next_link.get_attribute.return_value = "?page=2"
+    page.query_selector.side_effect = [next_link, None]
     runtime = _ChallengeBrowserRuntime(external_session=Mock(), page=page)
 
     def navigate(current_runtime, url, timeout_ms):
@@ -446,7 +487,9 @@ def test_pagination_without_external_session_does_not_goto() -> None:
     spider.interruptible_wait_for_selector = Mock(return_value=True)
     page = Mock()
     page.evaluate.return_value = [{"url": "https://missav.ai/cn/abc-123", "title": "A"}]
-    page.query_selector.return_value = object()
+    next_link = Mock()
+    next_link.get_attribute.return_value = "?page=2"
+    page.query_selector.return_value = next_link
     runtime = _ChallengeBrowserRuntime(external_session=None, page=page)
     collected: dict[str, str] = {}
 

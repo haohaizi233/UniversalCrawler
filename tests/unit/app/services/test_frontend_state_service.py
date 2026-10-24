@@ -318,6 +318,13 @@ class FrontendStateServiceTests(unittest.TestCase):
             self.assertEqual(missav["count_unit"], "videos")
             self.assertEqual([option["value"] for option in missav["count_options"]], ["10", "20", "30", "50", "9999"])
             self.assertTrue(missav["count_editable"])
+            self.assertEqual(missav["search_max_pages_config_key"], "search_max_pages")
+            self.assertEqual(missav["search_max_pages"], 1)
+            self.assertEqual(
+                [option["value"] for option in missav["search_max_pages_options"]],
+                ["1", "2", "3", "5", "10", "20", "50", "100"],
+            )
+            self.assertTrue(missav["search_max_pages_editable"])
             stale_video = FrontendStateService._platform_count_contract("douyin", {"max_items": 100})
             stale_note = FrontendStateService._platform_count_contract("xiaohongshu", {"max_items": 100})
             stale_page = FrontendStateService._platform_count_contract("bilibili", {"max_pages": 20})
@@ -605,6 +612,25 @@ class FrontendStateServiceTests(unittest.TestCase):
                     self.assertEqual(result["status"], "ok", (section, count_key, candidate))
                     expected_platform_values[(section, count_key)] = int(candidate)
 
+                scan_pages_key = row.get("search_max_pages_config_key")
+                scan_pages_options = row.get("search_max_pages_options") or []
+                if scan_pages_key and scan_pages_options:
+                    current_pages = str(row.get("search_max_pages"))
+                    candidate_pages = next(
+                        (
+                            str(option["value"])
+                            for option in scan_pages_options
+                            if str(option.get("value")) != current_pages
+                        ),
+                        current_pages,
+                    )
+                    result = service.handle_action(
+                        "update_setting",
+                        {"section": section, "key": scan_pages_key, "value": candidate_pages},
+                    )
+                    self.assertEqual(result["status"], "ok", (section, scan_pages_key, candidate_pages))
+                    expected_platform_values[(section, scan_pages_key)] = int(candidate_pages)
+
                 timeout_key = row.get("timeout_config_key")
                 if timeout_key:
                     result = service.handle_action(
@@ -668,6 +694,8 @@ class FrontendStateServiceTests(unittest.TestCase):
                 row = platform_rows[section]
                 if key == row.get("count_config_key"):
                     self.assertEqual(int(row["default_count"]), expected)
+                elif key == row.get("search_max_pages_config_key"):
+                    self.assertEqual(int(row["search_max_pages"]), expected)
                 elif key == row.get("timeout_config_key"):
                     self.assertEqual(int(row["timeout"]), expected)
             missav = platform_rows["missav"]
@@ -684,6 +712,7 @@ class FrontendStateServiceTests(unittest.TestCase):
             self.assertEqual(reloaded.get("logging", "ui_log_max_display_count"), 500)
             self.assertEqual(reloaded.get("appearance", "language"), "zh-TW")
             self.assertEqual(reloaded.get("missav", "proxy_url"), "http://127.0.0.1:7897")
+            self.assertEqual(reloaded.get("missav", "search_max_pages"), expected_platform_values[("missav", "search_max_pages")])
 
     def test_update_setting_applies_runtime_hooks(self):
         with TemporaryDirectory() as temp_dir:

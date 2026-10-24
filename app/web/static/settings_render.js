@@ -191,6 +191,13 @@
       const countUnit = ["pages", "notes"].includes(row.count_unit) ? row.count_unit : "videos";
       countOptions.unshift({ value: countValue, label: formatCountOption(countValue, countUnit) });
     }
+    const searchPagesKey = row.search_max_pages_config_key || "";
+    const searchPagesDisabled = row.search_max_pages_editable && searchPagesKey ? "" : " disabled";
+    let searchPagesOptions = (row.search_max_pages_options || []).map(normalizeSettingOption).filter(option => option.value);
+    const searchPagesValue = String(row.search_max_pages ?? 1);
+    if (!searchPagesOptions.some(option => option.value === searchPagesValue)) {
+      searchPagesOptions.unshift({ value: searchPagesValue, label: `${searchPagesValue} 页` });
+    }
     let timeoutOptions = (row.timeout_options || []).map(normalizeSettingOption).filter(option => option.value);
     const timeoutValue = String(row.default_timeout || row.timeout || 60);
     if (timeoutKey && !timeoutOptions.some(option => option.value === timeoutValue)) {
@@ -217,7 +224,10 @@
       <div class="setting-row setting-platform${hasCustomProxy && proxyCustom ? " has-proxy-custom" : ""}">
         <span class="platform-name platform-name-cell">${platformIcon ? `<img src="${escapeAttr(platformIcon)}" alt="" />` : ""}<span>${platformName}</span></span>
         <span class="platform-auth platform-auth-badge ${authAuthed ? "is-authed" : "is-unauthed"}" title="${escapeAttr(row.auth_detail || "")}">${escapeHtml(translate(authLabel))}</span>
-        <select class="platform-count" data-setting="${escapeAttr(countKey)}"${countDisabled} onchange="updateSetting('${escapeAttr(row.id || "")}', '${escapeAttr(countKey)}', this.value)">${countOptions.map(option => `<option value="${escapeAttr(option.value)}" ${countValue === option.value ? "selected" : ""}>${escapeHtml(translateOption(option.label))}</option>`).join("")}</select>
+        <div class="platform-count-controls">
+          <select class="platform-count" data-setting="${escapeAttr(countKey)}"${countDisabled} onchange="updateSetting('${escapeAttr(row.id || "")}', '${escapeAttr(countKey)}', this.value)">${countOptions.map(option => `<option value="${escapeAttr(option.value)}" ${countValue === option.value ? "selected" : ""}>${escapeHtml(translateOption(option.label))}</option>`).join("")}</select>
+          ${searchPagesKey ? `<label class="platform-search-pages-label" for="search-max-pages-${escapeAttr(row.id || "")}">${escapeHtml(translate("扫描页数"))}</label><select id="search-max-pages-${escapeAttr(row.id || "")}" class="platform-search-pages" aria-label="${escapeAttr(translate("扫描页数"))}" data-platform="${escapeAttr(row.id || "")}" data-setting="${escapeAttr(searchPagesKey)}"${searchPagesDisabled} onchange="updateSetting('${escapeAttr(row.id || "")}', '${escapeAttr(searchPagesKey)}', this.value)">${searchPagesOptions.map(option => `<option value="${escapeAttr(option.value)}" ${searchPagesValue === option.value ? "selected" : ""}>${escapeHtml(translateOption(option.label))}</option>`).join("")}</select>` : ""}
+        </div>
         <select class="platform-timeout" data-setting="${escapeAttr(timeoutKey)}"${timeoutDisabled} onchange="updateSetting('${escapeAttr(row.id || "")}', '${escapeAttr(timeoutKey)}', this.value)">${timeoutOptions.map(option => `<option value="${escapeAttr(option.value)}" ${timeoutValue === option.value ? "selected" : ""}>${escapeHtml(translateOption(option.label))}</option>`).join("")}</select>
         <span class="platform-proxy-entry${proxyEntryClass}">
           <select class="platform-proxy" data-setting="${escapeAttr(proxyKey)}"${proxyDisabled} onchange="handleProxySelect('${escapeAttr(row.id || "")}', '${escapeAttr(proxyKey)}', this)">${proxyOptions.map(option => `<option value="${escapeAttr(option.value)}" ${proxyValue === option.value ? "selected" : ""}>${escapeHtml(translateOption(proxyOptionDisplayLabel(option)))}</option>`).join("")}</select>

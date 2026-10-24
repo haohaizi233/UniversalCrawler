@@ -4,7 +4,7 @@ from collections.abc import Callable, Mapping
 from typing import Any
 
 from PyQt6.QtCore import Qt
-from PyQt6.QtWidgets import QComboBox, QHBoxLayout, QLineEdit, QSizePolicy, QWidget
+from PyQt6.QtWidgets import QComboBox, QHBoxLayout, QLabel, QLineEdit, QSizePolicy, QVBoxLayout, QWidget
 
 from shared.settings_metadata import PLATFORM_COUNT_OPTIONS, PROXY_OPTIONS, TIMEOUT_OPTIONS
 from app.ui.viewmodels.settings_options import (
@@ -50,6 +50,93 @@ def build_platform_count_combo(
     else:
         combo.setToolTip(translate("该平台暂无可热加载的爬取数量配置"))
     return combo
+
+
+def build_platform_search_pages_combo(
+    row: Mapping[str, Any],
+    *,
+    build_combo: BuildCombo,
+    emit_setting_changed: EmitSetting,
+    translate: Translate,
+    width: int | None = None,
+) -> QComboBox:
+    platform_id = str(row.get("id") or "")
+    config_key = str(row.get("search_max_pages_config_key") or "")
+    current = row.get("search_max_pages", 1)
+    options = list(row.get("search_max_pages_options") or [])
+    current_text = str(current)
+    if not any(str(option.get("value")) == current_text for option in options if isinstance(option, Mapping)):
+        options.insert(0, {"value": current_text, "label": f"{current_text} 页（当前）"})
+    combo = build_combo(
+        options,
+        current,
+        width=int(width or PLATFORM_DETAIL_COL_WIDTHS["count"]),
+    )
+    combo.setAccessibleName(translate("扫描页数"))
+    combo.setProperty("platformSearchPagesControl", True)
+    combo.setEnabled(bool(row.get("search_max_pages_editable", False) and platform_id and config_key))
+    if combo.isEnabled():
+        combo.currentIndexChanged.connect(
+            lambda *_args, control=combo, pid=platform_id, key=config_key: emit_setting_changed(
+                pid,
+                key,
+                int(current_combo_value(control)),
+            )
+        )
+    return combo
+
+
+def build_platform_count_controls(
+    row: Mapping[str, Any],
+    *,
+    build_combo: BuildCombo,
+    emit_setting_changed: EmitSetting,
+    translate: Translate,
+    width: int | None = None,
+) -> QWidget:
+    """Build the platform result-count control and optional scan-page setting."""
+    control_width = int(width or PLATFORM_DETAIL_COL_WIDTHS["count"])
+    count_combo = build_platform_count_combo(
+        row,
+        build_combo=build_combo,
+        emit_setting_changed=emit_setting_changed,
+        translate=translate,
+        width=control_width,
+    )
+    if not row.get("search_max_pages_config_key"):
+        return count_combo
+
+    container = QWidget()
+    container.setObjectName("SettingsPlatformCountControls")
+    container.setFixedWidth(control_width)
+    layout = QVBoxLayout(container)
+    layout.setContentsMargins(0, 0, 0, 0)
+    layout.setSpacing(4)
+    layout.addWidget(count_combo, 0, Qt.AlignmentFlag.AlignLeft)
+
+    page_row = QWidget(container)
+    page_layout = QHBoxLayout(page_row)
+    page_layout.setContentsMargins(0, 0, 0, 0)
+    page_layout.setSpacing(6)
+    label = QLabel(translate("扫描页数"), page_row)
+    label.setObjectName("SettingsPlatformSearchPagesLabel")
+    label.setAccessibleName(translate("扫描页数"))
+    label.setToolTip(translate("扫描页数"))
+
+    label_width = min(label.sizeHint().width(), max(36, control_width // 3))
+    label.setFixedWidth(label_width)
+    page_width = max(52, control_width - label_width - page_layout.spacing())
+    pages_combo = build_platform_search_pages_combo(
+        row,
+        build_combo=build_combo,
+        emit_setting_changed=emit_setting_changed,
+        translate=translate,
+        width=page_width,
+    )
+    page_layout.addWidget(label, 0)
+    page_layout.addWidget(pages_combo, 0)
+    layout.addWidget(page_row, 0)
+    return container
 
 
 def build_platform_timeout_combo(

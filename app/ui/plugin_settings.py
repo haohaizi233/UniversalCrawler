@@ -71,6 +71,18 @@ class MissAVSettingsWidget(QWidget):
         self.chk_individual.setChecked(cfg.get("missav", "individual_only", False))
         layout.addWidget(self.chk_individual)
 
+        self.label_search_max_pages = QLabel("扫描页数:")
+        self.label_search_max_pages.setToolTip("MissAV 单次扫描的列表页数（1-100）")
+        layout.addWidget(self.label_search_max_pages)
+        self.combo_search_max_pages = ThemedComboBox(row_height=32)
+        self.combo_search_max_pages.setAccessibleName("扫描页数")
+        self.combo_search_max_pages.setToolTip("MissAV 单次扫描的列表页数（1-100）")
+        scan_pages = int(get_platform_runtime_defaults("missav").get("search_max_pages", 1))
+        self._fill_choice_combo(self.combo_search_max_pages, "search_max_pages", scan_pages)
+        self.combo_search_max_pages.setMinimumWidth(76)
+        self.combo_search_max_pages.setMaximumWidth(92)
+        layout.addWidget(self.combo_search_max_pages)
+
         self.combo_priority = ThemedComboBox(row_height=32)
         saved_priority = cfg.get("missav", "priority", "中文字幕优先")
         if saved_priority == "默认排序":
@@ -103,7 +115,7 @@ class MissAVSettingsWidget(QWidget):
             self.combo_proxy.setCurrentIndex(proxy_index)
         else:
             self.combo_proxy.setCurrentText(saved_proxy)
-        self.combo_proxy.setMinimumWidth(220)
+        self.combo_proxy.setMinimumWidth(180)
         layout.addWidget(self.combo_proxy)
 
     @staticmethod

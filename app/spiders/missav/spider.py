@@ -156,8 +156,11 @@ class MissAVSpider(BaseSpider):
         timeout_ms: int,
     ) -> bool:
         """在不连接 CDP 的前提下等待系统浏览器离开挑战页。"""
+        challenge_reported = False
 
         def report_challenge(_title: str) -> None:
+            nonlocal challenge_reported
+            challenge_reported = True
             self.log("🛡️ 检测到 Cloudflare，请在浏览器中完成人工验证...")
 
         try:
@@ -174,9 +177,17 @@ class MissAVSpider(BaseSpider):
         except ChallengeWaitCancelled:
             return False
         except ChallengeWaitTimeout as exc:
-            self.log(f"❌ Cloudflare 验证等待超时: {exc}")
+            if challenge_reported:
+                self.log(f"❌ Cloudflare 验证等待超时: {exc}")
+            else:
+                self.log(f"❌ 页面加载等待超时: {exc}")
+            self.debug_state(
+                "MISSAV_BROWSER_WAIT_FAILED", message=str(exc), level="ERROR",
+                context={"target_url": target_url, "challenge_detected": challenge_reported},
+            )
             return False
-        self.log("✅ Cloudflare 验证已通过")
+        if challenge_reported:
+            self.log("✅ Cloudflare 验证已通过")
         return True
 
     def _attach_external_browser(
@@ -866,12 +877,36 @@ class MissAVSpider(BaseSpider):
         max_pages = self._max_scan_pages()
         max_items = self._max_items_limit()
         base_url = str(page_url or getattr(page, "url", "") or "")
+        visited_urls = set()
+
+        def navigation_key(url):
+            parts = urllib.parse.urlsplit(url)
+            return (parts.scheme.lower(), parts.netloc.lower(), parts.path,
+                    tuple(sorted(urllib.parse.parse_qsl(parts.query, keep_blank_values=True))))
+
+        def report_stop(reason):
+            self.debug_state(
+                "MISSAV_LIST_SCAN_STOPPED", context={
+                    "reason": reason, "scan_page": current_page, "max_pages": max_pages,
+                    "items": len(data_dict), "max_items": max_items,
+                    "url": base_url, "chinese_pass": is_chinese_pass,
+                },
+            )
+
         while self.is_running and current_page <= max_pages:
             self.log(f"   📄 扫描第 {current_page} 页...")
             try:
-                self.interruptible_wait_for_selector(page, "div.grid", timeout=self.GRID_READY_TIMEOUT_MS)
+                ready = self.interruptible_wait_for_selector(page, "div.grid", timeout=self.GRID_READY_TIMEOUT_MS)
                 if not self.is_running or self.interrupt_requested:
                     break
+                if not ready:
+                    self.log("   ⚠️ 列表加载失败，停止本轮扫描")
+                    report_stop("grid_not_ready")
+                    break
+                actual_url = getattr(page, "url", "")
+                if isinstance(actual_url, str) and self._url_matches_hosts(actual_url, self.PAGE_HOSTS):
+                    base_url = actual_url
+                visited_urls.add(navigation_key(base_url))
                 items = page.evaluate('''() => {
                     return Array.from(document.querySelectorAll('div.grid a')).map(a => {
                         const img = a.querySelector('img');
@@ -898,19 +933,40 @@ class MissAVSpider(BaseSpider):
                                 data_dict[url] = title
                                 new_count += 1
 
+                self.debug_state(
+                    "MISSAV_LIST_PAGE_SCANNED", context={
+                        "url": base_url, "scan_page": current_page,
+                        "new_items": new_count, "items": len(data_dict),
+                        "chinese_pass": is_chinese_pass,
+                    },
+                )
                 if len(data_dict) >= max_items:
                     self.log(f"   ✅ 已达到视频数上限 {max_items}，停止翻页")
+                    report_stop("item_limit")
                     break
-                if not page.query_selector("a[rel='next']"):
+                if current_page >= max_pages:
+                    self.log(f"   ✅ 已达到扫描页数上限 {max_pages}，停止翻页")
+                    report_stop("page_limit")
                     break
-                current_page += 1
-                if "page=" in base_url:
-                    next_url = re.sub(r'page=\d+', f'page={current_page}', base_url)
-                else:
-                    sep = "&" if "?" in base_url else "?"
-                    next_url = f"{base_url}{sep}page={current_page}"
+                next_link = page.query_selector("a[rel~='next']")
+                if next_link is None:
+                    report_stop("last_page")
+                    break
+                href = next_link.get_attribute("href")
+                if not isinstance(href, str) or not href.strip():
+                    report_stop("missing_next_href")
+                    break
+                next_url = urllib.parse.urljoin(base_url, href)
+                if navigation_key(next_url) in visited_urls:
+                    self.log("   ⚠️ 下一页链接重复，停止翻页")
+                    report_stop("repeated_next_url")
+                    break
                 try:
                     next_url = self._require_missav_page_url(next_url)
+                    self.debug_state("MISSAV_LIST_PAGE_NAVIGATE", context={
+                        "from_url": base_url, "target_url": next_url,
+                        "scan_page": current_page + 1, "chinese_pass": is_chinese_pass,
+                    })
                     timeout_ms = self._configured_timeout_ms(default=60)
                     if runtime is not None and runtime.external_session is not None:
                         if not self._navigate_external_challenge(
@@ -918,23 +974,35 @@ class MissAVSpider(BaseSpider):
                             next_url,
                             timeout_ms=timeout_ms,
                         ):
+                            report_stop("navigation_failed")
                             break
                         page = runtime.page
                         if page is None:
+                            report_stop("missing_reattached_page")
                             break
                     elif runtime is not None and runtime.external_session is None:
                         self.log("⚠️ 没有外部浏览器会话，已停止可能再次触发挑战的翻页，不会跳转已连接页面。")
+                        report_stop("missing_external_session")
                         break
                     elif not self.interruptible_playwright_goto(
                         page,
                         next_url,
                         timeout=timeout_ms,
                     ):
+                        report_stop("navigation_failed")
                         break
-                except (PlaywrightError, DomainPolicyViolation):
+                    current_page += 1
+                    base_url = next_url
+                except (PlaywrightError, DomainPolicyViolation) as exc:
+                    self.log(f"   ⚠️ 翻页失败: {exc}")
+                    self.debug_state("MISSAV_LIST_PAGE_FAILED", message=str(exc), level="ERROR",
+                                     context={"target_url": next_url, "scan_page": current_page + 1})
                     break
             except (PlaywrightError, ValueError, TypeError) as e:
                 self.log(f"   ⚠️ 页面扫描异常: {e}")
+                self.debug_state("MISSAV_LIST_PAGE_FAILED", message=str(e), level="ERROR",
+                                 context={"url": base_url, "scan_page": current_page,
+                                          "chinese_pass": is_chinese_pass})
                 break
 
     def _max_items_limit(self) -> int:

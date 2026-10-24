@@ -12,6 +12,7 @@ from app.services.frontend_settings_adapter import (
     platform_auth_snapshot,
     platform_count_contract,
     platform_proxy_contract,
+    platform_search_page_contract,
     resolve_platform_auth_spec,
 )
 
@@ -94,6 +95,21 @@ def test_missav_proxy_contract_preserves_custom_value():
     assert contract["proxy_custom_value"] == "127.0.0.1:7897"
 
 
+def test_missav_scan_page_contract_exposes_choices_and_preserves_current_values():
+    saved_one = platform_search_page_contract("missav", {"search_max_pages": 1})
+    custom = platform_search_page_contract("missav", {"search_max_pages": 4})
+
+    assert saved_one["search_max_pages_config_key"] == "search_max_pages"
+    assert saved_one["search_max_pages_editable"] is True
+    assert saved_one["search_max_pages"] == 1
+    assert [option["value"] for option in saved_one["search_max_pages_options"]] == [
+        "1", "2", "3", "5", "10", "20", "50", "100"
+    ]
+    assert custom["search_max_pages"] == 4
+    assert custom["search_max_pages_options"][0] == {"value": "4", "label": "4 页（当前）"}
+    assert platform_search_page_contract("douyin", {})["search_max_pages_config_key"] == ""
+
+
 def test_build_settings_snapshot_matches_frontend_contract_shape():
     snapshot = build_settings_snapshot(
         {
@@ -107,9 +123,13 @@ def test_build_settings_snapshot_matches_frontend_contract_shape():
             "logging": {"retention_days": 1, "failed_record_retention_days": 7, "ui_log_max_display_count": 300},
             "appearance": {"language": "zh-CN"},
             "bilibili": {"max_pages": 1, "timeout": 60},
+            "missav": {"max_items": 20, "search_max_pages": 1, "timeout": 60},
         },
         {"max_concurrent": 3, "max_retries": 3, "image_respects_concurrency": False},
-        plugins=[SimpleNamespace(id="bilibili", name="Bilibili")],
+        plugins=[
+            SimpleNamespace(id="bilibili", name="Bilibili"),
+            SimpleNamespace(id="missav", name="MissAV"),
+        ],
     )
 
     assert snapshot["\u57fa\u7840\u8bbe\u7f6e"]["filename_template_label"] == "\u9ed8\u8ba4"
@@ -121,6 +141,10 @@ def test_build_settings_snapshot_matches_frontend_contract_shape():
     assert snapshot["\u64ad\u653e\u8bbe\u7f6e"]["default_player"] == "builtin_player"
     assert snapshot["\u5e73\u53f0\u8bbe\u7f6e"][0]["id"] == "bilibili"
     assert snapshot["\u5e73\u53f0\u8bbe\u7f6e"][0]["count_unit"] == "pages"
+    missav = snapshot["\u5e73\u53f0\u8bbe\u7f6e"][1]
+    assert missav["count_config_key"] == "max_items"
+    assert missav["search_max_pages_config_key"] == "search_max_pages"
+    assert missav["search_max_pages"] == 1
 
 
 def test_build_settings_snapshot_uses_platform_auth_provider():

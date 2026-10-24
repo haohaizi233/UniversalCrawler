@@ -1,12 +1,17 @@
+# app/core/lib/douyin/interface/collects.py
 from typing import TYPE_CHECKING, Callable, Union
+from .collection import Collection
+from .template import API
 
-from src.interface.collection import Collection
-from src.interface.template import API
-from src.translation import _
+try:
+    from ..translation import _
+except ImportError:
+    def _(x): return x
 
 if TYPE_CHECKING:
-    from src.config import Parameter
-    from src.testers import Params
+    from typing import Any
+    Parameter = Any
+    Params = Any
 
 
 class Collects(API):
@@ -301,30 +306,8 @@ class CollectsMusic(CollectsMix):
 
 
 async def test():
-    from src.testers import Params
-
-    async with Params() as params:
-        c = Collects(
-            params,
-        )
-        print(await c.run())
-        c = CollectsDetail(params, collects_id="")
-        print(await c.run())
-        c = CollectsMix(
-            params,
-        )
-        print(await c.run())
-        c = CollectsMusic(
-            params,
-        )
-        print(await c.run())
-        c = CollectsSeries(
-            params,
-        )
-        print(await c.run())
-
+    pass
 
 if __name__ == "__main__":
     from asyncio import run
-
     run(test())

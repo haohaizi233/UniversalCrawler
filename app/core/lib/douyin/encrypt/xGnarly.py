@@ -1,3 +1,4 @@
+# app/core/lib/douyin/encrypt/xGnarly.py
 from hashlib import md5
 from random import randint
 from time import time

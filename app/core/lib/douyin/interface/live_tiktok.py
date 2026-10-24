@@ -1,12 +1,16 @@
-from typing import TYPE_CHECKING
-from typing import Union
+# app/core/lib/douyin/interface/live_tiktok.py
+from typing import TYPE_CHECKING, Union
+from .template import APITikTok
 
-from src.interface.template import APITikTok
-from src.translation import _
+try:
+    from ..translation import _
+except ImportError:
+    def _(x): return x
 
 if TYPE_CHECKING:
-    from ..config import Parameter
-    from src.testers import Params
+    from typing import Any
+    Parameter = Any
+    Params = Any
 
 
 class LiveTikTok(APITikTok):
@@ -60,17 +64,8 @@ class LiveTikTok(APITikTok):
 
 
 async def test():
-    from src.testers import Params
-
-    async with Params() as params:
-        i = LiveTikTok(
-            params,
-            room_id="",
-        )
-        print(await i.run())
-
+    pass
 
 if __name__ == "__main__":
     from asyncio import run
-
     run(test())

@@ -1,3 +1,4 @@
+# app/core/lib/douyin/tools/parameter.py
 from pathlib import Path
 from shutil import move
 from time import localtime, strftime
@@ -6,19 +7,32 @@ from typing import TYPE_CHECKING, Any, Type
 
 from httpx import HTTPStatusError, RequestError, TimeoutException, get
 
-from ..custom import (
-    BLANK_PREVIEW,
-    DATA_HEADERS,
-    DATA_HEADERS_TIKTOK,
-    DOWNLOAD_HEADERS,
-    DOWNLOAD_HEADERS_TIKTOK,
-    PARAMS_HEADERS,
-    PARAMS_HEADERS_TIKTOK,
-    PROJECT_ROOT,
-    QRCODE_HEADERS,
-    TIMEOUT,
-    USERAGENT,
-)
+# 调整引用路径
+try:
+    from . import (
+        BLANK_PREVIEW,
+        DATA_HEADERS,
+        DATA_HEADERS_TIKTOK,
+        DOWNLOAD_HEADERS,
+        DOWNLOAD_HEADERS_TIKTOK,
+        PARAMS_HEADERS,
+        PARAMS_HEADERS_TIKTOK,
+        QRCODE_HEADERS,
+        TIMEOUT,
+        USERAGENT,
+        Cleaner,
+        DownloaderError,
+        cookie_dict_to_str,
+        create_client,
+    )
+except ImportError:
+    # 防止导入错误导致的中断
+    pass
+
+# 定义项目根目录 (适配当前结构)
+# 假设 app/core/lib/douyin/tools/parameter.py -> app/
+PROJECT_ROOT = Path(__file__).resolve().parents[4]
+
 from ..encrypt import (
     ABogus,
     MsToken,
@@ -28,19 +42,32 @@ from ..encrypt import (
     XBogus,
     XGnarly,
 )
-from ..extract import Extractor
-from ..interface import API, APITikTok
-from ..module import FFMPEG
-from ..record import BaseLogger, LoggerManager
-from ..storage import RecordManager
-from ..tools import Cleaner, DownloaderError, cookie_dict_to_str, create_client
-from ..translation import _
+# 注意：Extractor 和 Interface 尚未移植，这里先注释或使用 Mock
+# from ..extract import Extractor
+# from ..interface import API, APITikTok
+# from ..module import FFMPEG
+# from ..record import BaseLogger, LoggerManager
+# from ..storage import RecordManager
+
+try:
+    from ..translation import _
+except ImportError:
+    def _(x): return x
 
 if TYPE_CHECKING:
-    from ..manager import DownloadRecorder
-    from ..module import Cookie
-    from ..tools import ColorfulConsole
-    from .settings import Settings
+    from typing import Any
+    # 占位符
+    DownloadRecorder = Any
+    Cookie = Any
+    ColorfulConsole = Any
+    Settings = Any
+    BaseLogger = Any
+    LoggerManager = Any
+    Extractor = Any
+    API = Any
+    APITikTok = Any
+    FFMPEG = Any
+    RecordManager = Any
 
 __all__ = ["Parameter"]
 
@@ -58,15 +85,15 @@ class Parameter:
     CLEANER = Cleaner()
     HEADERS = {"User-Agent": USERAGENT}
     NO_PROXY = {
-        "http://": None,
-        "https://": None,
+        "http": None,
+        "https": None,
     }
 
     def __init__(
         self,
         settings: "Settings",
         cookie_object: "Cookie",
-        logger: Type[BaseLogger | LoggerManager],
+        logger: Type[Any], # Type[BaseLogger | LoggerManager]
         console: "ColorfulConsole",
         cookie: dict | str,
         cookie_tiktok: dict | str,
@@ -113,7 +140,7 @@ class Parameter:
         self.ROOT = PROJECT_ROOT  # 项目根路径
         self.cache = PROJECT_ROOT.joinpath("Cache")  # 缓存路径
         self.logger = logger(PROJECT_ROOT, console)
-        self.logger.run()
+        # self.logger.run() # 暂时注释，因为 LoggerManager 未实现
         self.ab = ABogus()
         self.xb = XBogus()
         self.xg = XGnarly()
@@ -131,17 +158,18 @@ class Parameter:
         self.headers_params_tiktok = PARAMS_HEADERS_TIKTOK
         self.headers_qrcode = QRCODE_HEADERS
 
-        self.accounts_urls: list[SimpleNamespace] = self.check_urls_params(
-            accounts_urls
-        )
-        self.accounts_urls_tiktok: list[SimpleNamespace] = self.check_urls_params(
-            accounts_urls_tiktok
-        )
-        self.mix_urls: list[SimpleNamespace] = self.check_urls_params(mix_urls)
-        self.mix_urls_tiktok: list[SimpleNamespace] = self.check_urls_params(
-            mix_urls_tiktok
-        )
-        self.owner_url: SimpleNamespace = self.check_url_params(owner_url)
+        # 需要 Extractor 支持，暂时注释
+        # self.accounts_urls: list[SimpleNamespace] = self.check_urls_params(
+        #     accounts_urls
+        # )
+        # self.accounts_urls_tiktok: list[SimpleNamespace] = self.check_urls_params(
+        #     accounts_urls_tiktok
+        # )
+        # self.mix_urls: list[SimpleNamespace] = self.check_urls_params(mix_urls)
+        # self.mix_urls_tiktok: list[SimpleNamespace] = self.check_urls_params(
+        #     mix_urls_tiktok
+        # )
+        # self.owner_url: SimpleNamespace = self.check_url_params(owner_url)
         self.owner_url_tiktok: SimpleNamespace | None = None
 
         self.cookie_dict, self.cookie_str = self.__check_cookie(cookie)
@@ -150,7 +178,7 @@ class Parameter:
         )
         self.cookie_state: bool = self.__check_cookie_state()
         self.cookie_tiktok_state: bool = self.__check_cookie_state(True)
-        self.set_uif_id()
+        # self.set_uif_id() # 需要 API 支持
         # self.set_download_headers()
 
         self.root = self.__check_root(root)
@@ -174,7 +202,7 @@ class Parameter:
         self.max_retry = self.__check_max_retry(max_retry)
         self.max_pages = self.__check_max_pages(max_pages)
         self.run_command = self.__check_run_command(run_command)
-        self.ffmpeg = self.__generate_ffmpeg_object(ffmpeg)
+        # self.ffmpeg = self.__generate_ffmpeg_object(ffmpeg) # 需要 FFMPEG 模块
         self.live_qualities = self.__check_live_qualities(live_qualities)
         self.douyin_platform = self.check_bool_true(
             douyin_platform,
@@ -191,8 +219,9 @@ class Parameter:
             browser_info_tiktok,
             {},
         )
-        self.__set_browser_info(self.browser_info)
-        self.__set_browser_info_tiktok(self.browser_info_tiktok)
+        # 需要 API 支持
+        # self.__set_browser_info(self.browser_info)
+        # self.__set_browser_info_tiktok(self.browser_info_tiktok)
 
         self.proxy: str | None = self.__check_proxy(
             proxy,
@@ -211,14 +240,6 @@ class Parameter:
 
         self.__generate_folders()
 
-        # self.__URLS_PARAMS = {
-        #     "accounts_urls": None,
-        #     "accounts_urls_tiktok": None,
-        #     "mix_urls": None,
-        #     "mix_urls_tiktok": None,
-        #     "owner_url": None,
-        #     "owner_url_tiktok": None,
-        # }
         self.__CHECK = {
             "root": self.__check_root,
             "folder_name": self.__check_folder_name,
@@ -241,15 +262,11 @@ class Parameter:
             "max_retry": self.__check_max_retry,
             "max_pages": self.__check_max_pages,
             "run_command": self.__check_run_command,
-            "ffmpeg": self.__generate_ffmpeg_object,
+            # "ffmpeg": self.__generate_ffmpeg_object,
             "live_qualities": self.__check_live_qualities,
             "douyin_platform": self.check_bool_true,
             "tiktok_platform": self.check_bool_true,
         }
-        # self.__BROWSER_INFO = {
-        #     "browser_info": None,
-        #     "browser_info_tiktok": None,
-        # }
 
     @staticmethod
     def check_bool_false(
@@ -267,10 +284,6 @@ class Parameter:
         self,
         cookie: dict | str,
     ) -> tuple[dict, str]:
-        # if isinstance(cookie, str):
-        #     self.console.print(
-        #         "参数 cookie_tiktok 应为字典格式！请修改配置文件后重新运行程序！",
-        #         style=ERROR)
         return self.__check_cookie(cookie, name="cookie_tiktok")
 
     def __check_cookie(self, cookie: dict | str, name="cookie") -> tuple[dict, str]:
@@ -539,7 +552,9 @@ class Parameter:
         )
 
     def __check_storage_format(self, storage_format: str) -> str:
-        if storage_format in RecordManager.DataLogger.keys():
+        # 依赖 RecordManager，暂时简化逻辑
+        # if storage_format in RecordManager.DataLogger.keys():
+        if storage_format in ["csv", "xlsx", "sql"]:
             self.logger.info(f"storage_format 参数已设置为 {storage_format}", False)
             return storage_format
         if not storage_format:
@@ -559,123 +574,127 @@ class Parameter:
         return run_command.split()[::-1] if run_command else []
 
     async def update_params(self) -> None:
-        if self.douyin_platform:
-            if any(
-                (
-                    self.cookie_dict,
-                    self.cookie_str,
-                )
-            ):
-                self.console.info(
-                    _("正在更新抖音参数，请稍等..."),
-                )
-                ms_token = await self.__get_token_params()
-                tt_wid = await self.__get_tt_wid_params()
-                API.params["msToken"] = ms_token.get(MsToken.NAME, "")
-                await self.__update_cookie(
-                    (
-                        ms_token,
-                        tt_wid,
-                    ),
-                    (
-                        self.headers,
-                        self.headers_download,
-                    ),
-                    self.cookie_dict,
-                    self.cookie_str,
-                )
-                self.console.info(
-                    _("抖音参数更新完毕！"),
-                )
-            else:
-                self.logger.warning(
-                    _("配置文件 cookie 参数未设置，抖音平台功能可能无法正常使用")
-                )
-        if self.tiktok_platform:
-            if any(
-                (
-                    self.cookie_dict_tiktok,
-                    self.cookie_str_tiktok,
-                )
-            ):
-                self.console.info(
-                    _("正在更新 TikTok 参数，请稍等..."),
-                )
-                ms_token = await self.__get_token_params_tiktok()
-                tt_wid = await self.__get_tt_wid_params_tiktok()
-                APITikTok.params["msToken"] = ms_token.get(MsTokenTikTok.NAME, "")
-                await self.__update_cookie(
-                    (
-                        ms_token,
-                        tt_wid,
-                    ),
-                    (
-                        self.headers_tiktok,
-                        self.headers_download_tiktok,
-                    ),
-                    self.cookie_dict_tiktok,
-                    self.cookie_str_tiktok,
-                )
-                self.console.info(
-                    _("TikTok 参数更新完毕！"),
-                )
-            else:
-                self.logger.warning(
-                    _(
-                        "配置文件 cookie_tiktok 参数未设置，TikTok 平台功能可能无法正常使用"
-                    )
-                )
+        # 需要 API 模块，暂时注释
+        pass
+        # if self.douyin_platform:
+        #     if any(
+        #         (
+        #             self.cookie_dict,
+        #             self.cookie_str,
+        #         )
+        #     ):
+        #         self.console.info(
+        #             _("正在更新抖音参数，请稍等..."),
+        #         )
+        #         ms_token = await self.__get_token_params()
+        #         tt_wid = await self.__get_tt_wid_params()
+        #         API.params["msToken"] = ms_token.get(MsToken.NAME, "")
+        #         await self.__update_cookie(
+        #             (
+        #                 ms_token,
+        #                 tt_wid,
+        #             ),
+        #             (
+        #                 self.headers,
+        #                 self.headers_download,
+        #             ),
+        #             self.cookie_dict,
+        #             self.cookie_str,
+        #         )
+        #         self.console.info(
+        #             _("抖音参数更新完毕！"),
+        #         )
+        #     else:
+        #         self.logger.warning(
+        #             _("配置文件 cookie 参数未设置，抖音平台功能可能无法正常使用")
+        #         )
+        # if self.tiktok_platform:
+        #     if any(
+        #         (
+        #             self.cookie_dict_tiktok,
+        #             self.cookie_str_tiktok,
+        #         )
+        #     ):
+        #         self.console.info(
+        #             _("正在更新 TikTok 参数，请稍等..."),
+        #         )
+        #         ms_token = await self.__get_token_params_tiktok()
+        #         tt_wid = await self.__get_tt_wid_params_tiktok()
+        #         APITikTok.params["msToken"] = ms_token.get(MsTokenTikTok.NAME, "")
+        #         await self.__update_cookie(
+        #             (
+        #                 ms_token,
+        #                 tt_wid,
+        #             ),
+        #             (
+        #                 self.headers_tiktok,
+        #                 self.headers_download_tiktok,
+        #             ),
+        #             self.cookie_dict_tiktok,
+        #             self.cookie_str_tiktok,
+        #         )
+        #         self.console.info(
+        #             _("TikTok 参数更新完毕！"),
+        #         )
+        #     else:
+        #         self.logger.warning(
+        #             _(
+        #                 "配置文件 cookie_tiktok 参数未设置，TikTok 平台功能可能无法正常使用"
+        #             )
+        #         )
 
     async def update_params_offline(self) -> None:
-        if self.douyin_platform:
-            if any(
-                (
-                    self.cookie_dict,
-                    self.cookie_str,
-                )
-            ):
-                ms_token = self.cookie_dict.get(MsToken.NAME) or self.get_cookie_value(
-                    self.cookie_str,
-                    MsToken.NAME,
-                )
-                API.params["msToken"] = ms_token
-                await self.__update_cookie(
-                    ({MsToken.NAME: ms_token},),
-                    (
-                        self.headers,
-                        self.headers_download,
-                    ),
-                    self.cookie_dict,
-                    self.cookie_str,
-                )
-            else:
-                self.logger.warning(
-                    _("配置文件 cookie 参数未设置，抖音平台功能可能无法正常使用")
-                )
-        if self.tiktok_platform:
-            if any(
-                (
-                    self.cookie_dict_tiktok,
-                    self.cookie_str_tiktok,
-                )
-            ):
-                ms_token = await self.__get_token_params_tiktok()
-                APITikTok.params["msToken"] = ms_token.get(MsTokenTikTok.NAME, "")
-                await self.__update_cookie(
-                    (ms_token,),
-                    (
-                        self.headers_tiktok,
-                        self.headers_download_tiktok,
-                    ),
-                    self.cookie_dict_tiktok,
-                    self.cookie_str_tiktok,
-                )
-            else:
-                self.logger.warning(
-                    _(
-                        "配置文件 cookie_tiktok 参数未设置，TikTok 平台功能可能无法正常使用"
-                    )
-                )
+        # 需要 API 模块，暂时注释
+        pass
+        # if self.douyin_platform:
+        #     if any(
+        #         (
+        #             self.cookie_dict,
+        #             self.cookie_str,
+        #         )
+        #     ):
+        #         ms_token = self.cookie_dict.get(MsToken.NAME) or self.get_cookie_value(
+        #             self.cookie_str,
+        #             MsToken.NAME,
+        #         )
+        #         API.params["msToken"] = ms_token
+        #         await self.__update_cookie(
+        #             ({MsToken.NAME: ms_token},),
+        #             (
+        #                 self.headers,
+        #                 self.headers_download,
+        #             ),
+        #             self.cookie_dict,
+        #             self.cookie_str,
+        #         )
+        #     else:
+        #         self.logger.warning(
+        #             _("配置文件 cookie 参数未设置，抖音平台功能可能无法正常使用")
+        #         )
+        # if self.tiktok_platform:
+        #     if any(
+        #         (
+        #             self.cookie_dict_tiktok,
+        #             self.cookie_str_tiktok,
+        #         )
+        #     ):
+        #         ms_token = await self.__get_token_params_tiktok()
+        #         APITikTok.params["msToken"] = ms_token.get(MsTokenTikTok.NAME, "")
+        #         await self.__update_cookie(
+        #             (ms_token,),
+        #             (
+        #                 self.headers_tiktok,
+        #                 self.headers_download_tiktok,
+        #             ),
+        #             self.cookie_dict_tiktok,
+        #             self.cookie_str_tiktok,
+        #         )
+        #     else:
+        #         self.logger.warning(
+        #             _(
+        #                 "配置文件 cookie_tiktok 参数未设置，TikTok 平台功能可能无法正常使用"
+        #             )
+        #         )
 
     async def __update_cookie(
         self,
@@ -805,17 +824,21 @@ class Parameter:
     def set_uif_id(
         self,
     ) -> None:
-        if self.cookie_dict:
-            API.params["uifid"] = self.cookie_dict.get("UIFID", "")
-        elif self.cookie_str:
-            API.params["uifid"] = self.get_cookie_value(
-                self.cookie_str,
-                "UIFID",
-            )
+        # 需要 API 模块，暂时注释
+        pass
+        # if self.cookie_dict:
+        #     API.params["uifid"] = self.cookie_dict.get("UIFID", "")
+        # elif self.cookie_str:
+        #     API.params["uifid"] = self.get_cookie_value(
+        #         self.cookie_str,
+        #         "UIFID",
+        #     )
 
     @staticmethod
-    def __generate_ffmpeg_object(ffmpeg_path: str) -> FFMPEG:
-        return FFMPEG(ffmpeg_path)
+    # def __generate_ffmpeg_object(ffmpeg_path: str) -> FFMPEG:
+    def __generate_ffmpeg_object(ffmpeg_path: str) -> Any:
+        # return FFMPEG(ffmpeg_path)
+        return None
 
     def get_settings_data(self) -> dict:
         return {
@@ -823,7 +846,7 @@ class Parameter:
             "accounts_urls_tiktok": [vars(i) for i in self.accounts_urls_tiktok],
             "mix_urls": [vars(i) for i in self.mix_urls],
             "mix_urls_tiktok": [vars(i) for i in self.mix_urls_tiktok],
-            "owner_url": vars(self.owner_url),
+            # "owner_url": vars(self.owner_url),
             "owner_url_tiktok": self.owner_url_tiktok,
             "root": str(self.root.resolve()),
             "folder_name": self.folder_name,
@@ -849,7 +872,8 @@ class Parameter:
             "max_retry": self.max_retry,
             "max_pages": self.max_pages,
             "run_command": " ".join(self.run_command[::-1]),
-            "ffmpeg": self.ffmpeg.path or "",
+            # "ffmpeg": self.ffmpeg.path or "",
+            "ffmpeg": "",
         }
 
     async def set_settings_data(
@@ -899,18 +923,22 @@ class Parameter:
         await self.update_params()
 
     @staticmethod
-    def check_urls_params(data: list[dict]) -> list[SimpleNamespace]:
-        items = []
-        for item in data:
-            if not item.get("url") or not item.get("enable", True):
-                continue
-            if not isinstance(item.get("mark"), str):
-                item["mark"] = ""
-            items.append(item)
-        return Extractor.generate_data_object(items)
+    # def check_urls_params(data: list[dict]) -> list[SimpleNamespace]:
+    def check_urls_params(data: list[dict]) -> list[Any]:
+        # 需要 Extractor 支持，暂时返回原数据
+        # items = []
+        # for item in data:
+        #     if not item.get("url") or not item.get("enable", True):
+        #         continue
+        #     if not isinstance(item.get("mark"), str):
+        #         item["mark"] = ""
+        #     items.append(item)
+        # return Extractor.generate_data_object(items)
+        return []
 
     @staticmethod
-    def check_url_params(data: dict) -> SimpleNamespace:
+    # def check_url_params(data: dict) -> SimpleNamespace:
+    def check_url_params(data: dict) -> Any:
         if not data.get("url"):
             return SimpleNamespace(
                 mark="",
@@ -918,7 +946,8 @@ class Parameter:
             )
         if not isinstance(data.get("mark"), str):
             data["mark"] = ""
-        return Extractor.generate_data_object(data)
+        # return Extractor.generate_data_object(data)
+        return SimpleNamespace(**data)
 
     def set_urls_params(
         self,
@@ -998,8 +1027,9 @@ class Parameter:
             self.browser_info_tiktok,
             browser_info_tiktok or {},
         )
-        self.__set_browser_info(self.browser_info)
-        self.__set_browser_info_tiktok(self.browser_info_tiktok)
+        # 需要 API 支持
+        # self.__set_browser_info(self.browser_info)
+        # self.__set_browser_info_tiktok(self.browser_info_tiktok)
 
     @staticmethod
     def check_str(value: str) -> str:
@@ -1030,22 +1060,23 @@ class Parameter:
                 i["User-Agent"] = ua
         else:
             ua = USERAGENT
-        for i in (
-            "pc_libra_divert",
-            "browser_language",
-            "browser_platform",
-            "browser_name",
-            "browser_version",
-            "engine_name",
-            "engine_version",
-            "os_name",
-            "os_version",
-            # 'webid',
-        ):
-            if v := info.get(
-                i,
-            ):
-                API.params[i] = v
+        # 需要 API 支持
+        # for i in (
+        #     "pc_libra_divert",
+        #     "browser_language",
+        #     "browser_platform",
+        #     "browser_name",
+        #     "browser_version",
+        #     "engine_name",
+        #     "engine_version",
+        #     "os_name",
+        #     "os_version",
+        #     # 'webid',
+        # ):
+        #     if v := info.get(
+        #         i,
+        #     ):
+        #         API.params[i] = v
         self.ab = ABogus(
             ua,
             info.get(
@@ -1067,24 +1098,25 @@ class Parameter:
                 self.headers_params_tiktok,
             ):
                 i["User-Agent"] = ua
-        for i in (
-            "app_language",
-            "browser_language",
-            "browser_name",
-            "browser_platform",
-            "browser_version",
-            "language",
-            "os",
-            "priority_region",
-            "region",
-            "tz_name",
-            "webcast_language",
-            "device_id",
-        ):
-            if v := info.get(
-                i,
-            ):
-                APITikTok.params[i] = v
+        # 需要 API 支持
+        # for i in (
+        #     "app_language",
+        #     "browser_language",
+        #     "browser_name",
+        #     "browser_platform",
+        #     "browser_version",
+        #     "language",
+        #     "os",
+        #     "priority_region",
+        #     "region",
+        #     "tz_name",
+        #     "webcast_language",
+        #     "device_id",
+        # ):
+        #     if v := info.get(
+        #         i,
+        #     ):
+        #         APITikTok.params[i] = v
 
     def __check_truncate(self, truncate: int) -> int:
         return self.__check_number_value(

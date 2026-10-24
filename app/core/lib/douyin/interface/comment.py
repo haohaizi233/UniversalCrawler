@@ -1,12 +1,18 @@
+# app/core/lib/douyin/interface/comment.py
 from typing import TYPE_CHECKING, Callable, Coroutine, Type, Union
+# 调整引用路径
+from ..extract import Extractor
+from .template import API
 
-from src.extract import Extractor
-from src.interface.template import API
-from src.translation import _
+try:
+    from ..translation import _
+except ImportError:
+    def _(x): return x
 
 if TYPE_CHECKING:
-    from src.config import Parameter
-    from src.testers import Params
+    from typing import Any
+    Parameter = Any
+    Params = Any
 
 
 class Comment(API):
@@ -342,23 +348,8 @@ class Reply(Comment):
 
 
 async def test():
-    from src.testers import Params
-
-    async with Params() as params:
-        i = Comment(
-            params,
-            detail_id="",
-        )
-        print(await i.run())
-        i = Reply(
-            params,
-            detail_id="",
-            comment_id="",
-        )
-        print(await i.run())
-
+    pass
 
 if __name__ == "__main__":
     from asyncio import run
-
     run(test())

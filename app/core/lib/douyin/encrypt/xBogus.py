@@ -1,3 +1,4 @@
+# app/core/lib/douyin/encrypt/xBogus.py
 from base64 import b64encode
 from hashlib import md5
 from time import time

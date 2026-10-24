@@ -1,3 +1,4 @@
+//app/core/lib/douyin/js/X-Bogus.js
 var window = null;
 
 function _0x5cd844(e) {

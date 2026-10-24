@@ -1,3 +1,5 @@
+# app/core/lib/douyin/encrypt/aBogus.py
+
 from random import choice, randint, random
 from re import compile
 from time import time

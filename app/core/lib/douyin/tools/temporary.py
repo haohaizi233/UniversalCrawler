@@ -1,3 +1,4 @@
+# app/core/lib/douyin/tools/temporary.py
 from random import choice
 from string import (
     ascii_lowercase,

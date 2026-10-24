@@ -1,3 +1,4 @@
+# app/core/lib/douyin/encrypt/verifyFp.py
 from random import random
 from string import ascii_lowercase
 from string import ascii_uppercase
@@ -9,7 +10,6 @@ from rich import print
 __all__ = [
     "VerifyFp",
 ]
-
 
 class VerifyFp:
     """
@@ -28,7 +28,6 @@ class VerifyFp:
         }()
     }
     """
-
     @staticmethod
     def get_verify_fp(timestamp: int = None):
         base_str = digits + ascii_uppercase + ascii_lowercase
@@ -43,12 +42,10 @@ class VerifyFp:
                 base36 = str(remainder) + base36
             else:
                 base36 = chr(ord("a") + remainder - 10) + base36
-
         # 设置固定字符
         o = [""] * 36
         o[8] = o[13] = o[18] = o[23] = "_"
         o[14] = "4"
-
         # 随机填充缺失的字符
         for i in range(36):
             if not o[i]:
@@ -56,10 +53,8 @@ class VerifyFp:
                 if i == 19:
                     n = 3 & n | 8
                 o[i] = base_str[n]
-
         # 组合最终字符串
         return f"verify_{base36}_" + "".join(o)
-
 
 if __name__ == "__main__":
     params = 1710413848097

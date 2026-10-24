@@ -1,13 +1,19 @@
+# app/core/lib/douyin/interface/detail_tiktok.py
 from typing import Callable
 from typing import TYPE_CHECKING
 from typing import Union
 
-from src.interface.template import APITikTok
-from src.translation import _
+from .template import APITikTok
+
+try:
+    from ..translation import _
+except ImportError:
+    def _(x): return x
 
 if TYPE_CHECKING:
-    from src.config import Parameter
-    from src.testers import Params
+    from typing import Any
+    Parameter = Any
+    Params = Any
 
 
 class DetailTikTok(APITikTok):
@@ -80,19 +86,9 @@ class DetailTikTok(APITikTok):
                 _("数据解析失败，请告知作者处理: {data}").format(data=data_dict)
             )
 
-
 async def test():
-    from src.testers import Params
-
-    async with Params() as params:
-        i = DetailTikTok(
-            params,
-            detail_id="",
-        )
-        print(await i.run())
-
+    pass
 
 if __name__ == "__main__":
     from asyncio import run
-
     run(test())

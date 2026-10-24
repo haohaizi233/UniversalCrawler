@@ -1,3 +1,4 @@
+#app/core/lib/douyin/encrypt/__init__.py
 from .aBogus import ABogus
 from .device_id import DeviceId
 from .msToken import MsToken, MsTokenTikTok

@@ -1,15 +1,33 @@
+# app/core/lib/douyin/encrypt/webID.py
 from asyncio import run
 from typing import TYPE_CHECKING, Union
 
-from src.custom import PARAMS_HEADERS
-from src.tools import request_params
-from src.translation import _
+# 调整引用路径
+try:
+    from ..tools import PARAMS_HEADERS, request_params
+except ImportError:
+    PARAMS_HEADERS = {}
+
+
+    async def request_params(*args, **kwargs):
+        pass
+
+try:
+    from ..translation import _
+except ImportError:
+    def _(x):
+        return x
 
 if TYPE_CHECKING:
-    from src.record import BaseLogger, LoggerManager
-    from src.testers import Logger
+    # 由于 record 模块尚未移植，这里使用 Any 占位
+    from typing import Any
+
+    BaseLogger = Any
+    LoggerManager = Any
+    Logger = Any
 
 __all__ = ["WebId"]
+
 
 class WebId:
     NAME = "webid"
@@ -18,11 +36,11 @@ class WebId:
 
     @classmethod
     async def get_web_id(
-        cls,
-        logger: Union["BaseLogger", "LoggerManager", "Logger"],
-        headers: dict,
-        proxy: str = None,
-        **kwargs,
+            cls,
+            logger: Union["BaseLogger", "LoggerManager", "Logger"],
+            headers: dict,
+            proxy: str = None,
+            **kwargs,
     ) -> str | None:
         user_agent = headers.get("User-Agent")
         data = (
@@ -30,21 +48,25 @@ class WebId:
             f'.douyin.com/","user_unique_id":""}}'
         )
         if response := await request_params(
-            logger,
-            cls.API,
-            params=cls.PARAMS,
-            data=data,
-            headers=headers,
-            resp="json",
-            proxy=proxy,
-            **kwargs,
+                logger,
+                cls.API,
+                params=cls.PARAMS,
+                data=data,
+                headers=headers,
+                resp="json",
+                proxy=proxy,
+                **kwargs,
         ):
             return response.get("web_id")
         logger.error(_("获取 {name} 参数失败！").format(name=cls.NAME))
 
 
 async def test():
-    from src.testers import Logger
+    # 模拟 Logger
+    class Logger:
+        def error(self, msg): print(msg)
+
+        def info(self, msg, *args): print(msg)
 
     print(await WebId.get_web_id(Logger(), PARAMS_HEADERS, proxy=None))
 

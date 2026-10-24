@@ -1,3 +1,4 @@
+# app/core/lib/douyin/tools/console.py
 from rich.console import Console
 from rich.text import Text
 # 尝试导入自定义常量，如果失败则使用默认值

@@ -127,9 +127,57 @@ class BilibiliPlugin(BasePlugin):
             pass
         return {"max_pages": pages}
 
+
+class DouyinPlugin(BasePlugin):
+    id = "douyin"
+    name = "抖音"
+
+    def get_search_placeholder(self) -> str:
+        # 提示用户可以输入的内容类型
+        return "搜索关键词 / 抖音号 / 主页链接 / 作品分享链接 / 合集链接..."
+
+    def get_settings_widget(self, parent=None) -> QWidget:
+        container = QWidget(parent)
+        layout = QHBoxLayout(container)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(10)
+
+        # 搜索页数限制
+        layout.addWidget(QLabel("搜索采集页数:"))
+        self.spin_pages = QSpinBox()
+        self.spin_pages.setRange(1, 100)  # 通常一页10-20条，100页足够了
+        self.spin_pages.setValue(1)  # 默认搜索只抓1页
+        self.spin_pages.setToolTip("仅对关键词搜索生效，主页/链接解析默认全量")
+        layout.addWidget(self.spin_pages)
+
+        # 提示信息
+        info = QLabel("🚀 链接/主页全量抓取 | 扫码登录")
+        info.setStyleSheet("color: #00AEEC; font-weight: bold;")  # 抖音红
+        layout.addWidget(info)
+
+        return container
+
+    def get_spider_class(self):
+        # 延迟导入，防止循环引用或模块未就绪
+        from app.spiders.douyin_spider import DouyinSpider
+        return DouyinSpider
+
+    def get_run_options(self, widget: QWidget) -> dict:
+        pages = 1
+        try:
+            if hasattr(self, 'spin_pages'):
+                pages = self.spin_pages.value()
+        except:
+            pass
+        return {
+            "search_max_pages": pages,
+            "timeout": 10
+        }
+
 class PluginRegistry:
     def __init__(self):
         self._plugins = {}
+        # self.register(DouyinPlugin())
         self.register(KuaishouPlugin())
         self.register(MissAVPlugin())
         self.register(BilibiliPlugin())

@@ -1,15 +1,26 @@
+# app/core/lib/douyin/encrypt/ttWid.py
 from asyncio import run
 from http import cookies
 from json import dumps
 from typing import TYPE_CHECKING, Union
 
-from src.custom import PARAMS_HEADERS, PARAMS_HEADERS_TIKTOK
-from src.tools import request_params
-from src.translation import _
+try:
+    from ..tools import PARAMS_HEADERS, PARAMS_HEADERS_TIKTOK, request_params
+except ImportError:
+    PARAMS_HEADERS = {}
+    PARAMS_HEADERS_TIKTOK = {}
+    async def request_params(*args, **kwargs): pass
+
+try:
+    from ..translation import _
+except ImportError:
+    def _(x): return x
 
 if TYPE_CHECKING:
-    from src.record import BaseLogger, LoggerManager
-    from src.testers import Logger
+    from typing import Any
+    BaseLogger = Any
+    LoggerManager = Any
+    Logger = Any
 
 __all__ = ["TtWid", "TtWidTikTok"]
 
@@ -94,19 +105,20 @@ class TtWidTikTok(TtWid):
 
 
 async def test():
-    from src.testers import Logger
+    class Logger:
+        def error(self, msg): print(msg)
+        def info(self, msg, *args): print(msg)
 
     print("抖音", await TtWid.get_tt_wid(Logger(), PARAMS_HEADERS, proxy=None))
-    print(
-        "TikTok",
-        await TtWidTikTok.get_tt_wid(
-            Logger(),
-            PARAMS_HEADERS_TIKTOK,
-            cookie="ttwid=",
-            proxy="http://localhost:10809",
-        ),
-    )
-
+    # print(
+    #     "TikTok",
+    #     await TtWidTikTok.get_tt_wid(
+    #         Logger(),
+    #         PARAMS_HEADERS_TIKTOK,
+    #         cookie="ttwid=",
+    #         proxy="http://localhost:10809",
+    #     ),
+    # )
 
 if __name__ == "__main__":
     run(test())

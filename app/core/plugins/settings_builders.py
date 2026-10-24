@@ -141,6 +141,17 @@ def read_missav_run_options(widget: Any = None) -> dict[str, Any]:
     if not isinstance(widget, MissAVSettingsWidget):
         return options
     options["individual_only"] = bool(widget.chk_individual.isChecked())
+    search_max_pages = widget.combo_search_max_pages.currentData()
+    if search_max_pages is None:
+        search_max_pages = options.get("search_max_pages", 1)
+    try:
+        search_max_pages = int(search_max_pages)
+    except (TypeError, ValueError):
+        search_max_pages = int(options.get("search_max_pages", 1) or 1)
+    options["search_max_pages"] = resolve_choice_value(
+        search_max_pages,
+        control_choice_values("missav", "search_max_pages"),
+    )
     options["priority"] = resolve_choice_value(
         widget.combo_priority.currentText(),
         control_choice_values("missav", "priority"),

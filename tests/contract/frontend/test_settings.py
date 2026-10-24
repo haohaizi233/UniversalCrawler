@@ -590,6 +590,75 @@ class UnifiedFrontendSettingsContractTests(_UnifiedFrontendContractTestCase):
         self.assertFalse(any("(10808)" in text for text in proxy_texts))
         self.assertFalse(any("HTTP/SOCKS5" in text for text in proxy_texts))
 
+    def test_gui_missav_scan_page_control_preserves_video_count_and_scales_row_height(self):
+        shell = self._make_shell()
+        settings = shell.pages["settings"]
+        snapshot = FrontendStateService.mock_snapshot()
+        missav = next(row for row in snapshot["settings_snapshot"]["平台设置"] if row["id"] == "missav")
+        original_scale = self.app.property("ui_scale")
+        original_font_size = self.app.property("ui_font_size")
+        try:
+            self.app.setProperty("ui_scale", "100%")
+            self.app.setProperty("ui_font_size", "medium")
+            shell.show_page("settings")
+            settings._render_signature = None
+            settings.render(snapshot)
+            settings._set_current_group("平台设置")
+            self.app.processEvents()
+
+            page_combo = next(
+                combo
+                for combo in settings.detail_panel.findChildren(QComboBox)
+                if combo.property("platformSearchPagesControl")
+            )
+            count_controls = page_combo.parentWidget().parentWidget()
+            row = count_controls.parentWidget()
+            video_combo = next(
+                combo
+                for combo in count_controls.findChildren(QComboBox)
+                if combo is not page_combo
+            )
+
+            self.assertEqual(video_combo.currentData(), "20")
+            self.assertEqual(page_combo.currentData(), "1")
+            self.assertEqual(row.height(), 96)
+            self.assertLessEqual(count_controls.sizeHint().height(), row.height() - 8)
+
+            for scale in ("100%", "125%"):
+                with self.subTest(scale=scale):
+                    self.app.setProperty("ui_scale", scale)
+                    scaled_row = settings._build_platform_row(
+                        missav,
+                        {
+                            "name": 122,
+                            "auth": 112,
+                            "count": 210,
+                            "timeout": 132,
+                            "proxy": 294,
+                        },
+                    )
+                    scaled_row.show()
+                    self.app.processEvents()
+                    scaled_controls = scaled_row.findChild(QWidget, "SettingsPlatformCountControls")
+                    scaled_combos = scaled_controls.findChildren(QComboBox)
+                    self.assertEqual(len(scaled_combos), 2)
+                    self.assertEqual(scaled_combos[1].height(), settings._scaled_px(40, minimum=40))
+                    self.assertEqual(
+                        scaled_row.height(),
+                        settings._scaled_px(40, minimum=40) * 2 + 16,
+                    )
+                    self.assertLessEqual(scaled_controls.sizeHint().height(), scaled_controls.height())
+                    self.assertLessEqual(
+                        scaled_controls.geometry().y() + scaled_controls.height(),
+                        scaled_row.height() - 4,
+                    )
+                    scaled_row.close()
+                    scaled_row.deleteLater()
+                    self.app.processEvents()
+        finally:
+            self.app.setProperty("ui_scale", original_scale)
+            self.app.setProperty("ui_font_size", original_font_size)
+
     def test_gui_platform_settings_only_shows_custom_proxy_input_when_needed(self):
         shell = self._make_shell()
         settings = shell.pages["settings"]

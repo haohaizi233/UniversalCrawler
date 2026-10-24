@@ -6,6 +6,137 @@ from tests.support.browser_runtime import _stable_platform_settings_snapshot_js
 
 
 class SettingsCases:
+    def test_missav_settings_render_independent_video_and_scan_page_controls(self):
+        self._goto_ready()
+        original_viewport = self._page.viewport_size
+        self.addCleanup(
+            lambda: original_viewport and self._page.set_viewport_size(original_viewport)
+        )
+        self._page.set_viewport_size({"width": 1280, "height": 800})
+
+        result = self._page.evaluate(
+            r"""
+            async () => {
+              const row = {
+                id: 'missav',
+                name: 'MissAV',
+                auth_status: '无需认证',
+                default_count: 20,
+                count_config_key: 'max_items',
+                count_unit: 'videos',
+                count_editable: true,
+                count_options: [{ value: '20', label: '20 个视频' }],
+                search_max_pages: 1,
+                search_max_pages_config_key: 'search_max_pages',
+                search_max_pages_editable: true,
+                search_max_pages_options: [
+                  { value: '1', label: '1 页' },
+                  { value: '2', label: '2 页' },
+                  { value: '100', label: '100 页' }
+                ],
+                default_timeout: 60,
+                timeout_config_key: 'timeout',
+                timeout_editable: true,
+                timeout_options: [{ value: '60', label: '60 秒' }],
+                proxy: '系统代理',
+                proxy_config_key: 'proxy_app',
+                proxy_editable: true,
+                proxy_options: ['系统代理']
+              };
+              const actions = [];
+              const state = {
+                settings_snapshot: { '平台设置': [row] },
+                settings_contract: { group_order: ['平台设置'] }
+              };
+              window.UcpSettingsController.configure({
+                getState: () => state,
+                t: value => String(value || ''),
+                optionLabel: value => String(value || ''),
+                byId: id => document.getElementById(id),
+                sendWS: (action, payload) => actions.push({ action, payload }),
+                patchSetting: () => {},
+                patchPlatformSetting: (platformId, key, value) => {
+                  const target = state.settings_snapshot['平台设置'].find(item => item.id === platformId);
+                  target[key] = value;
+                },
+                syncAppearance: () => {},
+                enhanceSelects: root => window.UcpCustomSelect.enhance(root)
+              });
+              window.UcpSettingsController.switchGroup('平台设置');
+              switchPage('settings');
+              window.UcpSettingsController.render(true);
+              await new Promise(resolve => requestAnimationFrame(resolve));
+              const videoSelect = document.querySelector('#settingsGrid select.platform-count');
+              const scanSelect = document.querySelector('#settingsGrid select.platform-search-pages');
+              const scanLabel = document.querySelector('#settingsGrid label.platform-search-pages-label');
+              const scanWrapper = scanSelect?.closest('.custom-select');
+              const initial = {
+                videoSetting: videoSelect?.dataset.setting,
+                videoValue: videoSelect?.value,
+                videoEnhanced: videoSelect?.closest('.custom-select')?.classList.contains('platform-count') || false,
+                scanLabel: scanLabel?.textContent.trim(),
+                scanSetting: scanSelect?.dataset.setting,
+                scanValue: scanSelect?.value,
+                scanAccessibleName: scanSelect?.getAttribute('aria-label'),
+                scanEnhanced: Boolean(scanWrapper?.querySelector('.custom-select-button')),
+                scanControlsCount: scanSelect?.closest('.platform-count-controls')?.querySelectorAll('.custom-select').length || 0,
+                desktopOverflow: Math.max(0, document.documentElement.scrollWidth - document.documentElement.clientWidth)
+              };
+              actions.length = 0;
+              scanWrapper?.querySelector('.custom-select-button')?.click();
+              scanWrapper?.querySelector('.custom-select-option[data-value="100"]')?.click();
+              return {
+                ...initial,
+                updatedValue: row.search_max_pages,
+                actions
+              };
+            }
+            """
+        )
+
+        self.assertEqual(result["videoSetting"], "max_items")
+        self.assertEqual(result["videoValue"], "20")
+        self.assertEqual(result["scanLabel"], "扫描页数")
+        self.assertEqual(result["scanSetting"], "search_max_pages")
+        self.assertEqual(result["scanValue"], "1")
+        self.assertEqual(result["scanAccessibleName"], "扫描页数")
+        self.assertTrue(result["videoEnhanced"])
+        self.assertTrue(result["scanEnhanced"])
+        self.assertEqual(result["scanControlsCount"], 2)
+        self.assertLessEqual(result["desktopOverflow"], 1)
+        self.assertEqual(result["updatedValue"], 100)
+        self.assertEqual(
+            result["actions"],
+            [{"action": "update_setting", "payload": {"section": "missav", "key": "search_max_pages", "value": "100"}}],
+        )
+
+        self._page.set_viewport_size({"width": 390, "height": 844})
+        self._page.wait_for_function("document.documentElement.clientWidth === 390", timeout=5000)
+        mobile = self._page.evaluate(
+            """
+            () => {
+              const select = document.querySelector('#settingsGrid select.platform-search-pages');
+              const row = select?.closest('.setting-platform');
+              const controls = select?.closest('.platform-count-controls');
+              const wrapper = select?.closest('.custom-select');
+              const rowRect = row?.getBoundingClientRect();
+              const wrapperRect = wrapper?.getBoundingClientRect();
+              return {
+                rowWidth: row?.clientWidth || 0,
+                rowScrollWidth: row?.scrollWidth || 0,
+                wrapperRight: wrapperRect?.right || 0,
+                rowRight: rowRect?.right || 0,
+                wrapperHasButton: Boolean(wrapper?.querySelector('.custom-select-button')),
+                controlsContainsScan: Boolean(controls && controls.contains(wrapper))
+              };
+            }
+            """
+        )
+        self.assertTrue(mobile["wrapperHasButton"])
+        self.assertTrue(mobile["controlsContainsScan"])
+        self.assertLessEqual(mobile["rowScrollWidth"], mobile["rowWidth"] + 1, mobile)
+        self.assertLessEqual(mobile["wrapperRight"], mobile["rowRight"] + 1, mobile)
+
     def test_11d_settings_controller_commits_custom_proxy_through_public_api(self):
         self._goto_ready()
 

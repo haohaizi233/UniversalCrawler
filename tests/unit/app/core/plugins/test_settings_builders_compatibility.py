@@ -59,8 +59,10 @@ def test_control_choices_match_interactive_spec() -> None:
     assert values(DouyinPlugin, "max_items") == [10, 20, 30, 50, 9999]
     assert values(XiaohongshuPlugin, "max_items") == [10, 20, 30, 50, 9999]
     assert values(BilibiliPlugin, "max_pages") == [1, 2, 3, 5, 9999]
+    assert values(MissAVPlugin, "search_max_pages") == [1, 2, 3, 5, 10, 20, 50, 100]
     assert settings_builders.control_choice_values("douyin", "max_items") == values(DouyinPlugin, "max_items")
     assert settings_builders.control_choice_values("bilibili", "max_pages") == values(BilibiliPlugin, "max_pages")
+    assert settings_builders.control_choice_values("missav", "search_max_pages") == values(MissAVPlugin, "search_max_pages")
     assert "Clash Verge (7897)" in values(MissAVPlugin, "proxy")
     assert 60 in values(MissAVPlugin, "timeout")
 

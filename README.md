@@ -779,3 +779,18 @@ python -m entry.web_entry --host 127.0.0.1 --port 8000
 对于普通用户，这会是一个更省心的多平台下载工作台。
 
 对于开发者，这会是一份已经具备明显工程味道、值得继续打磨的桌面端采集框架。
+
+
+## Gitee 克隆与二进制恢复
+
+Gitee 当前账号不提供原生 Git LFS 托管。下载器等二进制文件的兼容归档已合入 main 的提交历史，恢复脚本直接读取固定归档提交，不依赖 migration 分支。
+
+```powershell
+$env:GIT_LFS_SKIP_SMUDGE = "1"
+git clone https://gitee.com/haohaizi554/UniversalCrawler.git
+Remove-Item Env:GIT_LFS_SKIP_SMUDGE
+Set-Location UniversalCrawler
+python scripts/restore_gitee_lfs.py --checkout
+```
+
+脚本校验每个切片及完整文件的 SHA-256，恢复到本地 Git LFS 缓存，再填充工作区；工作区有未提交修改时会跳过填充。新增加或替换 LFS 对象仍需更新兼容归档。
